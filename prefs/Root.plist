@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>IOSDecryptHub</string>
+            <key>footerText</key>
+            <string>选择要注入的 App。默认不注入任何应用。开启后目标 App 下次启动时生效。</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSLinkCell</string>
+            <key>isController</key>
+            <true/>
+            <key>label</key>
+            <string>选择要注入的应用</string>
+            <key>detail</key>
+            <string>IOSDecryptHubAppListController</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+            <key>label</key>
+            <string>关于</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSStaticTextCell</string>
+            <key>label</key>
+            <string>IOSDecryptHub — iOS 运行时安全分析工具</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSGroupCell</string>
+        </dict>
+        <dict>
+            <key>cell</key>
+            <string>PSStaticTextCell</string>
+            <key>cellClass</key>
+            <string>DHWeChatFollowCell</string>
+            <key>height</key>
+            <real>128</real>
+        </dict>
+    </array>
+    <key>title</key>
+    <string>IOSDecryptHub</string>
+</dict>
+</plist>

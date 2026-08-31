@@ -1,0 +1,9 @@
+# 构建产物
+build/
+*.deb
+*.dSYM/
+*.o
+
+.DS_Store
+*.swp
+.claude/
