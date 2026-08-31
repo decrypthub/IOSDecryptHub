@@ -1,5 +1,7 @@
 # IOSDecryptHub
 
+[中文](README.md) | **English**
+
 Add the repo in Sileo / Zebra:
 
 ```
