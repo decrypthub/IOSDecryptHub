@@ -20,3 +20,14 @@ https://ios.decrypthub.com
 ```bash
 make deb
 ```
+
+## 关注
+
+微信搜一搜 **DecryptHub**，点下面二维码也能加公众号。
+
+<p align="center">
+  <img src="./wechat-qr.png" alt="微信公众号 DecryptHub" width="168">
+</p>
+
+- Telegram：https://t.me/decrypthubteam
+- X：https://x.com/decrypthub_

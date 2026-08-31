@@ -15,3 +15,14 @@ Build debs (macOS + Xcode + dpkg + ldid):
 ```bash
 make deb
 ```
+
+## Follow
+
+Search **DecryptHub** in WeChat, or scan the QR below.
+
+<p align="center">
+  <img src="./wechat-qr.png" alt="WeChat Official Account DecryptHub" width="168">
+</p>
+
+- Telegram: https://t.me/decrypthubteam
+- X: https://x.com/decrypthub_
