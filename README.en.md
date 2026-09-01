@@ -8,7 +8,11 @@ Add the repo in Sileo / Zebra:
 https://ios.decrypthub.com
 ```
 
-Install the deb for your jailbreak (rootless or roothide). Open **Settings → IOSDecryptHub**, enable the target app, force-quit it, then reopen. Open `http://<device-ip>:8088` in a browser.
+Install the deb for your jailbreak (rootless or roothide). Open **Settings → IOSDecryptHub**, enable the target app, force-quit it, then reopen. Open `http://<device-ip>:8088` in a browser to use the live web panel:
+
+<p align="center">
+  <img src="./docs/screenshots/webui.png" alt="IOSDecryptHub web panel: crypto event list with UTF-8 / HEX / HEXDUMP detail" width="920">
+</p>
 
 No app is injected by default. Depends on ellekit and preferenceloader.
 
