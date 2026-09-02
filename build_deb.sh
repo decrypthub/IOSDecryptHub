@@ -123,6 +123,10 @@ build_variant() {
     local PREFIX="$2"
     local ARCHITECTURE="$3"
     local MACHO_ARCHS="$4"
+    # 偏好面板可单独指定架构：Preferences(设置) 进程在 arm64e 设备上是 arm64e，
+    # 只有 arm64 的 bundle 会被 dyld 以 incompatible architecture 拒绝加载，
+    # 故 rootless 也需把面板编成胖 arm64+arm64e（arm64 切片保留对 A11 的兼容）。
+    local PREFS_MACHO_ARCHS="${5:-$MACHO_ARCHS}"
 
     local STAGE="$BUILD_DIR/stage-$VARIANT"
     local DEB_OUT="$BUILD_DIR/${PKG_NAME}_${VERSION}_${VARIANT}.deb"
@@ -132,7 +136,7 @@ build_variant() {
 
     ENGINE_DYLIB=$(require_vendor_dylib "$VARIANT" "$MACHO_ARCHS")
     compile_loader "$MACHO_ARCHS" "$LOADER_OUT"
-    compile_prefs "$MACHO_ARCHS" "$PREFS_BUNDLE"
+    compile_prefs "$PREFS_MACHO_ARCHS" "$PREFS_BUNDLE"
 
     info "打包 $VARIANT (arch=$ARCHITECTURE, prefix=${PREFIX:-/})..."
     rm -rf "$STAGE"
@@ -206,7 +210,7 @@ POSTRM
         "$MACHO_ARCHS" "$VARIANT 主 dylib"
     verify_macho_arch \
         "$STAGE/${PREFIX}/Library/PreferenceBundles/IOSDecryptHubPrefs.bundle/IOSDecryptHubPrefs" \
-        "$MACHO_ARCHS" "$VARIANT 设置面板"
+        "$PREFS_MACHO_ARCHS" "$VARIANT 设置面板"
 
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.dylib"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
@@ -281,13 +285,13 @@ mkdir -p "$BUILD_DIR"
 case "$TARGET" in
     all)
         build_variant "rootless" "/var/jb" \
-            "iphoneos-arm64" "arm64"
+            "iphoneos-arm64" "arm64" "arm64 arm64e"
         build_variant "roothide" "" \
             "iphoneos-arm64e" "arm64 arm64e"
         ;;
     rootless)
         build_variant "rootless" "/var/jb" \
-            "iphoneos-arm64" "arm64"
+            "iphoneos-arm64" "arm64" "arm64 arm64e"
         ;;
     roothide)
         build_variant "roothide" "" \
