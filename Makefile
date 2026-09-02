@@ -4,7 +4,7 @@
 #   make deb-rootless
 #   make deb-roothide
 
-VERSION := 1.24.8
+VERSION := 1.24.9
 
 deb:
 	@chmod +x build_deb.sh
