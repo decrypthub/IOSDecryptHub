@@ -1,9 +1,9 @@
 #!/bin/bash
 # build_deb.sh — 打包 IOSDecryptHub rootless / roothide 越狱 deb
 #
-# dylib（引擎，由本仓源码编译后落在 vendor/ 下）:
-#   vendor/dylib/rootless/decrypt_helper.dylib   (arm64)
-#   vendor/dylib/roothide/decrypt_helper.dylib   (arm64 + arm64e)
+# dylib（引擎，由本仓 src/ 编译后落在 vendor/ 下，不入版本库）:
+#   vendor/dylib/rootless/decrypt_helper.dylib   VARIANT=rootless, arm64
+#   vendor/dylib/roothide/decrypt_helper.dylib   VARIANT=roothide, arm64 + arm64e
 #
 # 包内组件:
 #   IOSDecryptHubLoader.dylib  ElleKit 注入加载器（读名单 → dlopen 引擎，无 hook）

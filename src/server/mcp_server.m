@@ -1985,7 +1985,7 @@ static NSArray *tool_definitions(void) {
     return @[
         @{
             @"name": @"get_capabilities",
-            @"description": @"Handshake — call FIRST. Returns plugin version, packaging variant (dev/trollstore), CPU arch, current phase (observe|override), and per-tier hook capability flags (hook_import/hook_method/unpack). Also returns guidance.whenNoCryptoEvents: when standard crypto hooks (CCCrypt/EVP/SecKey) show no events but network traffic is encrypted, enumerate pointer+length imports (mlock/memcpy/read/send/getrandom) and capture at call time with hook_import(capture_memory) instead of attempting unsupported hooks.",
+            @"description": @"Handshake — call FIRST. Returns plugin version, packaging variant (dev/trollstore/rootless/roothide), CPU arch, current phase (observe|override), and per-tier hook capability flags (hook_import/hook_method/unpack). Also returns guidance.whenNoCryptoEvents: when standard crypto hooks (CCCrypt/EVP/SecKey) show no events but network traffic is encrypted, enumerate pointer+length imports (mlock/memcpy/read/send/getrandom) and capture at call time with hook_import(capture_memory) instead of attempting unsupported hooks.",
             @"inputSchema": @{@"type": @"object", @"properties": @{}},
         },
         @{

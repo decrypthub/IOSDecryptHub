@@ -6,11 +6,14 @@ build/
 *.a
 *.profraw
 
-# 编译出的引擎 (根目录产物; vendor/dylib/ 下的成品引擎随仓分发, 见 build_deb.sh)
+# 编译出的引擎 (根目录产物)
 /decrypt_helper.dylib
 /decrypt_helper-*.dylib
 /decrypt_helper.mac.dylib
 /decrypt_helper.sim.dylib
+
+# 打包用的引擎落地目录 —— 由 make deb / make test-updater 编译生成, 不入版本库
+vendor/dylib/*/*.dylib
 
 # 生成的 Web 资源头文件 (make 自动从 web/ 生成)
 src/server/web_index_html.h

@@ -92,13 +92,14 @@ idh mcp
 
 ## 编译变体
 
-一份源码编出三个变体，差别只有编译期的 `-DDH_VARIANT` 编号（见 `src/core/dh_capability.c`）。该编号目前只影响 MCP `get_capabilities` 握手自报的 `variant` 字段，**能力位不随变体改变**。
+一份源码编出四个变体，差别只有编译期的 `-DDH_VARIANT` 编号（见 `src/core/dh_capability.c`）。该编号目前只影响 MCP `get_capabilities` 握手自报的 `variant` 字段，**能力位不随变体改变**。
 
 | 变体 | 命令 | 架构 | 用途 |
 |------|------|------|------|
 | `dev`（默认） | `make` | arm64 | 开发者手动注入 / `DYLD_INSERT_LIBRARIES` / 本地调试 |
 | `trollstore` | `make VARIANT=trollstore` | arm64 | 巨魔注入器 —— **Release 里的 dylib 资产** |
-| `rootless` | `make VARIANT=rootless` | arm64 | 越狱插件 —— **deb 包里的引擎** |
+| `rootless` | `make VARIANT=rootless` | arm64 | **rootless deb 包里的引擎** |
+| `roothide` | `make VARIANT=roothide` | arm64 + arm64e | **roothide deb 包里的引擎**（胖切片） |
 
 ### 其他构建目标
 
@@ -143,7 +144,7 @@ tools/         gen_web.py（Web 资源转头文件）、patch_info_plist.py（IP
 app/           越狱版管理器 App（桌面图标：开关应用 / 检查更新 / 版本回滚）
 daemon/        updater daemon（launchd 按需拉起，检查 / 下载 / 安装 / 回滚引擎）
 repo/          Sileo 源公钥（装进设备 APT 信任链，否则源索引无法更新）
-vendor/dylib/  打包用引擎落地目录（由 make deb 自动填充）
+vendor/dylib/  打包用引擎落地目录（由 make deb / make test-updater 编译生成，不入版本库）
 build_deb.sh   越狱 deb 打包脚本
 ```
 

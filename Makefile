@@ -84,11 +84,13 @@ CAPSTONE_DEF := -DCAPSTONE_USE_SYS_DYN_MEM -DCAPSTONE_HAS_ARM -DCAPSTONE_HAS_ARM
 VERSION_DEF := -DDH_VERSION_STR=\"$(VERSION)\"
 
 # ---------- 打包变体矩阵 ----------
-# 一份源码编出 3 个变体, 差别只有编译期 -DDH_VARIANT 编号 (见 src/core/dh_capability.c)。
+# 一份源码编出 4 个变体, 差别只有编译期 -DDH_VARIANT 编号 (见 src/core/dh_capability.c)。
 # 该编号目前只影响 MCP get_capabilities 握手自报的 variant 字段, 能力位不随变体改变。
+# 编号 0/1/2 已是已发布产物的既有语义, 不得重排; 新增只能往后追加。
 #   make                       -> dev        (0) 开发者手动注入 / DYLD_INSERT
 #   make VARIANT=trollstore    -> trollstore (1) 巨魔注入器 —— Release 里的 dylib 资产
-#   make VARIANT=rootless      -> rootless   (2) 越狱插件 —— deb 包里的引擎
+#   make VARIANT=rootless      -> rootless   (2) 越狱 rootless 包
+#   make VARIANT=roothide      -> roothide   (3) 越狱 roothide 包 (胖切片 arm64+arm64e)
 VARIANT ?= dev
 
 ifeq ($(VARIANT),dev)
@@ -103,8 +105,12 @@ else ifeq ($(VARIANT),rootless)
     DH_VARIANT_NUM := 2
     ARCH    := arm64
     MIN_IOS := 14.0
+else ifeq ($(VARIANT),roothide)
+    DH_VARIANT_NUM := 3
+    ARCH    := arm64
+    MIN_IOS := 14.0
 else
-    $(error 未知 VARIANT=$(VARIANT); 可选: dev / trollstore / rootless)
+    $(error 未知 VARIANT=$(VARIANT); 可选: dev / trollstore / rootless / roothide)
 endif
 
 # ---------- 1) iOS 真机 dylib (默认 target) ----------
@@ -225,8 +231,9 @@ dist: $(TARGET)
 
 # ---------- 5) 越狱 deb 包 (rootless / roothide) ----------
 # 引擎在本仓编译 → 落进 vendor/dylib/<variant>/ → 交给 build_deb.sh 打包。
-# 两个 deb 变体用的是同一份 rootless 引擎, 只有架构不同
-# (rootless=arm64, roothide=arm64+arm64e), 与线上 1.27.5 产物的构成一致。
+# 每个 deb 包编自己的引擎变体, 架构也各按环境: rootless=arm64, roothide=arm64+arm64e。
+# (1.27.5 及之前 roothide 包用的也是 rootless 变体引擎, 于是包内 version.plist 写
+#  roothide 而引擎自报 rootless, 两者矛盾; 现已修正为各自对应的变体。)
 .PHONY: stage-rootless stage-roothide
 
 stage-rootless:
@@ -236,8 +243,8 @@ stage-rootless:
 	cp $(TARGET) vendor/dylib/rootless/$(TARGET)
 
 stage-roothide:
-	@echo "[*] 编译引擎 (VARIANT=rootless, archs=arm64 arm64e) → vendor/dylib/roothide"
-	$(MAKE) -B VARIANT=rootless ARCHS="arm64 arm64e" all
+	@echo "[*] 编译引擎 (VARIANT=roothide, archs=arm64 arm64e) → vendor/dylib/roothide"
+	$(MAKE) -B VARIANT=roothide ARCHS="arm64 arm64e" all
 	mkdir -p vendor/dylib/roothide
 	cp $(TARGET) vendor/dylib/roothide/$(TARGET)
 
@@ -254,13 +261,15 @@ deb:
 	$(MAKE) deb-roothide
 
 # 仿真回归测试：在 macOS 上把 daemon 跑成真机布局，用线上 release 走完整更新链路
-test-updater:
+# 测试需要一个「旧引擎」作替身，所以先 stage 一份 roothide 引擎（该目录不入版本库）
+test-updater: stage-roothide
 	@chmod +x tests/updater_sim_test.sh
 	./tests/updater_sim_test.sh
 
 clean:
 	rm -f $(TARGET) $(MAC_TARGET) $(SIM_TARGET) decrypt_helper-*.dylib
 	rm -f $(WEB_HEADER) $(WECHAT_HEADER)
+	rm -f vendor/dylib/rootless/$(TARGET) vendor/dylib/roothide/$(TARGET)
 	rm -rf build/
 
 .PHONY: all linux mac sim dist clean deb deb-rootless deb-roothide test-updater

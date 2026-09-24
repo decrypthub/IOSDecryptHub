@@ -16,10 +16,12 @@ extern "C" {
 #endif
 
 // 打包变体 —— 编译期 -DDH_VARIANT=<n> 注入, 缺省 0 (开发者 dylib)。
+// 已有取值不得重排: 0/1/2 是已发布产物的既有语义, 新增只能往后追加。
 typedef enum {
     DH_VARIANT_DEV = 0,      // insert_dylib / DYLD_INSERT_LIBRARIES (开发者手动注入)
     DH_VARIANT_TROLLSTORE,   // 巨魔 (TrollStore) 持久化安装
-    DH_VARIANT_ROOTLESS,     // 越狱 rootless (ElleKit 加载器注入)
+    DH_VARIANT_ROOTLESS,     // 越狱 rootless (ElleKit 加载器注入, arm64)
+    DH_VARIANT_ROOTHIDE,     // 越狱 roothide (ElleKit 加载器注入, 胖切片 arm64+arm64e)
     DH_VARIANT_COUNT
 } dh_variant;
 

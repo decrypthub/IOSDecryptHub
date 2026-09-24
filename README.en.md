@@ -92,13 +92,14 @@ idh mcp
 
 ## Build variants
 
-One source tree produces three variants. They differ only in the compile-time `-DDH_VARIANT` number (see `src/core/dh_capability.c`). That number currently only affects the `variant` field the MCP `get_capabilities` handshake reports — **capability bits do not change between variants**.
+One source tree produces four variants. They differ only in the compile-time `-DDH_VARIANT` number (see `src/core/dh_capability.c`). That number currently only affects the `variant` field the MCP `get_capabilities` handshake reports — **capability bits do not change between variants**.
 
 | Variant | Command | Arch | Purpose |
 |---------|---------|------|---------|
 | `dev` (default) | `make` | arm64 | Manual injection / `DYLD_INSERT_LIBRARIES` / local debugging |
 | `trollstore` | `make VARIANT=trollstore` | arm64 | TrollStore injector — **the dylib asset in our Releases** |
-| `rootless` | `make VARIANT=rootless` | arm64 | Jailbreak tweak — **the engine inside the debs** |
+| `rootless` | `make VARIANT=rootless` | arm64 | **engine inside the rootless deb** |
+| `roothide` | `make VARIANT=roothide` | arm64 + arm64e | **engine inside the roothide deb** (fat slice) |
 
 ### Other build targets
 
@@ -143,7 +144,7 @@ tools/         gen_web.py (web assets to header), patch_info_plist.py (used by I
 app/           Jailbreak manager app (home-screen icon: toggle apps, check updates, roll back)
 daemon/        Updater daemon (launched on demand by launchd; checks, downloads, installs, rolls back)
 repo/          Sileo repo public key (installed into the device APT trust chain, or index updates fail)
-vendor/dylib/  Staging directory for the engine used by packaging (filled by make deb)
+vendor/dylib/  Staging directory for the engine used by packaging (built by make deb / make test-updater, not tracked)
 build_deb.sh   Jailbreak deb packaging script
 ```
 
