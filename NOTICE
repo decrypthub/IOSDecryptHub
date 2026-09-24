@@ -1,0 +1,15 @@
+IOSDecryptHub
+Copyright (c) 2026 taisuii
+
+This product includes third-party software. Their original copyright notices
+and license terms are retained in the corresponding source files.
+
+fishhook
+  Location: src/core/fishhook.c, src/core/fishhook.h
+  License:  BSD-3-Clause
+  Copyright (c) 2013, Facebook, Inc.
+
+Capstone Disassembly Engine
+  Location: src/core/capstone/
+  License:  BSD-3-Clause (see src/core/capstone/LICENSE.TXT)
+  Copyright (c) 2013, COSEINC. Designed & implemented by Nguyen Anh Quynh.

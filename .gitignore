@@ -3,7 +3,30 @@ build/
 *.deb
 *.dSYM/
 *.o
+*.a
+*.profraw
 
+# 编译出的引擎 (根目录产物; vendor/dylib/ 下的成品引擎随仓分发, 见 build_deb.sh)
+/decrypt_helper.dylib
+/decrypt_helper-*.dylib
+/decrypt_helper.mac.dylib
+/decrypt_helper.sim.dylib
+
+# 生成的 Web 资源头文件 (make 自动从 web/ 生成)
+src/server/web_index_html.h
+src/server/web_wechat_png.h
+
+# inject.sh 中间产物
+work_*/
+hooked_*.ipa
+*-hooked*.ipa
+
+# 系统 / 编辑器垃圾
 .DS_Store
 *.swp
+
+# Python 缓存
+__pycache__/
+
+# AI 工具配置
 .claude/

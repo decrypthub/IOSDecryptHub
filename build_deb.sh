@@ -1,13 +1,13 @@
 #!/bin/bash
 # build_deb.sh — 打包 IOSDecryptHub rootless / roothide 越狱 deb
 #
-# dylib:
+# dylib（引擎，由本仓源码编译后落在 vendor/ 下）:
 #   vendor/dylib/rootless/decrypt_helper.dylib   (arm64)
 #   vendor/dylib/roothide/decrypt_helper.dylib   (arm64 + arm64e)
 #
 # 包内组件:
 #   IOSDecryptHubLoader.dylib  ElleKit 注入加载器（读名单 → dlopen 引擎，无 hook）
-#   decrypt_helper.dylib       闭源引擎（vendor 成品）
+#   decrypt_helper.dylib       运行时分析引擎（本仓 src/ 编译产物）
 #   IOSDecryptHubManager.app   管理器 App（唯一入口：应用开关 / 更新 / 关于）
 #   IOSDecryptHubUpdated       updater daemon，一次性进程（检查/安装/回滚），见 AGENTS.md
 #
@@ -138,8 +138,9 @@ require_vendor_dylib() {
     local VARIANT="$1"
     local EXPECTED_ARCH="$2"
     local DYLIB="$VENDOR_DIR/$VARIANT/decrypt_helper.dylib"
-    [ -f "$DYLIB" ] || error "缺少成品 dylib: $DYLIB
-请先由私有仓执行 make deb，或手动把对应架构的 decrypt_helper.dylib 放到该路径。"
+    [ -f "$DYLIB" ] || error "缺少引擎: $DYLIB
+请先在仓库根目录执行 make deb（会自动编译引擎并落到 vendor/dylib/），
+或手动把对应架构的 decrypt_helper.dylib 放到该路径。"
     verify_macho_arch "$DYLIB" "$EXPECTED_ARCH" "$VARIANT 主 dylib (vendor)"
     echo "$DYLIB"
 }
