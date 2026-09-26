@@ -128,6 +128,29 @@ make deb-roothide     # 仅 roothide（arm64 + arm64e）
 make test-updater
 ```
 
+## 发布
+
+发布产物固定三件：`decrypt_helper-<version>.dylib`（巨魔变体，给注入器用）
++ rootless / roothide 两个 deb。
+
+```bash
+# 本地一键发版：编译 → 打 tag → 建 Release 并上传三件资产
+./scripts/publish_release.sh
+```
+
+也可以交给 CI —— 先改 `Makefile` 里的 `VERSION` 并推 main，再：
+
+```bash
+git tag v1.27.6 && git push origin v1.27.6
+```
+
+`.github/workflows/release.yml` 会自动编译并创建 Release；Release 说明优先读
+`.github/release-notes/<version>.md`（建议手写），没有则用提交标题自动生成。
+`build.yml` 只在推 main / PR 时做编译验证，不发 Release。
+
+两个工作流都会校验 tag 版本与 `Makefile` 的 `VERSION` 一致；CI 发现该 tag 的 Release
+已存在时会跳过，所以本地发过之后再推 tag 也不会重复构建。
+
 ## 仓库结构
 
 ```

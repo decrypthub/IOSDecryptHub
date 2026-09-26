@@ -1,0 +1,68 @@
+name: Build
+
+# 持续集成：每次推 main / PR 都编译一遍，防止提交把构建弄坏。
+# 只产 artifact，不发 Release（发版走 release.yml）。
+#
+# 想在云端顺手把 dylib 注入到一个 IPA 里，用 workflow_dispatch 填 ipa_url。
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: '目标 IPA 的下载链接（可选，填了会自动注入并产出 hooked_*.ipa）'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 编译巨魔变体（= 发布用的那份 dylib）
+        run: |
+          set -euo pipefail
+          make VARIANT=trollstore dist
+          echo "--- 产物 ---"
+          ls -l decrypt_helper-*.dylib
+          lipo -info decrypt_helper-*.dylib
+
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: decrypt_helper_dylib
+          path: decrypt_helper-*.dylib
+
+      - name: 安装 insert_dylib（仅注入时需要）
+        if: ${{ github.event.inputs.ipa_url != '' }}
+        run: |
+          set -euo pipefail
+          brew install insert_dylib 2>/dev/null || {
+            git clone --depth 1 https://github.com/Tyilo/insert_dylib.git /tmp/insert_dylib
+            make -C /tmp/insert_dylib
+            sudo cp /tmp/insert_dylib/build/insert_dylib /usr/local/bin/
+          }
+          insert_dylib --help >/dev/null
+
+      - name: 下载并注入 IPA
+        if: ${{ github.event.inputs.ipa_url != '' }}
+        run: |
+          set -euo pipefail
+          curl -fSL "${{ github.event.inputs.ipa_url }}" -o input.ipa
+          chmod +x scripts/inject.sh
+          ./scripts/inject.sh input.ipa "$(ls decrypt_helper-*.dylib | head -1)"
+
+      - name: 上传注入后的 IPA
+        if: ${{ github.event.inputs.ipa_url != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: hooked_ipa
+          path: hooked_*.ipa
