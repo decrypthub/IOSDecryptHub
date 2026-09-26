@@ -128,6 +128,29 @@ Simulated regression test for the update path (runs on macOS, no device needed, 
 make test-updater
 ```
 
+## Releasing
+
+A release carries exactly three assets: `decrypt_helper-<version>.dylib` (the TrollStore
+variant, for injectors) plus the rootless and roothide debs.
+
+```bash
+# one-shot local release: build → tag → create the GitHub Release with all three assets
+./scripts/publish_release.sh
+```
+
+Or let CI do it — bump `VERSION` in `Makefile`, push to main, then:
+
+```bash
+git tag v1.27.6 && git push origin v1.27.6
+```
+
+`.github/workflows/release.yml` builds and creates the Release. Release notes come from
+`.github/release-notes/<version>.md` when present (preferred), otherwise from commit
+subjects. `build.yml` only compiles on push/PR and uploads artifacts — it never publishes.
+
+Both workflows verify that the tag matches `VERSION` in the `Makefile`, and CI skips
+entirely when a Release for that tag already exists, so publishing locally first is safe.
+
 ## Repository layout
 
 ```

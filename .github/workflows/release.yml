@@ -1,0 +1,147 @@
+name: Release
+
+# 发布链路（公开仓自持，不再依赖任何私有仓）。
+#
+# 触发方式：
+#   1) 推 tag：  git tag v1.27.6 && git push origin v1.27.6
+#   2) 手动：    Actions → Release → Run workflow，填版本号（不带 v）
+#
+# 若该 tag 的 Release 已经存在（例如本地用 scripts/publish_release.sh 先发过了），
+# 本工作流会直接跳过，不会重复构建或报错。
+#
+# 产出（与历史 Release 资产构成一致，固定三件）：
+#   decrypt_helper-<version>.dylib            巨魔注入器用的引擎
+#   com.iosdecrypthub_<version>_rootless.deb  rootless 越狱包
+#   com.iosdecrypthub_<version>_roothide.deb  roothide 越狱包
+#
+# Release 说明来源：优先用 .github/release-notes/<version>.md（手写），
+# 没有则用上一个 tag 到当前的提交标题自动生成。
+
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不带 v，需与 Makefile 的 VERSION 完全一致）'
+        required: true
+        type: string
+
+permissions:
+  contents: write   # 创建 Release / 上传资产需要
+
+jobs:
+  release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # 自动生成 release notes 需要完整 tag 历史
+
+      - name: 解析版本号并校验与 Makefile 一致
+        id: v
+        run: |
+          set -euo pipefail
+          MAKE_VERSION="$(grep -E '^VERSION[[:space:]]*:=' Makefile | head -1 | sed -E 's/^VERSION[[:space:]]*:=[[:space:]]*//')"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            TAG="${{ github.ref_name }}"
+          else
+            TAG="v${{ inputs.version }}"
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Makefile VERSION=$MAKE_VERSION / tag 版本=$VERSION"
+          if [ "$VERSION" != "$MAKE_VERSION" ]; then
+            echo "::error::tag 版本（$VERSION）与 Makefile 的 VERSION（$MAKE_VERSION）不一致，先改 Makefile 再发版"
+            exit 1
+          fi
+
+      - name: 检查 Release 是否已存在
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG 已存在，跳过（可能由 scripts/publish_release.sh 本地发布过）"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装打包依赖
+        if: steps.check.outputs.exists != 'true'
+        run: brew install ldid dpkg
+
+      - name: 编译发布产物
+        if: steps.check.outputs.exists != 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          # 顺序不能反：dist 先抄走 trollstore 变体的 decrypt_helper.dylib，
+          # deb 阶段会反复覆盖同名文件。
+          make VARIANT=trollstore dist
+          make deb
+          echo "--- 产物 ---"
+          ls -l "decrypt_helper-${VERSION}.dylib" build/deb/*.deb
+
+      - name: 生成 release notes
+        id: notes
+        if: steps.check.outputs.exists != 'true'
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+          TAG: ${{ steps.v.outputs.tag }}
+        run: |
+          set -euo pipefail
+          HANDWRITTEN=".github/release-notes/${VERSION}.md"
+          if [ -f "$HANDWRITTEN" ]; then
+            echo "用上手写说明: $HANDWRITTEN"
+            echo "path=$HANDWRITTEN" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          PREV="$(git tag --sort=-v:refname | grep -vx "$TAG" | head -1 || true)"
+          {
+            echo "## IOSDecryptHub $TAG"
+            echo
+            if [ -n "$PREV" ]; then
+              echo "自 $PREV 以来的改动："
+              echo
+              git log --no-merges --pretty='- %s' "$PREV..HEAD"
+            else
+              echo "首次发布。"
+            fi
+          } > /tmp/release-notes.md
+          echo "path=/tmp/release-notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: 创建 Release 并上传三件资产
+        if: steps.check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.v.outputs.version }}
+          TAG: ${{ steps.v.outputs.tag }}
+          NOTES: ${{ steps.notes.outputs.path }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TARGET_ARGS=(--target "$GITHUB_SHA")
+          else
+            TARGET_ARGS=()
+          fi
+          gh release create "$TAG" \
+            --title "IOSDecryptHub $TAG" \
+            --notes-file "$NOTES" \
+            "${TARGET_ARGS[@]}" \
+            "decrypt_helper-${VERSION}.dylib" \
+            "build/deb/com.iosdecrypthub_${VERSION}_rootless.deb" \
+            "build/deb/com.iosdecrypthub_${VERSION}_roothide.deb"
+
+      - name: 发布结果
+        if: steps.check.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.v.outputs.tag }}
+        run: gh release view "$TAG" --json url,assets --jq '.url, (.assets[].name)'
