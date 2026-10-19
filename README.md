@@ -208,8 +208,8 @@ build_deb.sh   越狱 deb 打包脚本
   <img src="./wechat-qr.png" alt="微信公众号 DecryptHub" width="168">
 </p>
 
-- Telegram：https://t.me/decrypthubteam
-- X：https://x.com/decrypthub_
+- Telegram：[decrypthubteam](https://t.me/decrypthubteam)
+- X：[decrypthub_](https://x.com/decrypthub_)
 
 ## 协议
 
