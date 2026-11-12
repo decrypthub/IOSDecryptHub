@@ -8,10 +8,23 @@
 #import <pthread.h>
 #import <stdatomic.h>
 #include <mach/mach.h>
+#include <mach/vm_region.h>
+#include <dlfcn.h>
+#include <string.h>
 #include <ptrauth.h>
 #import "dh_thunk.h"
 #import "log_store.h"
 #import "fishhook.h"
+
+// 内联 hook 后端：Dobby（静态链接）。arm64e 切片在 Makefile 里把 DH_HAVE_INLINE 置 0，
+// 因为 vendor 里的 Dobby/QBDI 静态库只有 arm64 切片；代码仍编译，只拒绝安装并说明原因。
+#ifndef DH_HAVE_INLINE
+#define DH_HAVE_INLINE 1
+#endif
+
+#if DH_HAVE_INLINE
+#include "dobby.h"
+#endif
 
 // asm 尾调用要用的「原函数指针表」—— thunk 用 slot 索引它跳转。必须是全局符号(asm 引用)。
 void *g_dh_thunk_orig[DH_THUNK_COUNT];
@@ -237,7 +250,8 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
     @autoreleasepool {
         DHLogEntry *e = [DHLogEntry new];
         e.category  = DHCategoryOther;
-        e.algorithm = (s->kind == DH_HOOK_METHOD) ? @"objc-hook" : @"import-hook";
+        e.algorithm = (s->kind == DH_HOOK_METHOD) ? @"objc-hook"
+                    : (s->kind == DH_HOOK_INLINE) ? @"inline-hook" : @"import-hook";
         e.operation = [NSString stringWithUTF8String:s->name];
         NSMutableString *d = [NSMutableString stringWithFormat:@"slot=%llu hits=%llu\n",
                               (unsigned long long)slot, (unsigned long long)n];
@@ -342,6 +356,153 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
     method_setImplementation(m, (IMP)dh_slot_addr(slot));
     pthread_mutex_unlock(&g_install_lock);
     return slot;
+}
+
+// ---- 内联 hook (Dobby) ----
+// 复用同一张 thunk 表：DobbyHook 把目标函数序言改跳到 thunk[slot]，thunk 记录后尾调用
+// DobbyHook 返回的原函数蹦床。参数寄存器/栈保持原样，所以对目标透明（入口观测）。
+
+static BOOL dh_addr_is_executable(uint64_t addr) {
+    vm_address_t region = (vm_address_t)addr;
+    vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    kern_return_t kr = vm_region_64(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
+                                    (vm_region_info_t)&info, &count, &object);
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    return kr == KERN_SUCCESS && (info.protection & VM_PROT_EXECUTE) &&
+           addr >= (uint64_t)region && addr < (uint64_t)region + size;
+}
+
+static void *dh_resolve_inline_target(const char *module, const char *symbol,
+                                      uint64_t addr, char *err, size_t errsz) {
+    if (err && errsz) err[0] = '\0';
+    if (addr) {
+        if (!dh_addr_is_executable(addr)) {
+            if (err) snprintf(err, errsz, "addr 0x%llx is not in an executable mapping",
+                              (unsigned long long)addr);
+            return NULL;
+        }
+        return (void *)(uintptr_t)addr;
+    }
+    if (!symbol || !symbol[0]) {
+        if (err) snprintf(err, errsz, "symbol or addr required");
+        return NULL;
+    }
+    void *handle = NULL;
+    if (module && module[0]) {
+        const char *prefixes[3] = { "", "/var/jb/usr/lib/", "/usr/lib/" };
+        char path[512];
+        for (int i = 0; i < 3 && !handle; i++) {
+            snprintf(path, sizeof(path), "%s%s", prefixes[i], module);
+            handle = dlopen(path, RTLD_LAZY | RTLD_NOLOAD);
+            if (!handle) handle = dlopen(path, RTLD_LAZY);
+        }
+        if (!handle && err) snprintf(err, errsz, "dlopen(%s) failed: %s", module,
+                                     dlerror() ?: "unknown");
+    } else {
+        handle = dlopen(NULL, RTLD_LAZY);
+    }
+    void *target = handle ? dlsym(handle, symbol) : NULL;
+    if (!target) target = dlsym(RTLD_DEFAULT, symbol);
+    if (!target && symbol[0] != '_') {
+        char underscored[256];
+        snprintf(underscored, sizeof(underscored), "_%s", symbol);
+        target = dlsym(RTLD_DEFAULT, underscored);
+    }
+    if (!target && err) {
+        snprintf(err, errsz, "symbol %s not found%s%s", symbol,
+                 (module && module[0]) ? " in " : "", (module && module[0]) ? module : "");
+    }
+    return target;
+}
+
+int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t addr,
+                            const char *label, char *err, size_t errsz) {
+    if (err && errsz) err[0] = '\0';
+    if (!DH_THUNK_ARM64) {
+        if (err) snprintf(err, errsz, "inline hook is only supported on arm64/arm64e");
+        return -4;
+    }
+    // 处理器在命中瞬间会分配 Foundation 对象（事件、字符串、栈符号化）。
+    // hook 分配器本身会递归进同一分配器，在 malloc 序言/原函数蹦床尚未完成时重入，
+    // 实测会直接把宿主打死（engine_shell 在 hook malloc 后立刻退出）。这里显式拒绝。
+    if (symbol && symbol[0]) {
+        static const char *unsafe_syms[] = {
+            "malloc", "calloc", "realloc", "free", "valloc", "posix_memalign",
+            "aligned_alloc", "malloc_zone_malloc", "malloc_zone_calloc",
+            "malloc_zone_realloc", "malloc_zone_free",
+            "objc_msgSend", "_objc_msgSend", "objc_retain", "objc_release",
+            NULL
+        };
+        for (int i = 0; unsafe_syms[i]; i++) {
+            if (strcmp(symbol, unsafe_syms[i]) == 0) {
+                if (err) snprintf(err, errsz,
+                    "refusing to inline-hook allocator/runtime symbol '%s': the hit handler allocates, "
+                    "so hooking allocation itself recurses before the original prologue completes and kills the process. "
+                    "Hook the caller/algorithm function instead.", symbol);
+                return -4;
+            }
+        }
+    }
+#if !DH_HAVE_INLINE
+    if (err) snprintf(err, errsz,
+                      "inline hook backend is not linked in this slice (vendor Dobby is arm64-only)");
+    return -4;
+#else
+    void *target = dh_resolve_inline_target(module, symbol, addr, err, errsz);
+    if (!target) return -2;
+
+    pthread_mutex_lock(&g_install_lock);
+    int slot = dh_alloc_slot();
+    if (slot < 0) {
+        pthread_mutex_unlock(&g_install_lock);
+        if (err) snprintf(err, errsz, "hook slots exhausted (capacity %d)", DH_THUNK_COUNT);
+        return -1;
+    }
+    dh_slot_t *s = &g_slots[slot];
+    memset(s, 0, sizeof(*s));
+    if (label && label[0]) {
+        snprintf(s->name, sizeof(s->name), "%s", label);
+    } else if (symbol && symbol[0] && module && module[0]) {
+        snprintf(s->name, sizeof(s->name), "%s!%s", module, symbol);
+    } else if (symbol && symbol[0]) {
+        snprintf(s->name, sizeof(s->name), "%s", symbol);
+    } else {
+        snprintf(s->name, sizeof(s->name), "0x%llx", (unsigned long long)(uintptr_t)target);
+    }
+    s->kind = DH_HOOK_INLINE;
+    s->used = 1;
+    atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
+    g_dh_thunk_orig[slot] = NULL;
+    atomic_store_explicit(&s->enabled, 0, memory_order_release);
+
+    int rc = DobbyHook(target, (void *)dh_slot_addr(slot),
+                       (void **)&g_dh_thunk_orig[slot]);
+    if (rc != 0 || g_dh_thunk_orig[slot] == NULL) {
+        s->used = 0;
+        s->name[0] = '\0';
+        int last = slot + 1;
+        atomic_compare_exchange_strong_explicit(&g_next_slot, &last, slot,
+                                                memory_order_relaxed, memory_order_relaxed);
+        pthread_mutex_unlock(&g_install_lock);
+        if (err) snprintf(err, errsz, "DobbyHook(0x%llx) failed: rc=%d orig=%p",
+                          (unsigned long long)(uintptr_t)target, rc, g_dh_thunk_orig[slot]);
+        return -4;
+    }
+    atomic_store_explicit(&s->enabled, 1, memory_order_release);
+    pthread_mutex_unlock(&g_install_lock);
+    return slot;
+#endif
+}
+
+const char *dh_thunk_inline_backend(void) {
+#if DH_HAVE_INLINE
+    return "dobby";
+#else
+    return "unavailable(arm64e-slice)";
+#endif
 }
 
 int dh_thunk_set_describe(int slot, int on) {

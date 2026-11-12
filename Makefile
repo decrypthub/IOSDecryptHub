@@ -18,7 +18,7 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.27.6
+VERSION := 1.28.0
 TARGET  := decrypt_helper.dylib
 
 # Capstone 反汇编库源文件（仅 ARM/ARM64 架构）
@@ -70,6 +70,7 @@ SRC     := src/core/fishhook.c \
            src/hooks/behavior/hook_webkit.m \
            src/server/http_server.m \
            src/server/mcp_server.m \
+           src/trace/qbdi_trace.m \
            src/server/dh_log_json.m \
            src/ui/ui_float.m \
            src/core/main.m \
@@ -118,7 +119,18 @@ SDK     := $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
 CC      := $(shell xcrun --find clang)
 ARCHS   ?= $(ARCH)
 ARCH_FLAGS := $(foreach A,$(ARCHS),-arch $(A))
-INCLUDES := -Isrc/core -Isrc/core/capstone/include -Isrc/hooks/crypto -Isrc/hooks/behavior -Isrc/server -Isrc/ui
+INCLUDES := -Isrc/core -Isrc/core/capstone/include -Isrc/hooks/crypto -Isrc/hooks/behavior -Isrc/server -Isrc/ui \
+            -Ivendor/dobby/include -Ivendor/qbdi/include
+
+# vendor 的 Dobby/QBDI 静态库目前只构建了 arm64 切片。含 arm64e 的胖构建（roothide）先不链接，
+# 让 inline_hook/trace_function 明确报 backend unavailable，而不是链接失败或静默降级。
+ifeq ($(filter arm64e,$(ARCHS)),)
+  VENDOR_DEF  := -DDH_HAVE_INLINE=1 -DDH_HAVE_QBDI=1
+  VENDOR_LIBS := vendor/dobby/lib/libdobby.a vendor/qbdi/lib/libQBDI.a -lc++
+else
+  VENDOR_DEF  := -DDH_HAVE_INLINE=0 -DDH_HAVE_QBDI=0
+  VENDOR_LIBS :=
+endif
 WEB_HEADER := src/server/web_index_html.h
 WECHAT_HEADER := src/server/web_wechat_png.h
 WEB_ASSETS := $(WEB_HEADER) $(WECHAT_HEADER)
@@ -134,6 +146,7 @@ CFLAGS  := $(ARCH_FLAGS) \
            $(INCLUDES) \
            $(CAPSTONE_DEF) \
            $(VERSION_DEF) \
+           $(VENDOR_DEF) \
            -DDH_VARIANT=$(DH_VARIANT_NUM) \
            $(FRAMEWORKS)
 
@@ -148,7 +161,7 @@ $(WECHAT_HEADER): web/wechat-follow.png tools/gen_web.py
 $(TARGET): $(WEB_ASSETS) $(SRC) Makefile
 	@if [ -z "$(SDK)" ]; then echo "❌ 没找到 iPhoneOS SDK (xcrun --sdk iphoneos)"; exit 1; fi
 	@echo "[*] 编译 iOS dylib (VARIANT=$(VARIANT), archs=$(ARCHS), min=$(MIN_IOS))..."
-	$(CC) $(CFLAGS) $(SRC) -o $(TARGET)
+	$(CC) $(CFLAGS) $(SRC) $(VENDOR_LIBS) -o $(TARGET)
 	@echo "✅ $(TARGET)"
 
 # ---------- 2) Linux 交叉编译 (WSL) ----------
@@ -164,8 +177,8 @@ linux:
 	$(CROSS_CC) $(ARCH_FLAGS) -isysroot $(IOS_SDK) -miphoneos-version-min=$(MIN_IOS) \
 		-dynamiclib -install_name @executable_path/$(TARGET) \
 		-ObjC -fobjc-arc -Wall -Wno-deprecated-declarations -Wno-nullability-completeness \
-		-O2 $(INCLUDES) $(CAPSTONE_DEF) $(VERSION_DEF) -DDH_VARIANT=$(DH_VARIANT_NUM) $(FRAMEWORKS) \
-		$(SRC) -o $(TARGET)
+		-O2 $(INCLUDES) $(CAPSTONE_DEF) $(VERSION_DEF) $(VENDOR_DEF) -DDH_VARIANT=$(DH_VARIANT_NUM) $(FRAMEWORKS) \
+		$(SRC) $(VENDOR_LIBS) -o $(TARGET)
 	@echo "✅ $(TARGET) (linux cross)"
 
 # ---------- 3a) macOS 灰度测试 ----------
@@ -183,6 +196,7 @@ MAC_CFLAGS := -target $(MAC_ARCH)-apple-macos$(MAC_MIN) \
               $(INCLUDES) \
               $(CAPSTONE_DEF) \
               $(VERSION_DEF) \
+              -DDH_HAVE_INLINE=0 -DDH_HAVE_QBDI=0 \
               -DDH_VARIANT=0 \
               -framework Foundation -framework CoreGraphics -framework Security
 
@@ -209,6 +223,7 @@ SIM_CFLAGS := -target $(SIM_ARCH)-apple-ios$(SIM_MIN)-simulator \
               $(INCLUDES) \
               $(CAPSTONE_DEF) \
               $(VERSION_DEF) \
+              -DDH_HAVE_INLINE=0 -DDH_HAVE_QBDI=0 \
               $(FRAMEWORKS)
 
 sim: $(WEB_ASSETS) $(SIM_TARGET)

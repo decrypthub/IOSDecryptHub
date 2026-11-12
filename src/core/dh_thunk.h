@@ -15,6 +15,7 @@
 #define DH_THUNK_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <objc/runtime.h>
 
 #ifdef __cplusplus
@@ -27,6 +28,7 @@ extern "C" {
 typedef enum {
     DH_HOOK_IMPORT = 0,   // 导入 C 符号 (fishhook): x0.. = 原始参数
     DH_HOOK_METHOD = 1,   // ObjC 方法 (swizzle): x0=self, x1=_cmd(SEL), x2.. = 参数
+    DH_HOOK_INLINE = 2,   // 内联 hook (Dobby): 直接改写函数序言, x0.. = 原始参数
 } dh_hook_kind;
 
 // 一个已装 hook 的运行时快照 (给 list_hooks 用)。
@@ -47,6 +49,17 @@ int  dh_thunk_install_import(const char *symbol, const char *label);
 
 // 装 ObjC 方法 hook。classMethod!=0 走类方法。返回 slot(>=0); -1 槽位耗尽; -3 类/方法不存在。
 int  dh_thunk_install_method(const char *className, const char *selector, int classMethod);
+
+// 装内联 hook (Dobby)。module 可为 NULL/"" (退化为 RTLD_DEFAULT)，symbol 或 addr 二选一：
+//   - module+symbol: dlopen(module) + dlsym(symbol)，module 也尝试 /var/jb/usr/lib、/usr/lib 下同名库
+//   - addr: 绝对地址，安装前用 vm_region 校验落在可执行映射里
+// 返回 slot(>=0); -1 槽位耗尽; -2 目标无法解析/非可执行地址; -4 后端不可用或安装失败。
+// err 写入可读原因（可为 NULL）。
+int  dh_thunk_install_inline(const char *module, const char *symbol, uint64_t addr,
+                             const char *label, char *err, size_t errsz);
+
+// 内联 hook 后端名称/可用性（不安装任何东西；用于 get_capabilities / 错误解释）。
+const char *dh_thunk_inline_backend(void);
 
 // 打开某个 hook 的「参数反引用」(默认关闭, 返回 0 成功 / -1 槽位无效):
 //   - DH_HOOK_METHOD: 前几个参数当 ObjC 对象读 (NSData → hex 前缀, NSString → 文本, 其它 → description)

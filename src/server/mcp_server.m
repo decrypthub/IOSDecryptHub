@@ -24,6 +24,7 @@
 #include "dh_files.h"
 #include "dump_manager.h"
 #include "hook_webkit.h"
+#include "../trace/qbdi_trace.h"
 #include <string.h>
 
 #define MCP_SERVER_NAME     "ios-decrypt-helper"
@@ -1434,6 +1435,119 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     return tool_ok(res);
 }
 
+// hook_inline — 对任意函数装只读内联 hook (Dobby)。复用 thunk 表做入口快照 + 尾调用原函数。
+// 目标可以是 module+symbol，也可以是绝对地址；对静态链接/模块内自研函数同样有效。
+static BOOL dh_parse_addr_arg(id raw, uint64_t *out) {
+    if (!raw) return NO;
+    if ([raw isKindOfClass:NSNumber.class]) { *out = [raw unsignedLongLongValue]; return YES; }
+    if ([raw isKindOfClass:NSString.class]) {
+        NSString *s = [(NSString *)raw stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([s hasPrefix:@"0x"] || [s hasPrefix:@"0X"]) s = [s substringFromIndex:2];
+        if (s.length == 0) return NO;
+        const char *c = s.UTF8String;
+        char *end = NULL;
+        unsigned long long v = strtoull(c, &end, 16);
+        if (end == c || (end && *end != '\0')) return NO;
+        *out = (uint64_t)v;
+        return YES;
+    }
+    return NO;
+}
+
+static NSDictionary *tool_hook_inline(NSDictionary *args) {
+    NSString *module = [args[@"module"] isKindOfClass:NSString.class] ? args[@"module"] : nil;
+    NSString *symbol = [args[@"symbol"] isKindOfClass:NSString.class] ? args[@"symbol"] : nil;
+    NSString *label  = [args[@"label"] isKindOfClass:NSString.class] ? args[@"label"] : nil;
+    uint64_t addr = 0;
+    BOOL hasAddr = (args[@"addr"] != nil);
+    if (hasAddr && !dh_parse_addr_arg(args[@"addr"], &addr)) {
+        return tool_err(@"addr 必须是数字或十六进制字符串（如 \"0x1004a2b30\"）");
+    }
+    if (!hasAddr && symbol.length == 0) {
+        return tool_err(@"symbol 或 addr 至少提供一个");
+    }
+    int capPtr = -1, capLen = -1, capMax = 0;
+    NSString *capErr = nil;
+    if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
+
+    char errbuf[256] = {0};
+    int slot = dh_thunk_install_inline(
+        module.length ? module.UTF8String : NULL,
+        symbol.length ? symbol.UTF8String : NULL,
+        addr, label.length ? label.UTF8String : NULL, errbuf, sizeof(errbuf));
+    if (slot == -1) return tool_err(@"thunk slots exhausted (max 128)");
+    if (slot == -2) return tool_err([NSString stringWithFormat:
+        @"内联目标无法解析/不是可执行地址: %s. 传 module+symbol（如 \"libsystem_kernel.dylib\"+\"getpid\"）或绝对 addr。",
+        errbuf[0] ? errbuf : "unknown"]);
+    if (slot < 0) return tool_err([NSString stringWithFormat:
+        @"内联 hook 安装失败: %s", errbuf[0] ? errbuf : "unknown"]);
+
+    BOOL describe = [args[@"describe_args"] boolValue];
+    if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
+    if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
+        dh_thunk_disable(slot);
+        return tool_err(@"capture_memory 应用失败");
+    }
+
+    NSString *display = label.length ? label
+        : (symbol.length ? (module.length ? [NSString stringWithFormat:@"%@!%@", module, symbol] : symbol)
+                         : [NSString stringWithFormat:@"0x%llx", (unsigned long long)addr]);
+    NSMutableDictionary *res = [@{
+        @"slot": @(slot), @"target": display, @"kind": @"inline", @"enabled": @YES,
+        @"backend": @(dh_thunk_inline_backend()),
+        @"describe_args": describe ? @YES : @NO,
+        @"note": @"record-only inline hook: 命中时记录 x0-x8 + 调用栈后尾调用原函数（原返回值不变）。"
+                 @" events land in category 'other' as algorithm 'inline-hook'. unhook 只做软停（停止记录，patch 保留）。"
+    } mutableCopy];
+    NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
+    if (capEcho) {
+        res[@"capture"] = capEcho;
+        res[@"note"] = [NSString stringWithFormat:@"%@ capture_memory: 命中瞬间把 x%d 指向的内存（长度取自 x%d%@，上限 %d 字节）拷进事件 input。",
+                        res[@"note"], capPtr, capLen, capLen < 0 ? @"(未指定, 用固定上限)" : @"", capMax];
+    }
+    return tool_ok(res);
+}
+
+// trace_function — QBDI 指令级 trace（一次显式函数调用 + 有界指令记录）。
+static NSDictionary *tool_trace_function(NSDictionary *args) {
+    NSString *module = [args[@"module"] isKindOfClass:NSString.class] ? args[@"module"] : nil;
+    NSString *symbol = [args[@"symbol"] isKindOfClass:NSString.class] ? args[@"symbol"] : nil;
+    uint64_t addr = 0;
+    BOOL hasAddr = (args[@"addr"] != nil);
+    if (hasAddr && !dh_parse_addr_arg(args[@"addr"], &addr)) {
+        return tool_err(@"addr 必须是数字或十六进制字符串（如 \"0x1004a2b30\"）");
+    }
+    if (!hasAddr && symbol.length == 0) return tool_err(@"symbol 或 addr 至少提供一个");
+
+    uint64_t argv[8] = {0};
+    int argc = 0;
+    id rawArgs = args[@"args"];
+    if (rawArgs) {
+        if (![rawArgs isKindOfClass:NSArray.class]) return tool_err(@"args 必须是数组");
+        NSArray *a = rawArgs;
+        argc = (int)MIN((NSUInteger)8, a.count);
+        for (int i = 0; i < argc; i++) {
+            if (!dh_parse_addr_arg(a[i], &argv[i])) {
+                return tool_err([NSString stringWithFormat:
+                    @"args[%d] 必须是数字或十六进制字符串", i]);
+            }
+        }
+    }
+    int maxInsns = [args[@"max_insns"] isKindOfClass:NSNumber.class] ? [args[@"max_insns"] intValue] : 256;
+    int maxMs = [args[@"max_ms"] isKindOfClass:NSNumber.class] ? [args[@"max_ms"] intValue] : 1000;
+    if (maxInsns < 1) maxInsns = 1;
+    if (maxInsns > 4096) maxInsns = 4096;
+    if (maxMs < 50) maxMs = 50;
+    if (maxMs > 10000) maxMs = 10000;
+
+    NSDictionary *res = DHQBDITraceFunction(module, symbol, addr, argv, argc, maxInsns, maxMs);
+    if (![res[@"ok"] boolValue]) {
+        return tool_err(res[@"error"] ?: @"QBDI trace failed");
+    }
+    return tool_ok(res);
+}
+
 // hook_method — 对 ObjC 方法装只读 hook (method_setImplementation swizzle)。同一套 thunk, x0=self x1=_cmd。
 static NSDictionary *tool_hook_method(NSDictionary *args) {
     NSString *cls = args[@"class"];
@@ -1479,7 +1593,8 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
     for (int i = 0; i < n; i++) {
         NSMutableDictionary *h = [@{
             @"slot":    @(info[i].slot),
-            @"kind":    info[i].kind == DH_HOOK_METHOD ? @"method" : @"import",
+            @"kind":    info[i].kind == DH_HOOK_METHOD ? @"method"
+                     : (info[i].kind == DH_HOOK_INLINE ? @"inline" : @"import"),
             @"name":    info[i].name ? @(info[i].name) : @"",
             @"hits":    @(info[i].hits),
             @"enabled": info[i].enabled ? @YES : @NO,
@@ -2525,6 +2640,44 @@ static NSArray *tool_definitions(void) {
             },
         },
         @{
+            @"name": @"hook_inline",
+            @"description": @"Install a record-only inline hook (Dobby backend) on ANY native function: module+symbol or an absolute code address. Unlike hook_import (GOT) this also works for statically linked functions and direct calls inside a module. On each hit it snapshots x0-x8 + call stack, then tail-calls the original function's trampoline, so the original return value and behavior are preserved (entry observation only). Events land in category 'other' as algorithm 'inline-hook'. unhook only soft-disables recording; the patch stays (no safe unbind). Available in the arm64 jailbreak build; arm64e slice refuses instead of silently falling back.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"module":  @{@"type": @"string", @"description": @"Loaded image name/path, e.g. \"libsystem_kernel.dylib\" or \"/var/jb/usr/lib/libfoo.dylib\"; omit to search RTLD_DEFAULT"},
+                    @"symbol":  @{@"type": @"string", @"description": @"Exported symbol name, e.g. \"getpid\" or \"_ZN...\""},
+                    @"addr":    @{@"type": @"string", @"description": @"Absolute executable address (hex string like \"0x1004a2b30\" or number); use instead of symbol when the target is not exported"},
+                    @"label":   @{@"type": @"string", @"description": @"Display name for list_hooks"},
+                    @"describe_args": @{@"type": @"boolean", @"description": @"true 时把前几个参数里像可打印 C 字符串的内容记进事件（与 hook_import 一致）；默认 false"},
+                    @"capture_memory": @{
+                        @"type": @"object",
+                        @"description": @"命中瞬间按 x 寄存器参数抓一段内存到事件 input（x0..x8）。",
+                        @"properties": @{
+                            @"ptr_arg":   @{@"type": @"number", @"description": @"指针参数所在 x 寄存器索引 0..8；默认 0"},
+                            @"len_arg":   @{@"type": @"number", @"description": @"长度参数所在 x 寄存器索引 0..8；-1 表示用 max_bytes 固定长度；默认 -1"},
+                            @"max_bytes": @{@"type": @"number", @"description": @"单次最多拷贝字节数 1..8192；默认 256"},
+                        },
+                    },
+                },
+            },
+        },
+        @{
+            @"name": @"trace_function",
+            @"description": @"QBDI instruction-level trace of ONE function: creates a one-shot QBDI VM, instruments the target's module, calls the function on the calling thread with up to 8 integer/pointer arguments, records up to max_insns instructions (instruction + time budgets), then destroys the VM. REPLAY semantics: the function is executed once under instrumentation, so side effects are real; only x0-x7 args are seeded (no stack/float args). Returns retval, stop_reason, truncated, duration and the instruction list. Available in the arm64 jailbreak build only.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"module": @{@"type": @"string", @"description": @"Loaded image name/path; omit to search RTLD_DEFAULT"},
+                    @"symbol": @{@"type": @"string", @"description": @"Exported symbol to call/trace, e.g. \"getpid\""},
+                    @"addr":   @{@"type": @"string", @"description": @"Absolute code address (hex string or number); alternative to symbol"},
+                    @"args":   @{@"type": @"array", @"items": @{@"type": @"number"}, @"description": @"Up to 8 integer/pointer arguments (x0-x7). Numbers or hex strings are accepted."},
+                    @"max_insns": @{@"type": @"number", @"description": @"Recording budget 1..4096; default 256"},
+                    @"max_ms":    @{@"type": @"number", @"description": @"Wall-clock budget 50..10000 ms; default 1000"},
+                },
+            },
+        },
+        @{
             @"name": @"list_hooks",
             @"description": @"List all dynamic hooks installed this session (slot, kind, name, hit count, enabled). Slots are not reclaimed; a disabled hook still shows with enabled=false.",
             @"inputSchema": @{@"type": @"object", @"properties": @{}},
@@ -2690,6 +2843,8 @@ static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
     // 动态 hook (一期: record-only)
     if ([name isEqualToString:@"hook_import"])           return tool_hook_import(args);
     if ([name isEqualToString:@"hook_method"])           return tool_hook_method(args);
+    if ([name isEqualToString:@"hook_inline"])           return tool_hook_inline(args);
+    if ([name isEqualToString:@"trace_function"])        return tool_trace_function(args);
     if ([name isEqualToString:@"list_hooks"])            return tool_list_hooks(args);
     if ([name isEqualToString:@"unhook"])                return tool_unhook(args);
     return nil;   // 未知工具
@@ -2707,7 +2862,8 @@ static BOOL tool_is_heavy(NSString *name) {
         heavy = [NSSet setWithArray:@[@"search_memory", @"find_xrefs", @"find_string_refs",
                                       @"find_selector_refs", @"find_function_refs",
                                       @"analyze_function", @"disassemble_function",
-                                      @"find_objc_methods", @"export_events", @"start_dump"]];
+                                      @"find_objc_methods", @"export_events", @"start_dump",
+                                      @"trace_function"]];
     });
     return [heavy containsObject:name];
 }
