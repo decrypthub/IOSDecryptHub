@@ -29,6 +29,10 @@
 // asm 尾调用要用的「原函数指针表」—— thunk 用 slot 索引它跳转。必须是全局符号(asm 引用)。
 void *g_dh_thunk_orig[DH_THUNK_COUNT];
 
+// 需要记录返回值的槽位标记 (1 = 走 post 路径: 先调原函数, 抓到返回值再返回)。
+// 必须是全局符号, 汇编里按 slot 索引读。
+uint8_t g_dh_thunk_post[DH_THUNK_COUNT];
+
 // 槽位注册表 (单调分配; 软停不回收, 硬停后退休)。
 typedef struct {
     char             name[160];
@@ -39,6 +43,7 @@ typedef struct {
     _Atomic int      capture_ptr_arg;   // >=0: 抓该寄存器位置的指针参数
     _Atomic int      capture_len_arg;   // >=0: 从该寄存器取长度; -1: 固定长度
     _Atomic int      capture_max_bytes;
+    _Atomic int      capture_return;   // 1 = post 路径, 记录返回值
     dh_hook_kind     kind;
     int              used;
     void            *target;          // inline: DobbyHook 的目标地址
@@ -71,8 +76,7 @@ __asm__(
 ".endr\n"
 "\n"
 ".globl _dh_thunk_trampoline\n"
-"_dh_thunk_trampoline:\n"
-"  sub  sp, sp, #0xE0\n"           // 224B 帧: x0-8 + slot + q0-7 + lr
+"_dh_thunk_trampoline:\n""  sub  sp, sp, #0xE0\n"           // 224B 帧: x0-8 + slot + q0-7 + lr
 "  stp  x0, x1, [sp, #0x00]\n"
 "  stp  x2, x3, [sp, #0x10]\n"
 "  stp  x4, x5, [sp, #0x20]\n"
@@ -98,11 +102,37 @@ __asm__(
 "  ldp  q4, q5, [sp, #0x90]\n"
 "  ldp  q6, q7, [sp, #0xB0]\n"
 "  ldr  x30, [sp, #0xD0]\n"
-"  add  sp, sp, #0xE0\n"
 "  adrp x16, _g_dh_thunk_orig@PAGE\n"
 "  add  x16, x16, _g_dh_thunk_orig@PAGEOFF\n"
-"  ldr  x16, [x16, x17, lsl #3]\n" // 原函数 = g_dh_thunk_orig[slot]
-"  br   x16\n"                     // 尾调用: lr 已复原, 原函数直接返回真正的调用者
+"  ldr  x16, [x16, x17, lsl #3]\n"  // 原函数 = g_dh_thunk_orig[slot]
+"  adrp x15, _g_dh_thunk_post@PAGE\n"
+"  add  x15, x15, _g_dh_thunk_post@PAGEOFF\n"
+"  ldrb w15, [x15, x17]\n"           // post 标记
+"  cbnz w15, 1f\n"
+"  add  sp, sp, #0xE0\n"
+"  br   x16\n"                       // 尾调用: lr 已复原, 原函数直接返回真正的调用者
+"\n"
+"// post 路径: 需要返回值的槽位。先调原函数, 保存 x0/x1/q0/q1, 让 C 记录一次, 再原样返回。\n"
+"// 代价是这层栈帧要一直留到原函数返回 (而不是尾调用), 因此只对付费槽位启用。\n"
+"1:\n"
+"  stp  x16, x30, [sp, #0xD0]\n"      // [0xD0]=原函数, [0xD8]=返回地址
+"  blr  x16\n"
+"  str  x0, [sp, #0x00]\n"            // 返回值 x0
+"  str  x1, [sp, #0x08]\n"            // 返回值 x1 (结构体/双整返回)
+"  stp  q0, q1, [sp, #0x50]\n"        // 浮点/向量返回值
+"  stp  q2, q3, [sp, #0x70]\n"        // HFA 结构体返回可能用到 q2/q3
+"  ldp  x8, x17, [sp, #0x40]\n"       // x8 = 间接返回缓冲, x17 = slot
+"  mov  x0, x17\n"                    // dh_thunk_post_handler(slot,
+"  add  x1, sp, #0\n"                 //                    retval regs,
+"  ldp  x2, x3, [sp, #0xD0]\n"        //                    orig, real_lr)
+"  bl   _dh_thunk_post_handler\n"
+"  ldr  x0, [sp, #0x00]\n"
+"  ldr  x1, [sp, #0x08]\n"
+"  ldp  q0, q1, [sp, #0x50]\n"
+"  ldp  q2, q3, [sp, #0x70]\n"
+"  ldr  x30, [sp, #0xD8]\n"
+"  add  sp, sp, #0xE0\n"
+"  ret\n"
 );
 
 extern void dh_thunk_table(void);   // asm label; 取地址即表基址
@@ -179,8 +209,7 @@ static BOOL dh_is_runtime_class(Class c) {
 }
 
 static NSString *dh_describe_arg(uint64_t v) {
-    if (v < 0x100000000ULL || (v & 0x7)) return nil;
-    // 判定分两层, 顺序很重要:
+    if (v < 0x100000000ULL || (v & 0x7)) return nil;    // 判定分两层, 顺序很重要:
     //   1) vm_read_overwrite 确认地址可读(挡野指针);
     //   2) 读出对象头 isa → 剥离 PAC(arm64e/Apple Silicon 上 isa 是签名指针) → 必须命中运行时类表。
     // 只有第 2 步通过后才当对象访问。绝不能直接 object_getClass(): 参数里常见的 NSError**
@@ -214,11 +243,13 @@ static NSString *dh_describe_arg(uint64_t v) {
         }
         if ([obj isKindOfClass:[NSString class]]) {
             NSString *s = (NSString *)obj;
-            NSString *t = s.length > 200 ? [[s substringToIndex:200] stringByAppendingString:@"…"] : s;
+            // 返回值常常就是整条签名/header (几百到几千字符), 截到 200 会把要看的字段切掉。
+            // 这里放宽到 4000 字符, 与事件 detail 的展示上限一致; 再长的才截断。
+            NSString *t = s.length > 4000 ? [[s substringToIndex:4000] stringByAppendingString:@"…"] : s;
             return [NSString stringWithFormat:@"NSString(%lu) %@", (unsigned long)s.length, t];
         }
         NSString *desc = [obj description];
-        if (desc.length > 300) desc = [[desc substringToIndex:300] stringByAppendingString:@"…"];
+        if (desc.length > 4000) desc = [[desc substringToIndex:4000] stringByAppendingString:@"…"];
         return desc;
     } @catch (__unused NSException *ex) {
         return @"<describe-exception>";
@@ -304,6 +335,37 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
     g_in_thunk = 0;
 }
 
+// ---- post 路径: 原函数返回后记录返回值 ----
+// 只在 g_dh_thunk_post[slot] 置位时被汇编调用; regs[0]=x0(返回值), regs[1]=x1。
+void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_t real_lr) {
+    (void)orig; (void)real_lr;
+    if (slot >= DH_THUNK_COUNT) return;
+    dh_slot_t *s = &g_slots[slot];
+    if (!atomic_load_explicit(&s->enabled, memory_order_relaxed)) return;
+    if (g_in_thunk) return;
+    g_in_thunk = 1;
+    @autoreleasepool {
+        uint64_t ret = regs[0];
+        DHLogEntry *e = [DHLogEntry new];
+        e.category  = DHCategoryOther;
+        e.algorithm = (s->kind == DH_HOOK_METHOD) ? @"objc-hook" : @"inline-hook";
+        e.operation = [NSString stringWithUTF8String:s->name];
+        NSMutableString *d = [NSMutableString stringWithFormat:
+            @"slot=%llu return\nx0(ret)=0x%llx x1=0x%llx",
+            (unsigned long long)slot, (unsigned long long)ret, (unsigned long long)regs[1]];
+        NSString *desc = dh_describe_arg(ret);   // 对象/NSData/NSString 才反引用
+        if (desc.length) {
+            [d appendFormat:@"\n  ret = %@", desc];
+            e.input = [desc dataUsingEncoding:NSUTF8StringEncoding];
+        }
+        e.detail    = d;
+        e.callStack = DHCallStackFiltered();
+        e.timestamp = DHTimestampNow();
+        [[DHLogStore shared] append:e];
+    }
+    g_in_thunk = 0;
+}
+
 // ---- 安装 / 关闭 / 枚举 ----
 
 static int dh_alloc_slot(void) {
@@ -323,6 +385,8 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
     s->kind = DH_HOOK_IMPORT;
     s->used = 1;
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
+    atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
+    g_dh_thunk_post[slot] = 0;
     g_dh_thunk_orig[slot] = NULL;
     struct rebinding rb = { symbol, dh_slot_addr(slot), &g_dh_thunk_orig[slot] };
     rebind_symbols(&rb, 1);
@@ -572,6 +636,8 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
     s->saved_len = dh_save_code_bytes(target, s->saved, sizeof(s->saved));
     atomic_store_explicit(&s->retired, 0, memory_order_relaxed);
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
+    atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
+    g_dh_thunk_post[slot] = 0;
     g_dh_thunk_orig[slot] = NULL;
     atomic_store_explicit(&s->enabled, 0, memory_order_release);
 
@@ -614,8 +680,7 @@ int dh_thunk_set_describe(int slot, int on) {
     return 0;
 }
 
-int dh_thunk_set_capture(int slot, int ptr_arg, int len_arg, int max_bytes) {
-    if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
+int dh_thunk_set_capture(int slot, int ptr_arg, int len_arg, int max_bytes) {    if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
     if (ptr_arg < 0) {   // 关闭捕获
@@ -629,6 +694,17 @@ int dh_thunk_set_capture(int slot, int ptr_arg, int len_arg, int max_bytes) {
     atomic_store_explicit(&s->capture_len_arg, len_arg, memory_order_relaxed);
     atomic_store_explicit(&s->capture_max_bytes, max_bytes, memory_order_relaxed);
     atomic_store_explicit(&s->capture_ptr_arg, ptr_arg, memory_order_release);
+    return 0;
+}
+
+int dh_thunk_set_return(int slot, int on) {
+    if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
+    dh_slot_t *s = &g_slots[slot];
+    if (!s->used) return -1;
+    if (atomic_load_explicit(&s->retired, memory_order_relaxed)) return -1;
+    // 先写槽位字段再发布汇编可见的标记位 (release), 保证 handler 看到 1 时字段已就绪。
+    atomic_store_explicit(&s->capture_return, on ? 1 : 0, memory_order_relaxed);
+    g_dh_thunk_post[slot] = on ? 1 : 0;
     return 0;
 }
 
@@ -715,6 +791,7 @@ int dh_thunk_list(dh_hook_info *out, int max) {
         out[n].capture_ptr_arg   = atomic_load_explicit(&g_slots[i].capture_ptr_arg, memory_order_acquire);
         out[n].capture_len_arg   = atomic_load_explicit(&g_slots[i].capture_len_arg, memory_order_relaxed);
         out[n].capture_max_bytes = atomic_load_explicit(&g_slots[i].capture_max_bytes, memory_order_relaxed);
+        out[n].capture_return   = atomic_load_explicit(&g_slots[i].capture_return, memory_order_relaxed);
         n++;
     }
     return n;   // 实际写入条数 (跳过被作废的槽)

@@ -1417,6 +1417,8 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
         @"symbol '%@' not found in any image's import table — it is statically linked or not imported, so fishhook cannot rebind it. Try list_imports to confirm the symbol is an external import.", sym]);
     BOOL describe = [args[@"describe_args"] boolValue];
     if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
+    BOOL wantRet = [args[@"capture_return"] boolValue];
+    if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
@@ -1487,6 +1489,8 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
 
     BOOL describe = [args[@"describe_args"] boolValue];
     if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
+    BOOL wantRet = [args[@"capture_return"] boolValue];
+    if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
@@ -1568,6 +1572,8 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
                                      cls, classMethod ? @"class" : @"instance", sel]);
     BOOL describe = [args[@"describe_args"] boolValue];
     if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
+    BOOL wantRet = [args[@"capture_return"] boolValue];
+    if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
@@ -2632,7 +2638,8 @@ static NSArray *tool_definitions(void) {
                 @"properties": @{
                     @"symbol": @{@"type": @"string", @"description": @"Imported symbol name, no leading underscore, e.g. \"SSL_write\""},
                     @"label":  @{@"type": @"string", @"description": @"Optional note appended to the event name"},
-                    @"describe_args": @{@"type": @"boolean", @"description": @"true 时尝试把前 4 个参数里「像可打印 C 字符串」的读出来(如 getaddrinfo 的域名、dlopen 的路径); 默认 false"},
+                    @"describe_args": @{@"type": @"boolean", @"description": @"true 时尝试把前 4 个参数里「像可打印 C 字符串」的读出来(如 getaddrinfo 的域名、dlopen 的路径); 默认 false",},
+                    @"capture_return": @{@"type": @"boolean", @"description": @"true 时记录该函数返回值（x0；NSData→hex / NSString→文本 / 其它→description）。命中会变成两条事件：进入一条、返回一条（带 ret=）。代价是这层栈帧留到原函数返回；默认 false"},
                     @"capture_memory": @{
                         @"type": @"object",
                         @"description": @"命中瞬间按寄存器参数抓一段内存到事件 input(hex/utf8)。不会事后回读, 因此能在缓冲区释放/复用前拿到 key、IV、明文。标准 crypto hook 全空时, 这是抓静态链接加密库 key 的主要手段: 先用 list_imports 找 mlock/memcpy/read/send 等「指针+长度」导入, 再在此配置。ptr_arg 是 x 寄存器索引(0..8), len_arg 指定哪个寄存器是长度(-1=固定抓 max_bytes), max_bytes 上限 8192。例: mlock 的 key 缓冲 → {ptr_arg:0, len_arg:1, max_bytes:4096}",
@@ -2655,7 +2662,8 @@ static NSArray *tool_definitions(void) {
                     @"class":       @{@"type": @"string", @"description": @"ObjC class name, e.g. \"NSURLSession\""},
                     @"selector":    @{@"type": @"string", @"description": @"Selector, e.g. \"dataTaskWithRequest:completionHandler:\""},
                     @"classMethod": @{@"type": @"boolean", @"description": @"true for a class (+) method; default false (instance -)"},
-                    @"describe_args": @{@"type": @"boolean", @"description": @"true 时反引用前几个参数内容(NSData→hex 前缀 / NSString→文本 / 其它→description), 直接看明文、密钥、密文; 默认 false"},
+                    @"describe_args": @{@"type": @"boolean", @"description": @"true 时反引用前几个参数内容(NSData→hex 前缀 / NSString→文本 / 其它→description), 直接看明文、密钥、密文; 默认 false",},
+                    @"capture_return": @{@"type": @"boolean", @"description": @"true 时记录该函数返回值（x0；NSData→hex / NSString→文本 / 其它→description）。命中会变成两条事件：进入一条、返回一条（带 ret=）。代价是这层栈帧留到原函数返回；默认 false"},
                     @"capture_memory": @{
                         @"type": @"object",
                         @"description": @"命中瞬间按 x 寄存器参数抓一段内存到事件 input。x0=self, x1=_cmd, x2..=方法参数。用于 ObjC 方法参数里裸指针+长度的加密缓冲。",
@@ -2679,7 +2687,8 @@ static NSArray *tool_definitions(void) {
                     @"symbol":  @{@"type": @"string", @"description": @"Exported symbol name, e.g. \"getpid\" or \"_ZN...\""},
                     @"addr":    @{@"type": @"string", @"description": @"Absolute executable address (hex string like \"0x1004a2b30\" or number); use instead of symbol when the target is not exported"},
                     @"label":   @{@"type": @"string", @"description": @"Display name for list_hooks"},
-                    @"describe_args": @{@"type": @"boolean", @"description": @"true 时把前几个参数里像可打印 C 字符串的内容记进事件（与 hook_import 一致）；默认 false"},
+                    @"describe_args": @{@"type": @"boolean", @"description": @"true 时把前几个参数里像可打印 C 字符串的内容记进事件（与 hook_import 一致）；默认 false",},
+                    @"capture_return": @{@"type": @"boolean", @"description": @"true 时记录该函数返回值（x0；NSData→hex / NSString→文本 / 其它→description）。命中会变成两条事件：进入一条、返回一条（带 ret=）。代价是这层栈帧留到原函数返回；默认 false"},
                     @"capture_memory": @{
                         @"type": @"object",
                         @"description": @"命中瞬间按 x 寄存器参数抓一段内存到事件 input（x0..x8）。",

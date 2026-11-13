@@ -112,3 +112,37 @@
 
 
 
+
+## 2026-11-13：capture_return（返回值记录）与七鲜 jdgs 实战
+
+七鲜（`com.xstore.sevenFresh`，RN/Hermes）的请求头 `jdgs` 是每请求变化的 JSON，由 `JDGS_pentane` 生成。用本插件在真机上钉死了生成点，并在此过程中补上一个能力缺口。
+
+### 新增能力：`capture_return`
+
+`hook_import` / `hook_method` / `hook_inline` 新增 `capture_return: true`：
+
+- 该槽位从「尾调用」改为 **post 路径**：先 `blr` 原函数，保存 x0/x1/q0-q3，调用 `dh_thunk_post_handler` 记录一条带 `ret=` 的事件，再把返回值原样交回调用者。
+- 返回对象会反引用：`NSData` → 前 64 字节 hex、`NSString` → 文本（上限放宽到 4000 字符）、其它 → `description`。
+- 代价明确：这一层栈帧要留到原函数返回（不再是尾调用），所以只对付费槽位启用，默认关闭。
+- 汇编实现要点：post 分支必须用**局部标号**（`1:`），不能 `cbnz` 到外部符号（汇编器拒绝跨符号条件跳转）。
+
+### 实测（iPhone X / iOS 15.6 / 1.28.4 / 七鲜 pid 12501）
+
+```
+-[JDGS_pentane signWithUrlString:contentType:method:bodyData:uppercaseBD:] return
+  ret = { jdgs = "{\"b1\":\"486612aa-...\",\"b2\":\"3.0.55_1\",\"b3\":\"3.0\",
+                  \"b4\":\"<716 base64 字符>\",\"b5\":\"<64 hex>\",\"b7\":\"<ms>\",\"b6\":\"<64 hex>\"}"; }
+
+-[JDGS_pentane _doSha256:] return
+  ret = NSString(64) 6668d13f...018efe
+```
+
+结论：`jdgs` 就是这个方法返回的 NSDictionary 里的 `jdgs` 键，不是拼在 header 层的。
+
+### 顺带修掉的可用性缺陷
+
+返回值/描述的截断上限原来是 200/300 字符，jdgs 有 700+ 字符会被切掉关键字段；已放宽到 4000（事件 detail 与 journal 的 8KB 上限仍生效）。
+
+### 未解决（下一步）
+
+b4（base64 解码后 537 字节，非 16 倍数）/ b5 / b6 的构造仍未还原：已排除 46 种单/双/三字段 SHA256 组合、以及用 CCCrypt 抓到的 16B key 做 HMAC。最可能依赖 `JDGS_pentane` 的 `svrtk`/`umidT`/`pwdTable`/`appkey` 等属性，需要 hook 这些 getter 的返回值继续追。
