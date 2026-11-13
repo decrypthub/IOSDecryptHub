@@ -216,3 +216,36 @@ b4（base64 解码后 537 字节，非 16 倍数）/ b5 / b6 的构造仍未还�
 
 验收（iPhone X 真机）：非法规格 `x9:64` 明确报错且不留槽位；合法 `x3:32,x5:64` 回显一致、
 `list_hooks` 可见；触发后事件里有完整 `win x3 = HELLO` 与 `win x5 = 配置对象`。
+## 2026-11-13 深夜：第三轮复审（abort_install）的 blocker
+
+`dh_thunk_abort_install` 回收槽位时只清了槽位表，**没撤销目标上的跳转/IMP/GOT**，
+还把 `g_next_slot` 回退让索引立刻被复用：
+- import：GOT 仍指向 `thunk[slot]`，而 `install_import` 会先把 `g_dh_thunk_orig[slot]`
+  置 NULL，窗口内旧符号一被调用就是 `br NULL` → SIGSEGV
+- inline：`used=0` 让 `dh_thunk_uninstall` 永远拒绝该槽，补丁永久不可卸载
+- method：IMP 仍是 thunk，`used=0` 使复用检测失效，重新 hook 同 selector 会把
+  当前 IMP(=thunk) 记成 orig → 无限递归
+
+**打错一个参数就能触发进程级内存安全事件。**
+
+改成「校验前置」：新增纯函数 `dh_thunk_validate_capture_multi`，在分配槽位**之前**
+先校验，不过就根本不装。`abort_install` 整个删掉 —— 不需要撤销，就没有漏撤销。
+
+同轮修：
+- 复用分支失败时不再 `dh_thunk_disable`（原来会把原本正常的 hook 永久停掉，
+  且没有任何一处把 `enabled` 置回 1，最终还 `return ok`）
+- `capture_multi` 的 `ready` 改 seqlock 语义（1=可读, 2=写作中），读取端前后各读一次；
+  删掉没有并发保护价值的 shadow 字段
+- `'\\0'` 是两个反斜杠的多字符常量（值 0x5C30 截断成 `'0'`），会把 `"x0:64"` 清成
+  `"00:64"`（仍是合法规格）；改成 `0`
+- `install_method` 补齐 capture 配置初始化
+- `dh_thunk_list` 回填 `capture_multi` 时先看 `ready`
+- 超长（>=96B）与语法错分开报错
+
+真机验收（1.28.23）：`"x9:64"` 在分配前被拒且不留槽位；20 段规格报「过长 119 字节,
+上限 95」；`"x3:32,x5:64"` 回显一致且 `list_hooks` 可见；触发后事件有完整 `win x3`/`win x5`。
+
+### 一个工具坑
+用 PowerShell 批量改代码时，双引号字符串里的 `` `r`n `` 在某些拼接上下文不会展开，
+会把整段多行代码压成**一行字面量**（本次因此让 `dh_thunk_list` 的回填逻辑变成一句
+无效注释，`list_hooks` 显示空串）。改完必须回读目标行确认，别只看写入成功。
