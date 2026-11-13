@@ -52,10 +52,10 @@
 实现（只在越狱版；巨魔版不动）：
 
 - `src/core/dh_thunk.m`：新增 `DH_HOOK_INLINE` 与 `dh_thunk_install_inline`。复用既有 thunk-bank（保存 x0-x8/q0-q7/lr，记录后尾调用原函数蹦床），后端为静态链接的 **Dobby**；支持 `module+symbol` 或绝对地址，地址先经 `vm_region_64` 校验可执行。
-- `src/trace/qbdi_trace.m`：静态链接 **QBDI 19.1.5**（iOS/AArch64，iOS 15.0+），一次性 VM + `qbdi_call`，指令/时间双预算；预算在回调里 `QBDI_STOP`，不把截断伪报成 completed。
+- `src/trace/qbdi_trace.m`：静态链接 **QBDI 0.12.2-devel（LLVM 19.1.5）**（iOS/AArch64，iOS 15.0+），一次性 VM + `qbdi_call`，指令/时间双预算；预算在回调里 `QBDI_STOP`，不把截断伪报成 completed。
 - MCP 新工具：`hook_inline`（install/软停由 `unhook` 承担）、`trace_function`；`list_hooks` 增 `kind=inline`；`trace_function` 进重活串行队列。
 - 安全护栏：拒绝 inline-hook `malloc/calloc/realloc/free/objc_msgSend/objc_retain/...` —— 命中处理器本身会分配 Foundation 对象，hook 分配器会在原序言未完成时重入并打死宿主（实测 engine_shell 直接退出）。
-- vendor：`vendor/dobby`（commit 5dfc854，arm64 静态）与 `vendor/qbdi`（commit 3318580，arm64 静态 + 头文件），构建脚本 `tools/build_dobby_ios.sh` / `tools/build_qbdi_ios.sh`。`Makefile` 只在 ARCHS 不含 arm64e 时链接这两个库；roothide 胖包可编译，但 `hook_inline/trace_function` 明确返回 unavailable。
+- vendor：`vendor/dobby`（commit 5dfc854，arm64 静态）与 `vendor/qbdi`（0.12.2-devel，arm64 静态 + 头文件），构建脚本 `tools/build_dobby_ios.sh` / `tools/build_qbdi_ios.sh`。`Makefile` 只在 ARCHS 不含 arm64e 时链接这两个库；roothide 胖包可编译，但 `hook_inline/trace_function` 明确返回 unavailable。
 
 真机验证（iPhone X / iPhone10,3 / iOS 15.6 / Dopamine rootless，rootless 1.28.0）：
 
@@ -83,5 +83,15 @@
 - QBDI trace 在真实 App 进程内可用，但**首次调用有 JIT 冷启动**：`max_ms=800` 时 `getpid` 只记录 1 条就 time-limit；同一进程随后 `max_ms=5000` 时 6 条 completed、retval=pid（8129）、65ms；`getuid` 4 条 completed、25ms。默认 `max_ms` 已由 1000 提高到 3000，并在 `time_limit && count<=3` 时返回「QBDI cold start，建议重试」的 warning。
 
 结论：真实 App 内的 inline hook（系统函数、App 自带 framework）和 ObjC 方法 hook 已可用；联想主二进制 inline 被其自身完整性保护拦下，是否做反检测绕过属于产品决策，当前不静默假装成功。
+
+## 2026-11-13：学习通 inline hook 对照
+
+目标：学习通（`com.ssreader.ChaoXingStudy`，pid 9364，iPhone X / iOS 15.6 / rootless 1.28.1）。
+
+- inline hook `libsystem_kernel.dylib!write`：安装成功，命中数逐步到 2432；`trace_function getpid` 默认预算 6 条 completed、`retval=0x2494`（=pid 9364）、7ms。
+- **学习通主二进制 inline 可用**：对 `-[AppDelegate extDotInfoInAdInfo:]`（从未调用的方法）安装后 20 秒 App 仍存活、hits=0；再对 `-[AppDelegate nbs_applicationDidBecomeActive:]`、`-[AppDelegate nbs_applicationWillEnterForeground:]` 安装 inline hook，经 Settings/学习通前后台切换各命中 1 次，App 存活 2 分 30 秒。
+- 对照结论：同一种 Dobby inline 在主二进制上，学习通稳定、联想 SIGILL；联想是自身完整性/反篡改，不是引擎或 Dobby 的通用缺陷。
+- 测试后已 unhook 全部 slot（enabled=false，patch 保留），学习通进程未重启。
+
 
 

@@ -5,7 +5,7 @@
 | 项 | 值 |
 |---|---|
 | 上游 | https://github.com/quarkslab/QBDI |
-| 版本 | commit `3318580`（2026-08-21，LLVM 19.1.5） |
+| 版本 | QBDI `0.12.2-devel`（`QBDI_VERSION_STRING`，LLVM 19.1.5；构建时 master 快照，脚本未 pin commit） |
 | 构建 | `cmake -DQBDI_PLATFORM=ios -DQBDI_ARCH=AARCH64 -DCMAKE_TOOLCHAIN_FILE=cmake/config/ios.toolchain.cmake -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0`，Apple Silicon macOS + Xcode 26.3 构建 |
 | 产物 | `lib/libQBDI.a`（静态，arm64，iOS 15.0+）；`include/QBDI/` 为源码头 + 构建生成的 `Config.h`/`Version.h`/`State.h`/`Options.h` |
 | 许可 | Apache-2.0（见上游 LICENSE.txt） |
