@@ -49,6 +49,7 @@ typedef struct {
 
 // 装导入符号 hook。symbol 去前导下划线的名字(与 list_imports 一致); label 可为 NULL。
 // 返回 slot(>=0) 成功; -1 槽位耗尽; -2 符号在任何 image 的导入表里都没找到(静态链接/未导入, hook 无效)。
+// 返回值: >=0 新槽位; -1 槽位耗尽; -2 符号不存在; -(slot+10) 该符号已装过, 用这个槽位
 int  dh_thunk_install_import(const char *symbol, const char *label);
 
 // 装 ObjC 方法 hook。classMethod!=0 走类方法。返回 slot(>=0); -1 槽位耗尽; -3 类/方法不存在。

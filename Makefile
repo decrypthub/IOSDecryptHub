@@ -18,7 +18,7 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.17
+VERSION := 1.28.19
 TARGET  := decrypt_helper.dylib
 
 # Capstone 反汇编库源文件（仅 ARM/ARM64 架构）

@@ -806,7 +806,8 @@ static NSDictionary *tool_objc_export_data(NSDictionary *args) {
     else if ([value isKindOfClass:[NSString class]]) bytes = [(NSString *)value dataUsingEncoding:NSUTF8StringEncoding];
     else return tool_err([NSString stringWithFormat:@"%@ is %@, not NSData/NSString", ivarName, NSStringFromClass([value class])]);
 
-    NSString *fname = outName.length ? outName : [ivarName stringByReplacingOccurrencesOfString:@"_" withString:@""];
+    // lastPathComponent: 挡住 name 里的 ../ 把文件写到 Documents 之外（仍在沙盒内，但没必要给这个口子）。
+    NSString *fname = [outName.length ? outName : [ivarName stringByReplacingOccurrencesOfString:@"_" withString:@""] lastPathComponent];
     if (![fname.pathExtension length]) fname = [fname stringByAppendingPathExtension:@"bin"];
     NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     NSString *path = [dir stringByAppendingPathComponent:fname];
@@ -837,7 +838,7 @@ static NSDictionary *tool_objc_call(NSDictionary *args) {
     NSString *objStr    = [args[@"object"] isKindOfClass:NSString.class] ? args[@"object"] : nil;
     if (!selName.length) return tool_err(@"missing 'selector'");
     if (!className.length && !objStr) return tool_err(@"provide 'class' or 'object'");
-    if (argList.count > 8) return tool_err(@"at most 8 arguments supported");
+    if (argList.count > 6) return tool_err(@"at most 6 arguments supported (marshalling defines 0..6)");
 
     SEL sel = NSSelectorFromString(selName);
     id receiver = nil;
@@ -852,7 +853,11 @@ static NSDictionary *tool_objc_call(NSDictionary *args) {
         if (!isClassMethod) return tool_err(@"instance call needs 'object' (address); set class_method:true for +method");
     }
 
-    Method m = class_getInstanceMethod(isClassMethod ? object_getClass(receiver) : object_getClass(receiver), sel);
+    // instance 调用: receiver 是实例, object_getClass(实例) == 它的类 → 查实例方法正确。
+    // +method 调用: receiver 是 Class, object_getClass(Class) == 元类 → 类方法正是元类上的实例方法。
+    // 两个分支表达式相同是巧合而非笔误; 但写成假三元会让人以为是 bug 而改错其中一支, 所以显式分开。
+    Class lookupCls = isClassMethod ? object_getClass((id)receiver) : object_getClass(receiver);
+    Method m = class_getInstanceMethod(lookupCls, sel);
     if (!m) return tool_err([NSString stringWithFormat:@"selector not found: %@", selName]);
     IMP imp = method_getImplementation(m);
     if (!imp) return tool_err(@"no IMP");
@@ -864,7 +869,10 @@ static NSDictionary *tool_objc_call(NSDictionary *args) {
     NSMutableArray *keep = [NSMutableArray array];
     int32_t intSlots[8] = {0};
     BOOL intSlotUsed[8] = {NO};
-    id argv[8] = {0};
+    // 必须是 __unsafe_unretained: int* 出参要传栈上 intSlots[i] 的地址, 那根本不是对象。
+    // 用默认的 __strong 时 ARC 在赋值点就会对栈地址调 objc_storeStrong → retain 读 isa → SIGSEGV
+    // (实测 rc=139, 崩在赋值语句本身, 走不到方法调用)。
+    __unsafe_unretained id argv[8] = {0};
     for (NSUInteger i = 0; i < argList.count; i++) {
         id v = argList[i];
         if ([v isKindOfClass:[NSNull class]]) { argv[i] = nil; continue; }
@@ -1680,13 +1688,12 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     NSString *capErr = nil;
     if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
     int slot = dh_thunk_install_import(sym.UTF8String, label.UTF8String);
-    if (slot == -3) {
+    if (slot <= -10) {
         // 同一符号已经装过: fishhook 只会把 GOT 指向一个槽位, 再装一次会让旧槽位永远 0 命中。
-        // 直接把已有槽位返回, 让调用方在原槽位上改 capture 配置。
-        dh_hook_info info[DH_THUNK_COUNT]; int n = dh_thunk_list(info, DH_THUNK_COUNT);
-        for (int i = 0; i < n; i++) {
-            if (strncmp(info[i].name ?: "", sym.UTF8String, sym.length) != 0) continue;
-            slot = info[i].slot;
+        // core 用 -(slot+10) 直接把准确槽位带回来 —— 不再按名字做前缀匹配
+        // (strncmp 没有右边界, 查 "CCHmac" 会命中 "CCHmacInit" 的槽位, 静默改错 hook)。
+        {
+            slot = -(slot + 10);
             NSMutableDictionary *r = [@{
                 @"slot": @(slot), @"reused": @YES, @"symbol": sym,
                 @"note": @"this symbol was already hooked; returning the existing slot instead of installing a second one (a duplicate would leave the first slot permanently unhit)",
@@ -1699,12 +1706,14 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
             if (wantAfter && dh_thunk_set_capture_after(slot, 1) == 0) r[@"capture_after"] = @YES;
             // 多窗口: 一次 hook 同时抓多个寄存器, 换寄存器不必重启进程
             NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-            if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) capMulti = nil;
+            if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
+                dh_thunk_disable(slot);
+                return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
+            }
             if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) == 0)
                 r[@"capture"] = @{@"ptr_arg": @(capPtr), @"len_arg": @(capLen), @"max_bytes": @(capMax)};
             return tool_ok(r);
         }
-        return tool_err(@"symbol reported as already hooked but its slot was not found");
     }
     if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
     if (slot == -2) return tool_err([NSString stringWithFormat:
@@ -1713,13 +1722,17 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
     BOOL wantRet = [args[@"capture_return"] boolValue];
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
-    BOOL wantAfter = [args[@"capture_after"] boolValue];
-    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) wantAfter = NO;
     // 多窗口: 一次 hook 同时抓多个寄存器, 换寄存器不必重启进程
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
+    }
+    // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
+    BOOL wantAfter = [args[@"capture_after"] boolValue];
+    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
+        dh_thunk_disable(slot);
+        return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
     }
     NSMutableDictionary *res = [@{@"slot": @(slot), @"symbol": sym, @"kind": @"import", @"enabled": @YES,
                                   @"describe_args": describe ? @YES : @NO,
@@ -1791,13 +1804,20 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
     if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
     BOOL wantRet = [args[@"capture_return"] boolValue];
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
-    BOOL wantAfter = [args[@"capture_after"] boolValue];
-    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) wantAfter = NO;
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) capMulti = nil;
+    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
+        dh_thunk_disable(slot);
+        return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
+    }
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
+    }
+    // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
+    BOOL wantAfter = [args[@"capture_after"] boolValue];
+    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
+        dh_thunk_disable(slot);
+        return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
     }
 
     NSString *display = label.length ? label
@@ -1880,13 +1900,20 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
     if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
     BOOL wantRet = [args[@"capture_return"] boolValue];
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
-    BOOL wantAfter = [args[@"capture_after"] boolValue];
-    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) wantAfter = NO;
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) capMulti = nil;
+    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
+        dh_thunk_disable(slot);
+        return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
+    }
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
+    }
+    // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
+    BOOL wantAfter = [args[@"capture_after"] boolValue];
+    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
+        dh_thunk_disable(slot);
+        return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
     }
     NSMutableDictionary *res = [@{@"slot": @(slot),
                                   @"target": [NSString stringWithFormat:@"%@[%@ %@]", classMethod ? @"+" : @"-", cls, sel],
@@ -2566,7 +2593,7 @@ static NSArray *tool_definitions(void) {
                     @"class": @{@"type": @"string", @"description": @"Class name"},
                     @"selector": @{@"type": @"string", @"description": @"Selector, e.g. \"maHWP__unpliableness:errCode:\""},
                     @"class_method": @{@"type": @"boolean", @"description": @"true for a +method (default false)"},
-                    @"args": @{@"type": @"array", @"description": @"Argument list; each entry becomes an NSString, null becomes nil"},
+                    @"args": @{@"type": @"array", @"description": @"Argument list (0..6 entries); each entry becomes an NSString, null becomes nil"},
                     @"object": @{@"type": @"string", @"description": @"Live receiver address (hex) for an instance method"},
                 },
                 @"required": @[@"selector"],

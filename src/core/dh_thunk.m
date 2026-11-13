@@ -78,7 +78,7 @@ __asm__(
 ".endr\n"
 "\n"
 ".globl _dh_thunk_trampoline\n"
-"_dh_thunk_trampoline:\n""  sub  sp, sp, #0xE0\n"           // 224B 帧: x0-8 + slot + q0-7 + lr
+"_dh_thunk_trampoline:\n""  sub  sp, sp, #0x130\n"           // 304B 帧: x0-8 + slot + q0-7 + lr + 入口快照
 "  stp  x0, x1, [sp, #0x00]\n"
 "  stp  x2, x3, [sp, #0x10]\n"
 "  stp  x4, x5, [sp, #0x20]\n"
@@ -111,13 +111,27 @@ __asm__(
 "  add  x15, x15, _g_dh_thunk_post@PAGEOFF\n"
 "  ldrb w15, [x15, x17]\n"           // post 标记
 "  cbnz w15, 1f\n"
-"  add  sp, sp, #0xE0\n"
+"  add  sp, sp, #0x130\n"
 "  br   x16\n"                       // 尾调用: lr 已复原, 原函数直接返回真正的调用者
 "\n"
 "// post 路径: 需要返回值的槽位。先调原函数, 保存 x0/x1/q0/q1, 让 C 记录一次, 再原样返回。\n"
 "// 代价是这层栈帧要一直留到原函数返回 (而不是尾调用), 因此只对付费槽位启用。\n"
 "1:\n"
 "  stp  x16, x30, [sp, #0xD0]\n"      // [0xD0]=原函数, [0xD8]=返回地址
+// 调用前把入口寄存器另存一份: capture_after 要用「进入时」的 ptr_arg/len_arg,
+// 而 blr 之后 [sp,#0x00] 会被返回值覆盖 —— ptr_arg=0 时会读到返回值, 抓出完全无关的内存。
+"  add  x9, sp, #0xE0\n"
+"  add  x10, sp, #0x00\n"
+"  ldp  x11, x12, [x10]\n"
+"  stp  x11, x12, [x9]\n"
+"  ldp  x11, x12, [x10, #0x10]\n"
+"  stp  x11, x12, [x9, #0x10]\n"
+"  ldp  x11, x12, [x10, #0x20]\n"
+"  stp  x11, x12, [x9, #0x20]\n"
+"  ldp  x11, x12, [x10, #0x30]\n"
+"  stp  x11, x12, [x9, #0x30]\n"
+"  ldr  x11, [x10, #0x40]\n"
+"  str  x11, [x9, #0x40]\n"
 "  blr  x16\n"
 "  str  x0, [sp, #0x00]\n"            // 返回值 x0
 "  str  x1, [sp, #0x08]\n"            // 返回值 x1 (结构体/双整返回)
@@ -127,13 +141,14 @@ __asm__(
 "  mov  x0, x17\n"                    // dh_thunk_post_handler(slot,
 "  add  x1, sp, #0\n"                 //                    retval regs,
 "  ldp  x2, x3, [sp, #0xD0]\n"        //                    orig, real_lr)
+"  add  x4, sp, #0xE0\n"           //                    entry_regs)
 "  bl   _dh_thunk_post_handler\n"
 "  ldr  x0, [sp, #0x00]\n"
 "  ldr  x1, [sp, #0x08]\n"
 "  ldp  q0, q1, [sp, #0x50]\n"
 "  ldp  q2, q3, [sp, #0x70]\n"
 "  ldr  x30, [sp, #0xD8]\n"
-"  add  sp, sp, #0xE0\n"
+"  add  sp, sp, #0x130\n"
 "  ret\n"
 );
 
@@ -415,7 +430,8 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
 
 // ---- post 路径: 原函数返回后记录返回值 ----
 // 只在 g_dh_thunk_post[slot] 置位时被汇编调用; regs[0]=x0(返回值), regs[1]=x1。
-void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_t real_lr) {
+void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_t real_lr,
+                           uint64_t *entry_regs) {
     (void)orig; (void)real_lr;
     if (slot >= DH_THUNK_COUNT) return;
     dh_slot_t *s = &g_slots[slot];
@@ -443,10 +459,13 @@ void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_
             int al = atomic_load_explicit(&s->capture_len_arg, memory_order_relaxed);
             int am = atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed);
             if (ap >= 0 && ap <= 8) {
-                uint64_t bufPtr = regs[ap];
+                // 必须用「进入时」的寄存器: regs[] 是返回后的快照, x0 已被返回值覆盖。
+                // 用 regs 会在 ptr_arg=0 时把返回值当成出参缓冲, 抓到完全无关的内存并当成证据上报。
+                const uint64_t *src = entry_regs ? entry_regs : regs;
+                uint64_t bufPtr = src[ap];
                 size_t want = (am > 0 && am <= DH_THUNK_CAPTURE_MAX) ? (size_t)am : 64;
                 if (al >= 0 && al <= 8) {
-                    uint64_t n = regs[al];
+                    uint64_t n = src[al];
                     if (n > 0 && n < (uint64_t)want) want = (size_t)n;
                 }
                 NSData *outBuf = dh_capture_at(bufPtr, want);
@@ -490,7 +509,9 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
             char after = o->name[strlen(symbol)];
             if (after != '\0' && after != ' ') continue;
             pthread_mutex_unlock(&g_install_lock);
-            return -3;   // 已安装过同一符号: 复用该槽位
+            // 返回 -(slot+10): 让调用方拿到准确槽位, 不必再按名字模糊匹配
+            // (MCP 层曾用 strncmp 前缀匹配, CCHmac 会误命中 CCHmacInit)。
+            return -(i + 10);
         }
     }
     int slot = dh_alloc_slot();
@@ -504,7 +525,6 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
     atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
     atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
     g_dh_thunk_post[slot] = 0;
-    g_dh_thunk_orig[slot] = NULL;
     // 必须先清 orig: 同进程里本 dylib 可能被 reload 过, g_dh_thunk_orig 里可能残留上一代的值,
     // 那样 rebind 失败也会被当成成功, 槽位从此 0 命中(实测踩过)。
     g_dh_thunk_orig[slot] = NULL;
@@ -537,31 +557,8 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
         Class meta = object_getClass((id)cls);
         if (meta) m = class_getInstanceMethod(meta, sel);
         if (!m) m = class_getClassMethod(cls, sel);
-        // 最后兜底: 直接扫元类自身的方法列表(继承链上 getInstanceMethod 有时看不到)。
-        if (!m && meta) {
-            for (Class c = meta; c && !m; c = class_getSuperclass(c)) {
-                unsigned int n = 0;
-                Method *list = class_copyMethodList(c, &n);
-                if (!list) continue;
-                for (unsigned int i = 0; i < n; i++) {
-                    if (method_getName(list[i]) == sel) { m = list[i]; break; }
-                }
-                free(list);
-            }
-        }
     } else {
         m = class_getInstanceMethod(cls, sel);
-        if (!m) {
-            for (Class c = cls; c && !m; c = class_getSuperclass(c)) {
-                unsigned int n = 0;
-                Method *list = class_copyMethodList(c, &n);
-                if (!list) continue;
-                for (unsigned int i = 0; i < n; i++) {
-                    if (method_getName(list[i]) == sel) { m = list[i]; break; }
-                }
-                free(list);
-            }
-        }
     }
     if (!m) return -3;
     pthread_mutex_lock(&g_install_lock);
@@ -866,6 +863,8 @@ int dh_thunk_set_capture_after(int slot, int on) {
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
     if (atomic_load_explicit(&s->retired, memory_order_relaxed)) return -1;
+    // 只开 after 而不配 capture_memory 是悬空语义(没有 ptr_arg 可读), 直接拒绝而不是让它静默什么都不做。
+    if (on && atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire) < 0) return -2;
     atomic_store_explicit(&s->capture_after, on ? 1 : 0, memory_order_relaxed);
     if (on) {   // 输出缓冲只有返回后才有内容, 必须同时打开 post 路径
         atomic_store_explicit(&s->capture_return, 1, memory_order_relaxed);
