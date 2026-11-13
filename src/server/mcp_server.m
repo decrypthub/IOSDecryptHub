@@ -1720,17 +1720,25 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
             NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
             if (dh_thunk_validate_capture_multi(capMulti.UTF8String) != 0)
                 return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 非法: %@。只接受 x0..x8 加可选 :N（每段最长 95 字节），逗号分隔，例如 x0:64,x3:32；已有 hook 未受影响", capMulti]);
-            if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0)
+            if (capMulti && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0)
                 return tool_err(@"capture_multi 应用失败（规格已通过校验，说明槽位状态异常）");
-            if (capMulti.length) r[@"capture_multi"] = capMulti;
+            if (capMulti) r[@"capture_multi"] = capMulti;
             // capture_ret_multi 也必须在这里处理: 漏掉的话对已 hook 的符号补窗口会返回
             // ok:true + reused:true 但一条 ret 都不产生 —— 又是一种假成功。
             NSString *capRet = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
             if (dh_thunk_validate_capture_multi(capRet.UTF8String) != 0)
                 return tool_err([NSString stringWithFormat:@"capture_ret_multi 非法: %@。语法同 capture_multi；已有 hook 未受影响", capRet]);
-            if (capRet.length && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
+            // 返回值只有 x0/x1。x2..x8 在 post 快照里仍是入口值，允许它们会把
+            // 入参渲染成 ret xN 写进 detail —— 误导性证据。
+            for (NSString *tok in [capRet componentsSeparatedByString:@","]) {
+                NSString *t = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+                if (!t.length) continue;
+                if (!([t hasPrefix:@"x0"] || [t hasPrefix:@"X0"] || [t hasPrefix:@"x1"] || [t hasPrefix:@"X1"] || [t hasPrefix:@"0"] || [t hasPrefix:@"1"]))
+                    return tool_err([NSString stringWithFormat:@"capture_ret_multi 只接受 x0/x1（AAPCS64 只有这两个寄存器承载返回值）: %@", t]);
+            }
+            if (capRet && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
                 return tool_err(@"capture_ret_multi 应用失败（规格已通过校验，说明槽位状态异常）");
-            if (capRet.length) r[@"capture_ret_multi"] = capRet;
+            if (capRet) r[@"capture_ret_multi"] = capRet;
             if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) == 0)
                 r[@"capture"] = @{@"ptr_arg": @(capPtr), @"len_arg": @(capLen), @"max_bytes": @(capMax)};
             return tool_ok(r);
@@ -1745,14 +1753,20 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     // 多窗口: 一次 hook 同时抓多个寄存器, 换寄存器不必重启进程
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
+    if (capMulti && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
         dh_thunk_disable(slot);
         return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
     }
     NSString *capRet = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
     if (dh_thunk_validate_capture_multi(capRet.UTF8String) != 0)
         return tool_err([NSString stringWithFormat:@"capture_ret_multi 非法: %@。语法同 capture_multi", capRet]);
-    if (capRet.length && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
+    for (NSString *tok in [capRet componentsSeparatedByString:@","]) {
+        NSString *t = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (!t.length) continue;
+        if (!([t hasPrefix:@"x0"] || [t hasPrefix:@"X0"] || [t hasPrefix:@"x1"] || [t hasPrefix:@"X1"] || [t hasPrefix:@"0"] || [t hasPrefix:@"1"]))
+            return tool_err([NSString stringWithFormat:@"capture_ret_multi 只接受 x0/x1（AAPCS64 只有这两个寄存器承载返回值）: %@", t]);
+    }
+    if (capRet && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
         return tool_err(@"capture_ret_multi 应用失败（规格已校验通过, 说明槽位状态异常）");
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
@@ -1770,8 +1784,8 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
                                     ? @"record-only + C 字符串参数反引用(前 4 个参数里像可打印字符串的会被记内容); events land in category 'other' as algorithm 'import-hook'."
                                     : @"record-only; events land in category 'other' as algorithm 'import-hook'. 传 describe_args:true 可尝试记录字符串参数(如 getaddrinfo 域名/dlopen 路径)。"} mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
-    if (capMulti.length) { res[@"capture_multi"] = capMulti; }
-    if (capRet.length) { res[@"capture_ret_multi"] = capRet; }
+    if (capMulti) { res[@"capture_multi"] = capMulti; }
+    if (capRet) { res[@"capture_ret_multi"] = capRet; }
 
     if (capEcho) {
         res[@"capture"] = capEcho;
@@ -1847,14 +1861,20 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
     BOOL wantRet = [args[@"capture_return"] boolValue];
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
+    if (capMulti && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
         dh_thunk_disable(slot);
         return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
     }
     NSString *capRet = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
     if (dh_thunk_validate_capture_multi(capRet.UTF8String) != 0)
         return tool_err([NSString stringWithFormat:@"capture_ret_multi 非法: %@。语法同 capture_multi", capRet]);
-    if (capRet.length && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
+    for (NSString *tok in [capRet componentsSeparatedByString:@","]) {
+        NSString *t = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (!t.length) continue;
+        if (!([t hasPrefix:@"x0"] || [t hasPrefix:@"X0"] || [t hasPrefix:@"x1"] || [t hasPrefix:@"X1"] || [t hasPrefix:@"0"] || [t hasPrefix:@"1"]))
+            return tool_err([NSString stringWithFormat:@"capture_ret_multi 只接受 x0/x1（AAPCS64 只有这两个寄存器承载返回值）: %@", t]);
+    }
+    if (capRet && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
         return tool_err(@"capture_ret_multi 应用失败（规格已校验通过, 说明槽位状态异常）");
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
@@ -1878,8 +1898,8 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
                  @" events land in category 'other' as algorithm 'inline-hook'. unhook 默认软停；unhook {hard:true} 恢复目标入口原始字节并退休槽位。"
     } mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
-    if (capMulti.length) { res[@"capture_multi"] = capMulti; }
-    if (capRet.length) { res[@"capture_ret_multi"] = capRet; }
+    if (capMulti) { res[@"capture_multi"] = capMulti; }
+    if (capRet) { res[@"capture_ret_multi"] = capRet; }
 
     if (capEcho) {
         res[@"capture"] = capEcho;
@@ -1960,14 +1980,20 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
     BOOL wantRet = [args[@"capture_return"] boolValue];
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
+    if (capMulti && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
         dh_thunk_disable(slot);
         return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
     }
     NSString *capRet = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
     if (dh_thunk_validate_capture_multi(capRet.UTF8String) != 0)
         return tool_err([NSString stringWithFormat:@"capture_ret_multi 非法: %@。语法同 capture_multi", capRet]);
-    if (capRet.length && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
+    for (NSString *tok in [capRet componentsSeparatedByString:@","]) {
+        NSString *t = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (!t.length) continue;
+        if (!([t hasPrefix:@"x0"] || [t hasPrefix:@"X0"] || [t hasPrefix:@"x1"] || [t hasPrefix:@"X1"] || [t hasPrefix:@"0"] || [t hasPrefix:@"1"]))
+            return tool_err([NSString stringWithFormat:@"capture_ret_multi 只接受 x0/x1（AAPCS64 只有这两个寄存器承载返回值）: %@", t]);
+    }
+    if (capRet && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
         return tool_err(@"capture_ret_multi 应用失败（规格已校验通过, 说明槽位状态异常）");
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
@@ -1987,8 +2013,8 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
                                     ? @"record-only + 参数反引用(NSData→hex, NSString→文本, 其它→description); events land in category 'other' as algorithm 'objc-hook'."
                                     : @"record-only; events land in category 'other' as algorithm 'objc-hook'. 传 describe_args:true 可直接记录参数内容。"} mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
-    if (capMulti.length) { res[@"capture_multi"] = capMulti; }
-    if (capRet.length) { res[@"capture_ret_multi"] = capRet; }
+    if (capMulti) { res[@"capture_multi"] = capMulti; }
+    if (capRet) { res[@"capture_ret_multi"] = capRet; }
 
     if (capEcho) {
         res[@"capture"] = capEcho;

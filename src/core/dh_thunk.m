@@ -241,7 +241,8 @@ static NSArray *dh_capture_spec(const char *specRaw, uint64_t *gpr, int defaultM
 static void dh_render_windows(NSMutableString *d, const char *spec, _Atomic int *ready,
                               uint64_t *gpr, int defaultMax, NSString *tag) {
     int sq1 = atomic_load_explicit(ready, memory_order_acquire);
-    if (sq1 == 0 || (sq1 & 1) || !spec[0]) return;   // 0=从未设置, 奇数=写作中
+    // 0 = 从未设置; 奇数 = 写作中; spec 为空 = 已被清空(清空也推进版本号, 所以靠 spec 判断)。
+    if (sq1 == 0 || (sq1 & 1) || !spec[0]) return;
     NSArray *wins = dh_capture_spec(spec, gpr, defaultMax);
     static const char hexd[] = "0123456789abcdef";
     for (NSDictionary *w in wins) {
@@ -565,6 +566,8 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
     atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
     s->capture_multi[0] = '\0';
     atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
+    s->capture_ret_multi[0] = 0;
+    atomic_store_explicit(&s->capture_ret_multi_ready, 0, memory_order_release);
     g_dh_thunk_post[slot] = 0;
     // 必须先清 orig: 同进程里本 dylib 可能被 reload 过, g_dh_thunk_orig 里可能残留上一代的值,
     // 那样 rebind 失败也会被当成成功, 槽位从此 0 命中(实测踩过)。
@@ -642,6 +645,8 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
     atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
     s->capture_multi[0] = 0;
     atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
+    s->capture_ret_multi[0] = 0;
+    atomic_store_explicit(&s->capture_ret_multi_ready, 0, memory_order_release);
     g_dh_thunk_post[slot] = 0;
     g_dh_thunk_orig[slot] = (void *)method_getImplementation(m);
     atomic_store_explicit(&s->enabled, 1, memory_order_release);
@@ -838,6 +843,8 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
     atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
     s->capture_multi[0] = '\0';
     atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
+    s->capture_ret_multi[0] = 0;
+    atomic_store_explicit(&s->capture_ret_multi_ready, 0, memory_order_release);
     g_dh_thunk_post[slot] = 0;
     g_dh_thunk_orig[slot] = NULL;
     atomic_store_explicit(&s->enabled, 0, memory_order_release);
@@ -941,6 +948,9 @@ int dh_thunk_validate_capture_multi(const char *spec) {
     if (!spec || !spec[0]) return 0;
     if (strlen(spec) >= 96) return -2;
     const char *p = spec;
+    int tokens = 0;          // 必须至少解析出一个窗口。
+    // 只含分隔符的规格（","、" "、", ,"）在下面会被全部跳过、循环正常结束，
+    // 于是 setter 打开 post 路径却一条窗口都产不出来 —— 永久慢路径 + 空输出。
     while (*p) {
         while (*p == ' ' || *p == ',') p++;
         if (!*p) break;
@@ -954,8 +964,9 @@ int dh_thunk_validate_capture_multi(const char *spec) {
             while (*p >= '0' && *p <= '9') p++;
         }
         if (*p && *p != ',' && *p != ' ') return -1;
+        tokens++;
     }
-    return 0;
+    return tokens > 0 ? 0 : -1;
 }
 
 // 统一重算 post 标记: 三个能力(capture_return / capture_after / capture_ret_multi)
@@ -966,9 +977,13 @@ int dh_thunk_validate_capture_multi(const char *spec) {
 static void dh_thunk_sync_post(int slot) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return;
     dh_slot_t *s = &g_slots[slot];
+    // ret_multi 的「是否有效」看串本身, 不看版本号: 版本号是单调计数器,
+    // 清空后也不会回到 0(避免 ABA), 所以 != 0 只说明「设过」而不是「现在开着」。
+    int retOn = atomic_load_explicit(&s->capture_ret_multi_ready, memory_order_acquire) != 0
+             && s->capture_ret_multi[0] != 0;
     int need = atomic_load_explicit(&s->capture_return, memory_order_relaxed)
             || atomic_load_explicit(&s->capture_after, memory_order_relaxed)
-            || atomic_load_explicit(&s->capture_ret_multi_ready, memory_order_acquire) != 0;
+            || retOn;
     g_dh_thunk_post[slot] = need ? 1 : 0;
 }
 
@@ -996,15 +1011,44 @@ int dh_thunk_set_capture_multi(int slot, const char *spec) {
 
 // 返回值寄存器的多窗口 (post 路径)。用于「函数返回 (status, buffer)」这种 ABI:
 // 缓冲在返回后可能立刻被释放, 只能在这里读。
+//
+// 只接受 x0/x1: AAPCS64 只有这两个寄存器承载整数/指针返回值。post 路径把返回的
+// x0/x1 写回快照, 但 x2..x8 仍是**入口**值 —— 允许它们会让 `ret x5 = ...` 这种
+// 把入参渲染成返回值的误导性证据出现在 detail 里。
+static int dh_validate_ret_regs(const char *spec) {
+    if (!spec) return 0;
+    const char *p = spec;
+    while (*p) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        if (*p == 'x' || *p == 'X') p++;
+        if (*p != '0' && *p != '1') return -1;    // 只有 x0/x1 是返回值
+        p++;
+        if (*p == ':') {
+            p++;
+            if (!(*p >= '0' && *p <= '9')) return -1;
+            while (*p >= '0' && *p <= '9') p++;
+        }
+        if (*p && *p != ',' && *p != ' ') return -1;
+    }
+    return 0;
+}
+
 int dh_thunk_set_capture_ret_multi(int slot, const char *spec) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
     int v = dh_thunk_validate_capture_multi(spec);
     if (v != 0) return v;
+    v = dh_validate_ret_regs(spec);
+    if (v != 0) return v;
     if (!spec || !spec[0]) {
-        atomic_store_explicit(&s->capture_ret_multi_ready, 0, memory_order_release);
+        // 清空也要保持版本号单调: 直接把 ready 按回 0 会造出 2 → 0 → 2 的 ABA,
+        // 读端首尾都读到 2 会判定一致, 可能用一条撕裂的规格。
+        // 所以清空 = 再推进两次, 并把「是否有效」交给 ret_multi[0] == 0 判断。
+        atomic_fetch_add_explicit(&s->capture_ret_multi_ready, 1, memory_order_acq_rel);
         s->capture_ret_multi[0] = 0;
+        atomic_fetch_add_explicit(&s->capture_ret_multi_ready, 1, memory_order_release);
         dh_thunk_sync_post(slot);
         return 0;
     }
