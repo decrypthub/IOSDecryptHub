@@ -1710,6 +1710,7 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
                 dh_thunk_disable(slot);
                 return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
             }
+            if (capMulti.length) r[@"capture_multi"] = capMulti;
             if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) == 0)
                 r[@"capture"] = @{@"ptr_arg": @(capPtr), @"len_arg": @(capLen), @"max_bytes": @(capMax)};
             return tool_ok(r);
@@ -1724,14 +1725,18 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     // 多窗口: 一次 hook 同时抓多个寄存器, 换寄存器不必重启进程
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
+    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
+        dh_thunk_abort_install(slot);
+        return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
+    }
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
-        dh_thunk_disable(slot);
+        dh_thunk_abort_install(slot);
         return tool_err(@"capture_memory 应用失败");
     }
     // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
     BOOL wantAfter = [args[@"capture_after"] boolValue];
     if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
-        dh_thunk_disable(slot);
+        dh_thunk_abort_install(slot);
         return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
     }
     NSMutableDictionary *res = [@{@"slot": @(slot), @"symbol": sym, @"kind": @"import", @"enabled": @YES,
@@ -1806,17 +1811,17 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
     if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
-        dh_thunk_disable(slot);
+        dh_thunk_abort_install(slot);
         return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
     }
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
-        dh_thunk_disable(slot);
+        dh_thunk_abort_install(slot);
         return tool_err(@"capture_memory 应用失败");
     }
     // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
     BOOL wantAfter = [args[@"capture_after"] boolValue];
     if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
-        dh_thunk_disable(slot);
+        dh_thunk_abort_install(slot);
         return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
     }
 
@@ -1902,17 +1907,17 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
     if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
-        dh_thunk_disable(slot);
+        dh_thunk_abort_install(slot);
         return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
     }
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
-        dh_thunk_disable(slot);
+        dh_thunk_abort_install(slot);
         return tool_err(@"capture_memory 应用失败");
     }
     // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
     BOOL wantAfter = [args[@"capture_after"] boolValue];
     if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
-        dh_thunk_disable(slot);
+        dh_thunk_abort_install(slot);
         return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
     }
     NSMutableDictionary *res = [@{@"slot": @(slot),
@@ -1950,6 +1955,7 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
             @"retired": info[i].retired ? @YES : @NO,
             @"capture_return": info[i].capture_return ? @YES : @NO,
             @"capture_after":  info[i].capture_after ? @YES : @NO,
+            @"capture_multi":  info[i].capture_multi[0] ? @(info[i].capture_multi) : @"",
         } mutableCopy];
         NSDictionary *cap = dh_capture_echo(info[i].capture_ptr_arg, info[i].capture_len_arg,
                                             info[i].capture_max_bytes);

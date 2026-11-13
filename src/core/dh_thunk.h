@@ -89,6 +89,8 @@ int  dh_thunk_set_capture_after(int slot, int on);
 int  dh_thunk_set_capture_multi(int slot, const char *spec);
 
 // 原子关闭一个 hook(停止记录, 仍透明转发)。越界/未用返回 -1, 成功返回 0。
+// 撤销一次刚完成的安装(参数校验失败时用), 回收槽位并清空配置
+int  dh_thunk_abort_install(int slot);
 int  dh_thunk_disable(int slot);
 
 // 卸载一个 hook。hard=0: 只停记录(软停, patch 保留);

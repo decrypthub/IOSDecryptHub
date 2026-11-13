@@ -45,7 +45,9 @@ typedef struct {
     _Atomic int      capture_max_bytes;
     _Atomic int      capture_return;   // 1 = post 路径, 记录返回值
     _Atomic int      capture_after;    // 1 = capture_ptr_arg 指向「调用后才写好的输出缓冲」
-    char             capture_multi[96]; // 多窗口: "x0:64,x3:32,x5:128" (空=关闭)
+    char             capture_multi[96];        // 多窗口: "x0:64,x3:32,x5:128" (空=关闭)
+    char             capture_multi_shadow[96]; // 写入用的影子缓冲, 避免读到写了一半的串
+    _Atomic int      capture_multi_ready;      // 1 = capture_multi 内容完整可读
     dh_hook_kind     kind;
     int              used;
     void            *target;          // inline: DobbyHook 的目标地址
@@ -403,21 +405,32 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
         }
         // 多窗口: 一次 hook 同时记录多个寄存器指向的内存。
         // 一个 inline 目标只能装一个 hook 且槽位不回收, 换寄存器就得重启进程, 所以这是分析多参数函数的关键能力。
-        if (s->capture_multi[0]) {
+        if (atomic_load_explicit(&s->capture_multi_ready, memory_order_acquire) && s->capture_multi[0]) {
             NSArray *wins = dh_capture_multi(s, gpr);
             for (NSDictionary *w in wins) {
                 int reg = [w[@"reg"] intValue];
                 NSData *b = w[@"bytes"];
                 uint64_t waddr = [w[@"addr"] unsignedLongLongValue];
-                // 必须自己转完整 hex: NSData.description 会在 16 字节后折叠成 "...",
-                // 分析时看不到中间内容等于白抓。
-                NSUInteger take = MIN(b.length, (NSUInteger)DH_THUNK_CAPTURE_MAX);
-                NSMutableString *hex = [NSMutableString stringWithCapacity:take * 2];
-                const uint8_t *p = (const uint8_t *)b.bytes;
-                for (NSUInteger i = 0; i < take; i++) [hex appendFormat:@"%02x", p[i]];
-                [d appendFormat:@"\nwin x%d @0x%llx = %lu bytes: %@", reg, waddr, (unsigned long)b.length, hex];
+                // 必须自己转完整 hex: NSData.description 会在 16 字节后折叠成 "...", 分析时等于白抓。
+                // 用查表 + stringWithCharacters 一次性成串: 逐字节 appendFormat 在热函数上是几万次
+                // 格式化调用, 会把命中耗时拉长到毫秒级, 改变目标 App 的时序。
+                NSUInteger take = b.length;   // 已在 dh_capture_multi 里钳到 CAPTURE_MAX
+                static const char hexd[] = "0123456789abcdef";
+                unichar *hbuf = (unichar *)malloc(take * 2 * sizeof(unichar));
+                if (hbuf) {
+                    const uint8_t *p = (const uint8_t *)b.bytes;
+                    for (NSUInteger k = 0; k < take; k++) {
+                        hbuf[k * 2]     = (unichar)hexd[p[k] >> 4];
+                        hbuf[k * 2 + 1] = (unichar)hexd[p[k] & 0xF];
+                    }
+                    NSString *hex = [NSString stringWithCharacters:hbuf length:take * 2];
+                    free(hbuf);
+                    [d appendFormat:@"\nwin x%d @0x%llx = %lu bytes: %@", reg, waddr, (unsigned long)b.length, hex];
+                } else {
+                    [d appendFormat:@"\nwin x%d @0x%llx = %lu bytes (hex alloc failed)", reg, waddr, (unsigned long)b.length];
+                }
             }
-            if (!wins.count) [d appendFormat:@"\nwin [%@] unreadable", s->capture_multi];
+            if (!wins.count) [d appendFormat:@"\nwin [%s] unreadable (所有窗口都读不到: 地址<4GB 或 vm_read_overwrite 失败)", s->capture_multi];
         }
         [d appendFormat:@"\nsp=0x%llx lr=0x%llx", caller_sp, lr];
         e.detail    = d;
@@ -524,6 +537,8 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
     atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
     atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
+    s->capture_multi[0] = '\0';
+    atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
     g_dh_thunk_post[slot] = 0;
     // 必须先清 orig: 同进程里本 dylib 可能被 reload 过, g_dh_thunk_orig 里可能残留上一代的值,
     // 那样 rebind 失败也会被当成成功, 槽位从此 0 命中(实测踩过)。
@@ -535,6 +550,8 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
         // 所以回收该槽 100% 安全(没有遗留跳转)。若它正好是最后分配的一个, 直接回退计数复用。
         s->used = 0;
         s->name[0] = '\0';
+        s->capture_multi[0] = '\0';
+        atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
         int last = slot + 1;
         atomic_compare_exchange_strong_explicit(&g_next_slot, &last, slot,
                                                 memory_order_relaxed, memory_order_relaxed);
@@ -785,6 +802,8 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
     atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
     atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
+    s->capture_multi[0] = '\0';
+    atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
     g_dh_thunk_post[slot] = 0;
     g_dh_thunk_orig[slot] = NULL;
     atomic_store_explicit(&s->enabled, 0, memory_order_release);
@@ -794,6 +813,8 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
     if (rc != 0 || g_dh_thunk_orig[slot] == NULL) {
         s->used = 0;
         s->name[0] = '\0';
+        s->capture_multi[0] = '\0';
+        atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
         s->target = NULL;
         s->saved_len = 0;
         s->patched_len = 0;
@@ -879,7 +900,11 @@ int dh_thunk_set_capture_multi(int slot, const char *spec) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
-    if (!spec || !spec[0]) { s->capture_multi[0] = '\0'; return 0; }
+    if (!spec || !spec[0]) {
+        atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
+        s->capture_multi[0] = '\\0';
+        return 0;
+    }
     if (strlen(spec) >= sizeof(s->capture_multi)) return -1;
     // 语法预检: 只接受 "x<0-8>[:N]" 的逗号序列，其它一律拒绝（不让坏规格静默变成空抓取）。
     const char *p = spec;
@@ -897,7 +922,39 @@ int dh_thunk_set_capture_multi(int slot, const char *spec) {
         }
         if (*p && *p != ',' && *p != ' ') return -1;
     }
-    strlcpy(s->capture_multi, spec, sizeof(s->capture_multi));
+    // 写入端与 hook 命中线程的读取端没有锁。若直接 strlcpy 覆盖, 读到的是「写了一半」的混合串
+    // (例如旧 "x0:64,x3:32" 被新 "x5:128" 覆盖时读到 "x5:64,x3:32"), 会抓错寄存器产出错误证据。
+    // 做法: 先把新规格写进 shadow, 再原子翻转 ready 标志; 读取端只在 ready 为 1 时整串读。
+    strlcpy(s->capture_multi_shadow, spec, sizeof(s->capture_multi_shadow));
+    atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
+    strlcpy(s->capture_multi, s->capture_multi_shadow, sizeof(s->capture_multi));
+    atomic_store_explicit(&s->capture_multi_ready, 1, memory_order_release);
+    return 0;
+}
+
+// 撤销一次刚完成的安装（参数校验失败时用）。
+// 为什么需要: 装 hook 时槽位先分配、参数后校验；校验失败如果只 disable 不回收，
+// 槽位会以「已用但半配置」的状态留在表里，list_hooks 会显示一个名字是旧 label、
+// 配置是新参数的混合体 —— 排查时完全误导。
+int dh_thunk_abort_install(int slot) {
+    if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
+    pthread_mutex_lock(&g_install_lock);
+    dh_slot_t *s = &g_slots[slot];
+    if (s->used) {
+        s->used = 0;
+        s->name[0] = '\0';
+        s->capture_multi[0] = '\0';
+        atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
+        atomic_store_explicit(&s->enabled, 0, memory_order_release);
+        atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
+        atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
+        atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
+        g_dh_thunk_post[slot] = 0;
+        int last = slot + 1;
+        atomic_compare_exchange_strong_explicit(&g_next_slot, &last, slot,
+                                                memory_order_relaxed, memory_order_relaxed);
+    }
+    pthread_mutex_unlock(&g_install_lock);
     return 0;
 }
 
@@ -981,6 +1038,8 @@ int dh_thunk_list(dh_hook_info *out, int max) {
         out[n].kind    = g_slots[i].kind;
         out[n].hits    = atomic_load_explicit(&g_slots[i].hits, memory_order_relaxed);
         out[n].name    = g_slots[i].name;
+        // capture_multi 必须回填: 否则 list_hooks 看不到多窗口配置, 用户没法自查是否真的生效。
+        strlcpy(out[n].capture_multi, g_slots[i].capture_multi, sizeof(out[n].capture_multi));
         out[n].capture_ptr_arg   = atomic_load_explicit(&g_slots[i].capture_ptr_arg, memory_order_acquire);
         out[n].capture_len_arg   = atomic_load_explicit(&g_slots[i].capture_len_arg, memory_order_relaxed);
         out[n].capture_max_bytes = atomic_load_explicit(&g_slots[i].capture_max_bytes, memory_order_relaxed);
