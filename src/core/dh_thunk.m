@@ -44,6 +44,7 @@ typedef struct {
     _Atomic int      capture_len_arg;   // >=0: 从该寄存器取长度; -1: 固定长度
     _Atomic int      capture_max_bytes;
     _Atomic int      capture_return;   // 1 = post 路径, 记录返回值
+    _Atomic int      capture_after;    // 1 = capture_ptr_arg 指向「调用后才写好的输出缓冲」
     dh_hook_kind     kind;
     int              used;
     void            *target;          // inline: DobbyHook 的目标地址
@@ -167,6 +168,22 @@ static int dh_class_cmp(const void *pa, const void *pb) {
 // 的 key 缓冲区经 mlock 锁定又立即 munlock, 事后回读只剩零), 只有命中瞬间的内容可信。
 // 安全边界: 只读用户态地址, 显式长度上限, vm_read_overwrite 失败/部分成功都安全降级,
 // 不新增任何可执行内存或 inline hook。
+// 同 dh_capture_arg_memory，但指针/长度直接给定。post 路径要用「已返回的原函数返回的缓冲」，
+// 那些值只在寄存器快照里，没有槽位字段可读。
+static NSData *dh_capture_at(uint64_t addr, size_t want) {
+    if (addr < 0x100000000ULL || want == 0) return nil;
+    if (want > DH_THUNK_CAPTURE_MAX) want = DH_THUNK_CAPTURE_MAX;
+    NSMutableData *data = [NSMutableData dataWithLength:want];
+    if (!data) return nil;
+    vm_size_t got = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr,
+                                         (vm_size_t)want,
+                                         (mach_vm_address_t)data.mutableBytes, &got);
+    if (kr != KERN_SUCCESS || got == 0) return nil;
+    if (got < want) data.length = got;
+    return data;
+}
+
 static NSData *dh_capture_arg_memory(dh_slot_t *s, uint64_t *gpr) {
     int ptrArg = atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire);
     if (ptrArg < 0 || ptrArg > 8) return nil;
@@ -358,6 +375,29 @@ void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_
             [d appendFormat:@"\n  ret = %@", desc];
             e.input = [desc dataUsingEncoding:NSUTF8StringEncoding];
         }
+        // capture_after: 输出缓冲在原函数返回后才有效 (CCHmac 的 digest 出参、CCCrypt 的密文出参)。
+        // 入口抓只能拿到未初始化内存, 所以这类槽位必须在 post 路径读。
+        if (atomic_load_explicit(&s->capture_after, memory_order_relaxed)) {
+            int ap = atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire);
+            int al = atomic_load_explicit(&s->capture_len_arg, memory_order_relaxed);
+            int am = atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed);
+            if (ap >= 0 && ap <= 8) {
+                uint64_t bufPtr = regs[ap];
+                size_t want = (am > 0 && am <= DH_THUNK_CAPTURE_MAX) ? (size_t)am : 64;
+                if (al >= 0 && al <= 8) {
+                    uint64_t n = regs[al];
+                    if (n > 0 && n < (uint64_t)want) want = (size_t)n;
+                }
+                NSData *outBuf = dh_capture_at(bufPtr, want);
+                if (outBuf.length) {
+                    e.output = outBuf;
+                    [d appendFormat:@"\n  out arg%d(x%d) @0x%llx = %lu bytes: %@",
+                     ap, ap, bufPtr, (unsigned long)outBuf.length, DHHexFromData(outBuf)];
+                } else {
+                    [d appendFormat:@"\n  out arg%d(x%d) @0x%llx unreadable", ap, ap, bufPtr];
+                }
+            }
+        }
         e.detail    = d;
         e.callStack = DHCallStackFiltered();
         e.timestamp = DHTimestampNow();
@@ -377,6 +417,21 @@ static int dh_alloc_slot(void) {
 int dh_thunk_install_import(const char *symbol, const char *label) {
     if (!DH_THUNK_ARM64 || !symbol || !symbol[0]) return -1;
     pthread_mutex_lock(&g_install_lock);
+    // fishhook 按符号改 GOT: 同一符号装第二次会把 GOT 指向新槽位, 旧槽位从此 0 命中
+    // (它还留在 list_hooks 里, 看起来像「装好了却不生效」)。重复安装直接拒绝, 让调用方复用。
+    {
+        int n = atomic_load_explicit(&g_next_slot, memory_order_relaxed);
+        if (n > DH_THUNK_COUNT) n = DH_THUNK_COUNT;
+        for (int i = 0; i < n; i++) {
+            dh_slot_t *o = &g_slots[i];
+            if (!o->used || o->kind != DH_HOOK_IMPORT) continue;
+            if (strncmp(o->name, symbol, strlen(symbol)) != 0) continue;
+            char after = o->name[strlen(symbol)];
+            if (after != '\0' && after != ' ') continue;
+            pthread_mutex_unlock(&g_install_lock);
+            return -3;   // 已安装过同一符号: 复用该槽位
+        }
+    }
     int slot = dh_alloc_slot();
     if (slot < 0) { pthread_mutex_unlock(&g_install_lock); return -1; }
     dh_slot_t *s = &g_slots[slot];
@@ -386,7 +441,11 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
     s->used = 1;
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
     atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
     g_dh_thunk_post[slot] = 0;
+    g_dh_thunk_orig[slot] = NULL;
+    // 必须先清 orig: 同进程里本 dylib 可能被 reload 过, g_dh_thunk_orig 里可能残留上一代的值,
+    // 那样 rebind 失败也会被当成成功, 槽位从此 0 命中(实测踩过)。
     g_dh_thunk_orig[slot] = NULL;
     struct rebinding rb = { symbol, dh_slot_addr(slot), &g_dh_thunk_orig[slot] };
     rebind_symbols(&rb, 1);
@@ -411,8 +470,38 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
     Class cls = objc_getClass(className);
     if (!cls) return -3;
     SEL sel = sel_registerName(selector);
-    Method m = classMethod ? class_getClassMethod(cls, sel)
-                           : class_getInstanceMethod(cls, sel);
+    Method m = nil;
+    if (classMethod) {
+        // Swift 类的 +method 只在元类上以实例方法形式存在, class_getClassMethod 会漏。
+        Class meta = object_getClass((id)cls);
+        if (meta) m = class_getInstanceMethod(meta, sel);
+        if (!m) m = class_getClassMethod(cls, sel);
+        // 最后兜底: 直接扫元类自身的方法列表(继承链上 getInstanceMethod 有时看不到)。
+        if (!m && meta) {
+            for (Class c = meta; c && !m; c = class_getSuperclass(c)) {
+                unsigned int n = 0;
+                Method *list = class_copyMethodList(c, &n);
+                if (!list) continue;
+                for (unsigned int i = 0; i < n; i++) {
+                    if (method_getName(list[i]) == sel) { m = list[i]; break; }
+                }
+                free(list);
+            }
+        }
+    } else {
+        m = class_getInstanceMethod(cls, sel);
+        if (!m) {
+            for (Class c = cls; c && !m; c = class_getSuperclass(c)) {
+                unsigned int n = 0;
+                Method *list = class_copyMethodList(c, &n);
+                if (!list) continue;
+                for (unsigned int i = 0; i < n; i++) {
+                    if (method_getName(list[i]) == sel) { m = list[i]; break; }
+                }
+                free(list);
+            }
+        }
+    }
     if (!m) return -3;
     pthread_mutex_lock(&g_install_lock);
     int total = atomic_load_explicit(&g_next_slot, memory_order_relaxed);
@@ -637,6 +726,7 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
     atomic_store_explicit(&s->retired, 0, memory_order_relaxed);
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
     atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
     g_dh_thunk_post[slot] = 0;
     g_dh_thunk_orig[slot] = NULL;
     atomic_store_explicit(&s->enabled, 0, memory_order_release);
@@ -705,6 +795,21 @@ int dh_thunk_set_return(int slot, int on) {
     // 先写槽位字段再发布汇编可见的标记位 (release), 保证 handler 看到 1 时字段已就绪。
     atomic_store_explicit(&s->capture_return, on ? 1 : 0, memory_order_relaxed);
     g_dh_thunk_post[slot] = on ? 1 : 0;
+    return 0;
+}
+
+// capture_after=1: capture_ptr_arg 指向的是「调用之后才写好的输出缓冲」(CCHmac 的 digest 出参、
+// CCCrypt 的密文出参)。这种槽位必须走 post 路径, 否则入口抓到的是未初始化内存。
+int dh_thunk_set_capture_after(int slot, int on) {
+    if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
+    dh_slot_t *s = &g_slots[slot];
+    if (!s->used) return -1;
+    if (atomic_load_explicit(&s->retired, memory_order_relaxed)) return -1;
+    atomic_store_explicit(&s->capture_after, on ? 1 : 0, memory_order_relaxed);
+    if (on) {   // 输出缓冲只有返回后才有内容, 必须同时打开 post 路径
+        atomic_store_explicit(&s->capture_return, 1, memory_order_relaxed);
+        g_dh_thunk_post[slot] = 1;
+    }
     return 0;
 }
 
@@ -792,6 +897,7 @@ int dh_thunk_list(dh_hook_info *out, int max) {
         out[n].capture_len_arg   = atomic_load_explicit(&g_slots[i].capture_len_arg, memory_order_relaxed);
         out[n].capture_max_bytes = atomic_load_explicit(&g_slots[i].capture_max_bytes, memory_order_relaxed);
         out[n].capture_return   = atomic_load_explicit(&g_slots[i].capture_return, memory_order_relaxed);
+        out[n].capture_after    = atomic_load_explicit(&g_slots[i].capture_after, memory_order_relaxed);
         n++;
     }
     return n;   // 实际写入条数 (跳过被作废的槽)

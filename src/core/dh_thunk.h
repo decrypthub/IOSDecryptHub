@@ -37,6 +37,7 @@ typedef struct {
     int          enabled;
     int          retired;   // 已硬卸载并恢复原代码; 槽位不再复用
     int          capture_return;   // 1 = post 路径, 记录返回值
+    int          capture_after;    // 1 = capture_ptr_arg 指向调用后才写好的输出缓冲
     dh_hook_kind kind;
     uint64_t     hits;
     const char  *name;    // 符号名 / "-[Class sel]"
@@ -80,6 +81,9 @@ int  dh_thunk_set_capture(int slot, int ptr_arg, int len_arg, int max_bytes);
 // on=1 时该槽位改走 post 路径: 先调原函数, 记录 x0(返回值, 对象会反引用成描述) 后再返回。
 // 代价是这一层栈帧要留到原函数返回, 只在需要看返回值时开。import hook 同样支持。
 int  dh_thunk_set_return(int slot, int on);
+// 输出缓冲抓取: 目标把结果写进调用方提供的缓冲 (CCHmac digest / CCCrypt 密文)。
+// 这种槽位必须走 post 路径, 入口抓到的是未初始化内存。
+int  dh_thunk_set_capture_after(int slot, int on);
 
 // 原子关闭一个 hook(停止记录, 仍透明转发)。越界/未用返回 -1, 成功返回 0。
 int  dh_thunk_disable(int slot);

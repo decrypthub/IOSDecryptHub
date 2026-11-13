@@ -655,6 +655,274 @@ static NSDictionary *tool_objc_resolve_imp(NSDictionary *args) {
     return tool_ok(out);
 }
 
+// objc_dump_ivars —— 直接读实例的 ivar 表（含 @encode 类型），用于「属性 getter 全 0 命中」的对象。
+// 为什么需要它: 很多 SDK 的 singleton 在内部直接读 ivar 而不走 ObjC getter，
+// hook getter 会 0 命中，而逐个 object_inspect 又要求先知道字段名。
+// 这里按 class_getInstanceVariable 遍历整个继承链，把 NSData/NSString/NSNumber 反引用成可读值。
+static NSDictionary *tool_objc_dump_ivars(NSDictionary *args) {
+    NSString *className = [args[@"class"] isKindOfClass:NSString.class] ? args[@"class"] : nil;
+    NSString *objStr    = [args[@"object"] isKindOfClass:NSString.class] ? args[@"object"] : nil;
+    BOOL useShared      = [args[@"shared"] boolValue];
+    NSNumber *maxBytesN = [args[@"max_bytes"] isKindOfClass:NSNumber.class] ? args[@"max_bytes"] : nil;
+    NSUInteger maxBytes = maxBytesN ? maxBytesN.unsignedIntegerValue : 128;
+    if (maxBytes == 0) maxBytes = 128;
+    if (maxBytes > 4096) maxBytes = 4096;
+
+    id target = nil;
+    Class cls = Nil;
+    NSString *source = nil;
+    if (objStr) {
+        uint64_t a = strtoull(objStr.UTF8String, NULL, 0);
+        if (a < 0x100000000ULL) return tool_err(@"object address looks invalid");
+        target = (__bridge id)(void *)(uintptr_t)a;
+        cls = object_getClass(target);
+        source = [NSString stringWithFormat:@"object 0x%llx", a];
+    } else {
+        if (!className.length) return tool_err(@"provide 'class' (with shared:true) or 'object' (address)");
+        cls = objc_getClass(className.UTF8String);
+        if (!cls) return tool_err([NSString stringWithFormat:@"class not found: %@", className]);
+        source = className;
+        if (useShared) {
+            SEL sh = NSSelectorFromString(@"sharedInstance");
+            if (![cls respondsToSelector:sh]) return tool_err(@"class does not respond to +sharedInstance; pass object address instead");
+            IMP imp = class_getMethodImplementation(object_getClass((id)cls), sh);
+            if (!imp) return tool_err(@"+sharedInstance has no IMP");
+            id (*fn)(id, SEL) = (id (*)(id, SEL))imp;
+            target = fn((id)cls, sh);
+            if (!target) return tool_err(@"+sharedInstance returned nil");
+            cls = object_getClass(target);
+        } else {
+            return tool_err(@"pass object (address) or set shared:true to read the +sharedInstance object");
+        }
+    }
+
+    NSMutableArray *rows = [NSMutableArray array];
+    NSUInteger total = 0;
+    for (Class c = cls; c && c != [NSObject class]; c = class_getSuperclass(c)) {
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(c, &n);
+        if (!ivars) continue;
+        for (unsigned int i = 0; i < n; i++) {
+            Ivar iv = ivars[i];
+            const char *nm = ivar_getName(iv);
+            const char *tp = ivar_getTypeEncoding(iv);
+            ptrdiff_t off = ivar_getOffset(iv);
+            NSMutableDictionary *row = [NSMutableDictionary dictionary];
+            row[@"owner"] = @(class_getName(c));
+            row[@"name"] = nm ? @(nm) : @"";
+            row[@"type"] = tp ? @(tp) : @"";
+            row[@"offset"] = @((long long)off);
+            @try {
+                // KVC 优先: 能走 getter/ivar 两种路径，且能正确桥接对象。
+                id value = nil;
+                if (nm) {
+                    @try { value = [target valueForKey:@(nm)]; }
+                    @catch (__unused NSException *ex) { value = nil; }
+                }
+                if (value) {
+                    NSString *desc = nil;
+                    if ([value isKindOfClass:[NSData class]]) {
+                        NSData *d = value;
+                        NSUInteger take = MIN(d.length, maxBytes);
+                        NSData *head = take ? [d subdataWithRange:NSMakeRange(0, take)] : [NSData data];
+                        desc = [NSString stringWithFormat:@"NSData(%lu) %@%@", (unsigned long)d.length,
+                                DHHexFromData(head), d.length > take ? @"…" : @""];
+                    } else if ([value isKindOfClass:[NSString class]]) {
+                        NSString *s = value;
+                        desc = [NSString stringWithFormat:@"NSString(%lu) %@", (unsigned long)s.length,
+                                s.length > maxBytes ? [[s substringToIndex:maxBytes] stringByAppendingString:@"…"] : s];
+                    } else if ([value isKindOfClass:[NSNumber class]] || [value isKindOfClass:[NSNull class]]) {
+                        desc = [value description];
+                    } else if ([value isKindOfClass:[NSArray class]] || [value isKindOfClass:[NSDictionary class]]) {
+                        NSString *s = [value description];
+                        desc = s.length > maxBytes ? [[s substringToIndex:maxBytes] stringByAppendingString:@"…"] : s;
+                    } else {
+                        desc = [NSString stringWithFormat:@"<%@ %p>", NSStringFromClass([value class]), (void *)value];
+                    }
+                    if (desc) row[@"value"] = desc;
+                }
+                // 即使 KVC 拿到 nil，也把原始指针/标量读出来，避免「字段存在但看不到」。
+                uint8_t buf[8] = {0};
+                if (analysis_read_memory((uint64_t)(uintptr_t)target + (uint64_t)off, 8, buf, sizeof(buf)) == 8) {
+                    uint64_t raw = 0; memcpy(&raw, buf, sizeof(raw));
+                    row[@"raw_u64"] = [NSString stringWithFormat:@"0x%llx", raw];
+                }
+            } @catch (__unused NSException *ex) {
+                row[@"error"] = @"read failed";
+            }
+            [rows addObject:row];
+            total++;
+        }
+        free(ivars);
+    }
+    return tool_ok(@{
+        @"class": @(class_getName(cls)),
+        @"object": [NSString stringWithFormat:@"0x%llx", (unsigned long long)(uintptr_t)target],
+        @"source": source,
+        @"count": @(total),
+        @"ivars": rows,
+        @"note": @"reads the ivar table directly (works when the SDK bypasses ObjC getters); values shown via KVC when available, raw_u64 always present",
+    });
+}
+// objc_export_data —— 把对象上某个 NSData/NSString ivar 原样落盘到沙盒 Documents，
+// 供 scp 拉出来做离线分析（密钥表、pwdTable、内嵌二进制这类几十 KB 的载荷，
+// 用 read_memory 分块读既慢又容易漏，落盘一次最省）。
+static NSDictionary *tool_objc_export_data(NSDictionary *args) {
+    NSString *className = [args[@"class"] isKindOfClass:NSString.class] ? args[@"class"] : nil;
+    NSString *objStr    = [args[@"object"] isKindOfClass:NSString.class] ? args[@"object"] : nil;
+    NSString *ivarName  = [args[@"ivar"] isKindOfClass:NSString.class] ? args[@"ivar"] : nil;
+    NSString *outName   = [args[@"name"] isKindOfClass:NSString.class] ? args[@"name"] : nil;
+    BOOL useShared      = [args[@"shared"] boolValue];
+    if (!ivarName.length) return tool_err(@"missing 'ivar'");
+
+    id target = nil;
+    Class cls = Nil;
+    if (objStr) {
+        uint64_t a = strtoull(objStr.UTF8String, NULL, 0);
+        if (a < 0x100000000ULL) return tool_err(@"object address looks invalid");
+        target = (__bridge id)(void *)(uintptr_t)a;
+        cls = object_getClass(target);
+    } else {
+        if (!className.length) return tool_err(@"provide 'class'+shared:true or 'object'");
+        cls = objc_getClass(className.UTF8String);
+        if (!cls) return tool_err([NSString stringWithFormat:@"class not found: %@", className]);
+        if (!useShared) return tool_err(@"pass object, or set shared:true");
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        if (![cls respondsToSelector:sh]) return tool_err(@"no +sharedInstance");
+        IMP imp = class_getMethodImplementation(object_getClass((id)cls), sh);
+        id (*fn)(id, SEL) = (id (*)(id, SEL))imp;
+        target = fn((id)cls, sh);
+        if (!target) return tool_err(@"+sharedInstance returned nil");
+        cls = object_getClass(target);
+    }
+
+    id value = nil;
+    @try { value = [target valueForKey:ivarName]; }
+    @catch (NSException *ex) { return tool_err([NSString stringWithFormat:@"valueForKey failed: %@", ex.reason]); }
+    if (!value) return tool_err([NSString stringWithFormat:@"%@ is nil", ivarName]);
+
+    NSData *bytes = nil;
+    if ([value isKindOfClass:[NSData class]]) bytes = value;
+    else if ([value isKindOfClass:[NSString class]]) bytes = [(NSString *)value dataUsingEncoding:NSUTF8StringEncoding];
+    else return tool_err([NSString stringWithFormat:@"%@ is %@, not NSData/NSString", ivarName, NSStringFromClass([value class])]);
+
+    NSString *fname = outName.length ? outName : [ivarName stringByReplacingOccurrencesOfString:@"_" withString:@""];
+    if (![fname.pathExtension length]) fname = [fname stringByAppendingPathExtension:@"bin"];
+    NSString *dir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSString *path = [dir stringByAppendingPathComponent:fname];
+    NSError *err = nil;
+    if (![bytes writeToFile:path options:NSDataWritingAtomic error:&err])
+        return tool_err([NSString stringWithFormat:@"write failed: %@", err.localizedDescription]);
+
+    // 前 64 字节 hex 便于立刻判断内容形态
+    NSUInteger headLen = MIN(bytes.length, (NSUInteger)64);
+    NSData *head = [bytes subdataWithRange:NSMakeRange(0, headLen)];
+    return tool_ok(@{
+        @"class": @(class_getName(cls)),
+        @"ivar": ivarName,
+        @"path": path,
+        @"bytes": @(bytes.length),
+        @"head_hex": DHHexFromData(head),
+        @"note": @"file written inside the app sandbox Documents; pull it with scp/sftp for offline analysis",
+    });
+}
+// objc_call —— 直接调用一个 ObjC 方法并返回结果。这是逆向里最缺的一环:
+// 有了它才能把「签名函数」当 oracle, 喂可控输入观察输出, 而不是靠猜输入组合。
+// 只支持 NSString 参数 + 对象返回值 (覆盖签名/摘要/编码这类 facade), 不做任意类型编组。
+static NSDictionary *tool_objc_call(NSDictionary *args) {
+    NSString *className = [args[@"class"] isKindOfClass:NSString.class] ? args[@"class"] : nil;
+    NSString *selName   = [args[@"selector"] isKindOfClass:NSString.class] ? args[@"selector"] : nil;
+    BOOL isClassMethod  = [args[@"class_method"] boolValue];
+    NSArray *argList    = [args[@"args"] isKindOfClass:NSArray.class] ? args[@"args"] : @[];
+    NSString *objStr    = [args[@"object"] isKindOfClass:NSString.class] ? args[@"object"] : nil;
+    if (!selName.length) return tool_err(@"missing 'selector'");
+    if (!className.length && !objStr) return tool_err(@"provide 'class' or 'object'");
+    if (argList.count > 8) return tool_err(@"at most 8 arguments supported");
+
+    SEL sel = NSSelectorFromString(selName);
+    id receiver = nil;
+    if (objStr) {
+        uint64_t a = strtoull(objStr.UTF8String, NULL, 0);
+        if (a < 0x100000000ULL) return tool_err(@"object address looks invalid");
+        receiver = (__bridge id)(void *)(uintptr_t)a;
+    } else {
+        Class cls = objc_getClass(className.UTF8String);
+        if (!cls) return tool_err([NSString stringWithFormat:@"class not found: %@", className]);
+        receiver = isClassMethod ? (id)cls : (id)cls;
+        if (!isClassMethod) return tool_err(@"instance call needs 'object' (address); set class_method:true for +method");
+    }
+
+    Method m = class_getInstanceMethod(isClassMethod ? object_getClass(receiver) : object_getClass(receiver), sel);
+    if (!m) return tool_err([NSString stringWithFormat:@"selector not found: %@", selName]);
+    IMP imp = method_getImplementation(m);
+    if (!imp) return tool_err(@"no IMP");
+
+    // 参数编组。默认按 NSString; 特殊形态用字典表示, 解决「签名方法要 int* 出参」这类签名:
+    //   {"$intptr": N}  -> 分配一个 int32 初值 N, 传它的地址 (方法里写回的 errCode 能拿到)
+    //   null            -> nil
+    // 不认识的形态一律退回 description, 保持向后兼容。
+    NSMutableArray *keep = [NSMutableArray array];
+    int32_t intSlots[8] = {0};
+    BOOL intSlotUsed[8] = {NO};
+    id argv[8] = {0};
+    for (NSUInteger i = 0; i < argList.count; i++) {
+        id v = argList[i];
+        if ([v isKindOfClass:[NSNull class]]) { argv[i] = nil; continue; }
+        if ([v isKindOfClass:[NSDictionary class]] && v[@"$intptr"]) {
+            intSlots[i] = (int32_t)[v[@"$intptr"] intValue];
+            intSlotUsed[i] = YES;
+            argv[i] = (__bridge id)(void *)&intSlots[i];
+            continue;
+        }
+        NSString *s = [v isKindOfClass:[NSString class]] ? v : [v description];
+        [keep addObject:s];
+        argv[i] = s;
+    }
+
+    id result = nil;
+    @try {
+        switch (argList.count) {
+            case 0: result = ((id (*)(id, SEL))imp)(receiver, sel); break;
+            case 1: result = ((id (*)(id, SEL, id))imp)(receiver, sel, argv[0]); break;
+            case 2: result = ((id (*)(id, SEL, id, id))imp)(receiver, sel, argv[0], argv[1]); break;
+            case 3: result = ((id (*)(id, SEL, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2]); break;
+            case 4: result = ((id (*)(id, SEL, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3]); break;
+            case 5: result = ((id (*)(id, SEL, id, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3], argv[4]); break;
+            case 6: result = ((id (*)(id, SEL, id, id, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]); break;
+            default: return tool_err(@"argument count not supported");
+        }
+    } @catch (NSException *ex) {
+        return tool_err([NSString stringWithFormat:@"target raised %@: %@", ex.name, ex.reason]);
+    }
+
+    NSMutableDictionary *out = [@{
+        @"class": className ?: @"(object)",
+        @"selector": selName,
+        @"class_method": isClassMethod ? @YES : @NO,
+        @"arg_count": @(argList.count),
+        @"returned_nil": result ? @NO : @YES,
+    } mutableCopy];
+    if (result) {
+        out[@"return_class"] = NSStringFromClass([result class]);
+        NSString *desc = nil;
+        if ([result isKindOfClass:[NSString class]]) desc = result;
+        else if ([result isKindOfClass:[NSData class]]) {
+            NSData *d = result;
+            NSUInteger take = MIN(d.length, (NSUInteger)4096);
+            desc = [NSString stringWithFormat:@"NSData(%lu) %@", (unsigned long)d.length,
+                    DHHexFromData([d subdataWithRange:NSMakeRange(0, take)])];
+        } else desc = [result description];
+        if (desc.length > 4096) desc = [[desc substringToIndex:4096] stringByAppendingString:@"…"];
+        out[@"result"] = desc ?: @"";
+    }
+    // 把 int* 出参的最终值回读出来 —— 签名方法常把错误码/长度写在这里。
+    NSMutableDictionary *outs = [NSMutableDictionary dictionary];
+    for (NSUInteger i = 0; i < argList.count; i++) {
+        if (intSlotUsed[i]) outs[[NSString stringWithFormat:@"arg%lu_int", (unsigned long)i]] = @(intSlots[i]);
+    }
+    if (outs.count) out[@"out_params"] = outs;
+    return tool_ok(out);
+}
 static BOOL objc_name_matches(NSString *value, NSString *query, NSString *mode) {
     if (!query.length) return YES;
     if ([mode isEqualToString:@"exact"]) return [value isEqualToString:query];
@@ -1412,6 +1680,29 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     NSString *capErr = nil;
     if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
     int slot = dh_thunk_install_import(sym.UTF8String, label.UTF8String);
+    if (slot == -3) {
+        // 同一符号已经装过: fishhook 只会把 GOT 指向一个槽位, 再装一次会让旧槽位永远 0 命中。
+        // 直接把已有槽位返回, 让调用方在原槽位上改 capture 配置。
+        dh_hook_info info[DH_THUNK_COUNT]; int n = dh_thunk_list(info, DH_THUNK_COUNT);
+        for (int i = 0; i < n; i++) {
+            if (strncmp(info[i].name ?: "", sym.UTF8String, sym.length) != 0) continue;
+            slot = info[i].slot;
+            NSMutableDictionary *r = [@{
+                @"slot": @(slot), @"reused": @YES, @"symbol": sym,
+                @"note": @"this symbol was already hooked; returning the existing slot instead of installing a second one (a duplicate would leave the first slot permanently unhit)",
+            } mutableCopy];
+            BOOL describe = [args[@"describe_args"] boolValue];
+            if (describe && dh_thunk_set_describe(slot, 1) == 0) r[@"describe_args"] = @YES;
+            BOOL wantRet = [args[@"capture_return"] boolValue];
+            if (wantRet && dh_thunk_set_return(slot, 1) == 0) r[@"capture_return"] = @YES;
+            BOOL wantAfter = [args[@"capture_after"] boolValue];
+            if (wantAfter && dh_thunk_set_capture_after(slot, 1) == 0) r[@"capture_after"] = @YES;
+            if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) == 0)
+                r[@"capture"] = @{@"ptr_arg": @(capPtr), @"len_arg": @(capLen), @"max_bytes": @(capMax)};
+            return tool_ok(r);
+        }
+        return tool_err(@"symbol reported as already hooked but its slot was not found");
+    }
     if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
     if (slot == -2) return tool_err([NSString stringWithFormat:
         @"symbol '%@' not found in any image's import table — it is statically linked or not imported, so fishhook cannot rebind it. Try list_imports to confirm the symbol is an external import.", sym]);
@@ -1419,6 +1710,8 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
     BOOL wantRet = [args[@"capture_return"] boolValue];
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
+    BOOL wantAfter = [args[@"capture_after"] boolValue];
+    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) wantAfter = NO;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
@@ -1491,6 +1784,8 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
     if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
     BOOL wantRet = [args[@"capture_return"] boolValue];
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
+    BOOL wantAfter = [args[@"capture_after"] boolValue];
+    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) wantAfter = NO;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
@@ -1574,6 +1869,8 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
     if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
     BOOL wantRet = [args[@"capture_return"] boolValue];
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
+    BOOL wantAfter = [args[@"capture_after"] boolValue];
+    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) wantAfter = NO;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
@@ -1609,6 +1906,8 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
             @"hits":    @(info[i].hits),
             @"enabled": info[i].enabled ? @YES : @NO,
             @"retired": info[i].retired ? @YES : @NO,
+            @"capture_return": info[i].capture_return ? @YES : @NO,
+            @"capture_after":  info[i].capture_after ? @YES : @NO,
         } mutableCopy];
         NSDictionary *cap = dh_capture_echo(info[i].capture_ptr_arg, info[i].capture_len_arg,
                                             info[i].capture_max_bytes);
@@ -2216,6 +2515,49 @@ static NSArray *tool_definitions(void) {
             },
         },
         @{
+            @"name": @"objc_dump_ivars",
+            @"description": @"Dump an Objective-C object's ivar table directly (whole superclass chain), with @encode types, offsets, readable values (NSData→hex, NSString→text, NSNumber→number) and the raw 8-byte slot. Use this when a class's property getters never fire (the SDK reads ivars directly) or when you do not know the field names: class+shared:true reads +sharedInstance, or pass a live object address. Read-only.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"class": @{@"type": @"string", @"description": @"Class name; combine with shared:true to read its +sharedInstance object"},
+                    @"object": @{@"type": @"string", @"description": @"Live object address (hex). Provide this OR class+shared."},
+                    @"shared": @{@"type": @"boolean", @"description": @"true: call +sharedInstance on the class and dump that object"},
+                    @"max_bytes": @{@"type": @"number", @"description": @"Per-value display cap for hex/text (default 128, max 4096)"},
+                },
+            },
+        },
+        @{
+            @"name": @"objc_export_data",
+            @"description": @"Write an object's NSData/NSString ivar to a file inside the app sandbox (Documents/), so a large binary payload (key table, embedded blob) can be pulled out with scp instead of read in 4KB chunks. class+shared:true reads +sharedInstance, or pass a live object address. Returns path, byte count and the first 64 bytes as hex. Write-only to the app's own Documents directory.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"class": @{@"type": @"string", @"description": @"Class name (with shared:true)"},
+                    @"object": @{@"type": @"string", @"description": @"Live object address (hex)"},
+                    @"shared": @{@"type": @"boolean", @"description": @"true: use +sharedInstance"},
+                    @"ivar": @{@"type": @"string", @"description": @"Ivar/property name, e.g. _pwdTable"},
+                    @"name": @{@"type": @"string", @"description": @"Output filename (defaults to the ivar name + .bin)"},
+                },
+                @"required": @[@"ivar"],
+            },
+        },
+        @{
+            @"name": @"objc_call",
+            @"description": @"Invoke an Objective-C method and return its result. Use it to turn a signing/digest facade into an ORACLE: feed controlled inputs and observe outputs instead of guessing which fields feed a hash. Arguments are marshalled as NSString (pass null for nil), up to 8; the return value is rendered as text / NSData hex / description. class_method:true calls a +method; instance calls need object (live address). Synchronous and can crash the target if the selector has side effects.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"class": @{@"type": @"string", @"description": @"Class name"},
+                    @"selector": @{@"type": @"string", @"description": @"Selector, e.g. \"maHWP__unpliableness:errCode:\""},
+                    @"class_method": @{@"type": @"boolean", @"description": @"true for a +method (default false)"},
+                    @"args": @{@"type": @"array", @"description": @"Argument list; each entry becomes an NSString, null becomes nil"},
+                    @"object": @{@"type": @"string", @"description": @"Live receiver address (hex) for an instance method"},
+                },
+                @"required": @[@"selector"],
+            },
+        },
+        @{
             @"name": @"find_objc_methods",
             @"description": @"Query Objective-C runtime method entities. Lists methods declared directly by matching classes and returns selector, type encoding, current IMP, class image, and current IMP image. Requires at least one filter and is paged. An IMP outside the class image is reported as an observation, not proof of swizzling.",
             @"inputSchema": @{
@@ -2640,6 +2982,7 @@ static NSArray *tool_definitions(void) {
                     @"label":  @{@"type": @"string", @"description": @"Optional note appended to the event name"},
                     @"describe_args": @{@"type": @"boolean", @"description": @"true 时尝试把前 4 个参数里「像可打印 C 字符串」的读出来(如 getaddrinfo 的域名、dlopen 的路径); 默认 false",},
                     @"capture_return": @{@"type": @"boolean", @"description": @"true 时记录该函数返回值（x0；NSData→hex / NSString→文本 / 其它→description）。命中会变成两条事件：进入一条、返回一条（带 ret=）。代价是这层栈帧留到原函数返回；默认 false"},
+                    @"capture_after": @{@"type": @"boolean", @"description": @"true 时把 capture_memory 的 ptr_arg 当成「调用之后才写好的输出缓冲」读（CCHmac 的 digest 出参、CCCrypt 的密文出参）。必须配 capture_memory 指定 ptr_arg；会自动启用返回值记录（post 路径）。默认 false"},
                     @"capture_memory": @{
                         @"type": @"object",
                         @"description": @"命中瞬间按寄存器参数抓一段内存到事件 input(hex/utf8)。不会事后回读, 因此能在缓冲区释放/复用前拿到 key、IV、明文。标准 crypto hook 全空时, 这是抓静态链接加密库 key 的主要手段: 先用 list_imports 找 mlock/memcpy/read/send 等「指针+长度」导入, 再在此配置。ptr_arg 是 x 寄存器索引(0..8), len_arg 指定哪个寄存器是长度(-1=固定抓 max_bytes), max_bytes 上限 8192。例: mlock 的 key 缓冲 → {ptr_arg:0, len_arg:1, max_bytes:4096}",
@@ -2664,6 +3007,7 @@ static NSArray *tool_definitions(void) {
                     @"classMethod": @{@"type": @"boolean", @"description": @"true for a class (+) method; default false (instance -)"},
                     @"describe_args": @{@"type": @"boolean", @"description": @"true 时反引用前几个参数内容(NSData→hex 前缀 / NSString→文本 / 其它→description), 直接看明文、密钥、密文; 默认 false",},
                     @"capture_return": @{@"type": @"boolean", @"description": @"true 时记录该函数返回值（x0；NSData→hex / NSString→文本 / 其它→description）。命中会变成两条事件：进入一条、返回一条（带 ret=）。代价是这层栈帧留到原函数返回；默认 false"},
+                    @"capture_after": @{@"type": @"boolean", @"description": @"true 时把 capture_memory 的 ptr_arg 当成「调用之后才写好的输出缓冲」读（CCHmac 的 digest 出参、CCCrypt 的密文出参）。必须配 capture_memory 指定 ptr_arg；会自动启用返回值记录（post 路径）。默认 false"},
                     @"capture_memory": @{
                         @"type": @"object",
                         @"description": @"命中瞬间按 x 寄存器参数抓一段内存到事件 input。x0=self, x1=_cmd, x2..=方法参数。用于 ObjC 方法参数里裸指针+长度的加密缓冲。",
@@ -2689,6 +3033,7 @@ static NSArray *tool_definitions(void) {
                     @"label":   @{@"type": @"string", @"description": @"Display name for list_hooks"},
                     @"describe_args": @{@"type": @"boolean", @"description": @"true 时把前几个参数里像可打印 C 字符串的内容记进事件（与 hook_import 一致）；默认 false",},
                     @"capture_return": @{@"type": @"boolean", @"description": @"true 时记录该函数返回值（x0；NSData→hex / NSString→文本 / 其它→description）。命中会变成两条事件：进入一条、返回一条（带 ret=）。代价是这层栈帧留到原函数返回；默认 false"},
+                    @"capture_after": @{@"type": @"boolean", @"description": @"true 时把 capture_memory 的 ptr_arg 当成「调用之后才写好的输出缓冲」读（CCHmac 的 digest 出参、CCCrypt 的密文出参）。必须配 capture_memory 指定 ptr_arg；会自动启用返回值记录（post 路径）。默认 false"},
                     @"capture_memory": @{
                         @"type": @"object",
                         @"description": @"命中瞬间按 x 寄存器参数抓一段内存到事件 input（x0..x8）。",
@@ -2840,6 +3185,9 @@ static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
     if ([name isEqualToString:@"resolve_symbol"])        return tool_resolve_symbol(args);
     if ([name isEqualToString:@"symbolicate"])           return tool_symbolicate(args);
     if ([name isEqualToString:@"objc_resolve_imp"])      return tool_objc_resolve_imp(args);
+    if ([name isEqualToString:@"objc_dump_ivars"])       return tool_objc_dump_ivars(args);
+    if ([name isEqualToString:@"objc_call"])             return tool_objc_call(args);
+    if ([name isEqualToString:@"objc_export_data"])      return tool_objc_export_data(args);
     if ([name isEqualToString:@"find_objc_methods"])     return tool_find_objc_methods(args);
     if ([name isEqualToString:@"read_memory"])           return tool_read_memory(args);
     if ([name isEqualToString:@"search_memory"])         return tool_search_memory(args);
