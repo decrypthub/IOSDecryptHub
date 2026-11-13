@@ -45,6 +45,7 @@ typedef struct {
     _Atomic int      capture_max_bytes;
     _Atomic int      capture_return;   // 1 = post 路径, 记录返回值
     _Atomic int      capture_after;    // 1 = capture_ptr_arg 指向「调用后才写好的输出缓冲」
+    char             capture_multi[96]; // 多窗口: "x0:64,x3:32,x5:128" (空=关闭)
     dh_hook_kind     kind;
     int              used;
     void            *target;          // inline: DobbyHook 的目标地址
@@ -210,6 +211,48 @@ static NSData *dh_capture_arg_memory(dh_slot_t *s, uint64_t *gpr) {
     return data;
 }
 
+// 多窗口抓取: 一次 hook 同时看多个寄存器指向的内存。
+// 为什么需要: 一个 inline 目标只能装一个 hook(重复装会被拒绝), 而分析一个函数往往要同时
+// 看「输入 / 密钥 / 输出」三个寄存器。没有这个能力就只能卸了重装, 而 inline 槽位一旦
+// 分配不会回收 —— 每次换寄存器都得重启目标进程, 实测把一轮分析拖成十几分钟。
+// 语法: "x0:64,x3:32,x5:128" 或 "0:64,3:32"; len 用 :N 显式给, 不给就用 max_bytes 上限。
+// 返回 @[{reg, addr, bytes(NSData)}], 由调用方渲染。
+static NSArray *dh_capture_multi(dh_slot_t *s, uint64_t *gpr) {
+    NSString *spec = @(s->capture_multi);
+    if (!spec || spec.length == 0) return nil;
+    NSMutableArray *out = [NSMutableArray array];
+    int defaultMax = atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed);
+    if (defaultMax <= 0 || defaultMax > DH_THUNK_CAPTURE_MAX) defaultMax = 256;
+    for (NSString *piece in [spec componentsSeparatedByString:@","]) {
+        NSString *tok = [piece stringByTrimmingCharactersInSet:
+                         [NSCharacterSet whitespaceCharacterSet]];
+        if (tok.length == 0) continue;
+        NSString *regPart = tok;
+        size_t want = (size_t)defaultMax;
+        NSRange colon = [tok rangeOfString:@":"];
+        if (colon.location != NSNotFound) {
+            regPart = [tok substringToIndex:colon.location];
+            want = (size_t)[[tok substringFromIndex:colon.location + 1] integerValue];
+        }
+        if ([regPart hasPrefix:@"x"] || [regPart hasPrefix:@"X"]) regPart = [regPart substringFromIndex:1];
+        int reg = [regPart intValue];
+        if (reg < 0 || reg > 8) continue;
+        if (want == 0 || want > DH_THUNK_CAPTURE_MAX) want = DH_THUNK_CAPTURE_MAX;
+        uint64_t addr = gpr[reg];
+        if (addr < 0x100000000ULL) continue;
+        NSMutableData *data = [NSMutableData dataWithLength:want];
+        if (!data) continue;
+        vm_size_t got = 0;
+        kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr,
+                                             (vm_size_t)want,
+                                             (mach_vm_address_t)data.mutableBytes, &got);
+        if (kr != KERN_SUCCESS || got == 0) continue;
+        if (got < want) data.length = got;
+        [out addObject:@{@"reg": @(reg), @"addr": @(addr), @"bytes": data}];
+    }
+    return out.count ? out : nil;
+}
+
 static BOOL dh_is_runtime_class(Class c) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -342,6 +385,24 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
                 [d appendFormat:@"\ncaptured arg%d(x%d) @0x%llx failed (ptr_arg=%d len_arg=%d max=%d)",
                  capPtr, capPtr, gpr[capPtr], capPtr, capLen, capMax];
             }
+        }
+        // 多窗口: 一次 hook 同时记录多个寄存器指向的内存。
+        // 一个 inline 目标只能装一个 hook 且槽位不回收, 换寄存器就得重启进程, 所以这是分析多参数函数的关键能力。
+        if (s->capture_multi[0]) {
+            NSArray *wins = dh_capture_multi(s, gpr);
+            for (NSDictionary *w in wins) {
+                int reg = [w[@"reg"] intValue];
+                NSData *b = w[@"bytes"];
+                uint64_t waddr = [w[@"addr"] unsignedLongLongValue];
+                // 必须自己转完整 hex: NSData.description 会在 16 字节后折叠成 "...",
+                // 分析时看不到中间内容等于白抓。
+                NSUInteger take = MIN(b.length, (NSUInteger)DH_THUNK_CAPTURE_MAX);
+                NSMutableString *hex = [NSMutableString stringWithCapacity:take * 2];
+                const uint8_t *p = (const uint8_t *)b.bytes;
+                for (NSUInteger i = 0; i < take; i++) [hex appendFormat:@"%02x", p[i]];
+                [d appendFormat:@"\nwin x%d @0x%llx = %lu bytes: %@", reg, waddr, (unsigned long)b.length, hex];
+            }
+            if (!wins.count) [d appendFormat:@"\nwin [%@] unreadable", s->capture_multi];
         }
         [d appendFormat:@"\nsp=0x%llx lr=0x%llx", caller_sp, lr];
         e.detail    = d;
@@ -810,6 +871,34 @@ int dh_thunk_set_capture_after(int slot, int on) {
         atomic_store_explicit(&s->capture_return, 1, memory_order_relaxed);
         g_dh_thunk_post[slot] = 1;
     }
+    return 0;
+}
+// 多窗口抓取: 一次 hook 同时观察多个寄存器指向的内存。
+// 一个 inline 目标只能装一个 hook，没有这个能力就只能卸了重装换寄存器；
+// 而 inline 槽位分配后不回收，换一次寄存器就要重启目标进程一次。
+int dh_thunk_set_capture_multi(int slot, const char *spec) {
+    if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
+    dh_slot_t *s = &g_slots[slot];
+    if (!s->used) return -1;
+    if (!spec || !spec[0]) { s->capture_multi[0] = '\0'; return 0; }
+    if (strlen(spec) >= sizeof(s->capture_multi)) return -1;
+    // 语法预检: 只接受 "x<0-8>[:N]" 的逗号序列，其它一律拒绝（不让坏规格静默变成空抓取）。
+    const char *p = spec;
+    while (*p) {
+        while (*p == ' ' || *p == ',') p++;
+        if (!*p) break;
+        if (*p != 'x' && *p != 'X' && !(*p >= '0' && *p <= '9')) return -1;
+        if (*p == 'x' || *p == 'X') p++;
+        if (!(*p >= '0' && *p <= '8')) return -1;
+        p++;
+        if (*p == ':') {
+            p++;
+            if (!(*p >= '0' && *p <= '9')) return -1;
+            while (*p >= '0' && *p <= '9') p++;
+        }
+        if (*p && *p != ',' && *p != ' ') return -1;
+    }
+    strlcpy(s->capture_multi, spec, sizeof(s->capture_multi));
     return 0;
 }
 

@@ -44,6 +44,7 @@ typedef struct {
     int          capture_ptr_arg;   // >=0: 从该寄存器位置的指针参数抓内存; -1: 未开启
     int          capture_len_arg;   // >=0: 从该寄存器位置取长度; -1: 用 capture_max_bytes 固定长度
     int          capture_max_bytes; // 单次最多抓多少字节
+    char         capture_multi[96]; // 多窗口抓取规格: "x0:64,x3:32,x5:128" (空=关闭)
 } dh_hook_info;
 
 // 装导入符号 hook。symbol 去前导下划线的名字(与 list_imports 一致); label 可为 NULL。
@@ -84,6 +85,7 @@ int  dh_thunk_set_return(int slot, int on);
 // 输出缓冲抓取: 目标把结果写进调用方提供的缓冲 (CCHmac digest / CCCrypt 密文)。
 // 这种槽位必须走 post 路径, 入口抓到的是未初始化内存。
 int  dh_thunk_set_capture_after(int slot, int on);
+int  dh_thunk_set_capture_multi(int slot, const char *spec);
 
 // 原子关闭一个 hook(停止记录, 仍透明转发)。越界/未用返回 -1, 成功返回 0。
 int  dh_thunk_disable(int slot);

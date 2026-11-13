@@ -1697,6 +1697,9 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
             if (wantRet && dh_thunk_set_return(slot, 1) == 0) r[@"capture_return"] = @YES;
             BOOL wantAfter = [args[@"capture_after"] boolValue];
             if (wantAfter && dh_thunk_set_capture_after(slot, 1) == 0) r[@"capture_after"] = @YES;
+            // 多窗口: 一次 hook 同时抓多个寄存器, 换寄存器不必重启进程
+            NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
+            if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) capMulti = nil;
             if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) == 0)
                 r[@"capture"] = @{@"ptr_arg": @(capPtr), @"len_arg": @(capLen), @"max_bytes": @(capMax)};
             return tool_ok(r);
@@ -1712,6 +1715,8 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     BOOL wantAfter = [args[@"capture_after"] boolValue];
     if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) wantAfter = NO;
+    // 多窗口: 一次 hook 同时抓多个寄存器, 换寄存器不必重启进程
+    NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
@@ -1722,6 +1727,8 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
                                     ? @"record-only + C 字符串参数反引用(前 4 个参数里像可打印字符串的会被记内容); events land in category 'other' as algorithm 'import-hook'."
                                     : @"record-only; events land in category 'other' as algorithm 'import-hook'. 传 describe_args:true 可尝试记录字符串参数(如 getaddrinfo 域名/dlopen 路径)。"} mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
+    if (capMulti.length) { res[@"capture_multi"] = capMulti; }
+
     if (capEcho) {
         res[@"capture"] = capEcho;
         res[@"note"] = [NSString stringWithFormat:@"%@ capture_memory: 命中瞬间把 arg%d 指向的内存(长度取自 arg%d%@, 上限 %d 字节)拷进事件 input。",
@@ -1786,6 +1793,8 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     BOOL wantAfter = [args[@"capture_after"] boolValue];
     if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) wantAfter = NO;
+    NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
+    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) capMulti = nil;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
@@ -1802,6 +1811,8 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
                  @" events land in category 'other' as algorithm 'inline-hook'. unhook 默认软停；unhook {hard:true} 恢复目标入口原始字节并退休槽位。"
     } mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
+    if (capMulti.length) { res[@"capture_multi"] = capMulti; }
+
     if (capEcho) {
         res[@"capture"] = capEcho;
         res[@"note"] = [NSString stringWithFormat:@"%@ capture_memory: 命中瞬间把 x%d 指向的内存（长度取自 x%d%@，上限 %d 字节）拷进事件 input。",
@@ -1871,6 +1882,8 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     BOOL wantAfter = [args[@"capture_after"] boolValue];
     if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) wantAfter = NO;
+    NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
+    if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) capMulti = nil;
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
         dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
@@ -1883,6 +1896,8 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
                                     ? @"record-only + 参数反引用(NSData→hex, NSString→文本, 其它→description); events land in category 'other' as algorithm 'objc-hook'."
                                     : @"record-only; events land in category 'other' as algorithm 'objc-hook'. 传 describe_args:true 可直接记录参数内容。"} mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
+    if (capMulti.length) { res[@"capture_multi"] = capMulti; }
+
     if (capEcho) {
         res[@"capture"] = capEcho;
         res[@"note"] = [NSString stringWithFormat:@"%@ capture_memory: 命中瞬间把 x%d 指向的内存(长度取自 x%d%@, 上限 %d 字节)拷进事件 input。",
@@ -2983,6 +2998,7 @@ static NSArray *tool_definitions(void) {
                     @"describe_args": @{@"type": @"boolean", @"description": @"true 时尝试把前 4 个参数里「像可打印 C 字符串」的读出来(如 getaddrinfo 的域名、dlopen 的路径); 默认 false",},
                     @"capture_return": @{@"type": @"boolean", @"description": @"true 时记录该函数返回值（x0；NSData→hex / NSString→文本 / 其它→description）。命中会变成两条事件：进入一条、返回一条（带 ret=）。代价是这层栈帧留到原函数返回；默认 false"},
                     @"capture_after": @{@"type": @"boolean", @"description": @"true 时把 capture_memory 的 ptr_arg 当成「调用之后才写好的输出缓冲」读（CCHmac 的 digest 出参、CCCrypt 的密文出参）。必须配 capture_memory 指定 ptr_arg；会自动启用返回值记录（post 路径）。默认 false"},
+                    @"capture_multi": @{@"type": @"string", @"description": @"多窗口抓取: 一次 hook 同时记录多个寄存器指向的内存, 换寄存器不必重启进程（一个 inline 目标只能装一个 hook 且槽位不回收）。语法 \"x0:64,x3:32,x5:128\"，寄存器 x0-x8，:N 为字节数，省略则用 capture_max_bytes。结果以 win xN @addr = N bytes: hex 写进事件 detail。默认关闭"},
                     @"capture_memory": @{
                         @"type": @"object",
                         @"description": @"命中瞬间按寄存器参数抓一段内存到事件 input(hex/utf8)。不会事后回读, 因此能在缓冲区释放/复用前拿到 key、IV、明文。标准 crypto hook 全空时, 这是抓静态链接加密库 key 的主要手段: 先用 list_imports 找 mlock/memcpy/read/send 等「指针+长度」导入, 再在此配置。ptr_arg 是 x 寄存器索引(0..8), len_arg 指定哪个寄存器是长度(-1=固定抓 max_bytes), max_bytes 上限 8192。例: mlock 的 key 缓冲 → {ptr_arg:0, len_arg:1, max_bytes:4096}",
@@ -3008,6 +3024,7 @@ static NSArray *tool_definitions(void) {
                     @"describe_args": @{@"type": @"boolean", @"description": @"true 时反引用前几个参数内容(NSData→hex 前缀 / NSString→文本 / 其它→description), 直接看明文、密钥、密文; 默认 false",},
                     @"capture_return": @{@"type": @"boolean", @"description": @"true 时记录该函数返回值（x0；NSData→hex / NSString→文本 / 其它→description）。命中会变成两条事件：进入一条、返回一条（带 ret=）。代价是这层栈帧留到原函数返回；默认 false"},
                     @"capture_after": @{@"type": @"boolean", @"description": @"true 时把 capture_memory 的 ptr_arg 当成「调用之后才写好的输出缓冲」读（CCHmac 的 digest 出参、CCCrypt 的密文出参）。必须配 capture_memory 指定 ptr_arg；会自动启用返回值记录（post 路径）。默认 false"},
+                    @"capture_multi": @{@"type": @"string", @"description": @"多窗口抓取: 一次 hook 同时记录多个寄存器指向的内存, 换寄存器不必重启进程（一个 inline 目标只能装一个 hook 且槽位不回收）。语法 \"x0:64,x3:32,x5:128\"，寄存器 x0-x8，:N 为字节数，省略则用 capture_max_bytes。结果以 win xN @addr = N bytes: hex 写进事件 detail。默认关闭"},
                     @"capture_memory": @{
                         @"type": @"object",
                         @"description": @"命中瞬间按 x 寄存器参数抓一段内存到事件 input。x0=self, x1=_cmd, x2..=方法参数。用于 ObjC 方法参数里裸指针+长度的加密缓冲。",
@@ -3034,6 +3051,7 @@ static NSArray *tool_definitions(void) {
                     @"describe_args": @{@"type": @"boolean", @"description": @"true 时把前几个参数里像可打印 C 字符串的内容记进事件（与 hook_import 一致）；默认 false",},
                     @"capture_return": @{@"type": @"boolean", @"description": @"true 时记录该函数返回值（x0；NSData→hex / NSString→文本 / 其它→description）。命中会变成两条事件：进入一条、返回一条（带 ret=）。代价是这层栈帧留到原函数返回；默认 false"},
                     @"capture_after": @{@"type": @"boolean", @"description": @"true 时把 capture_memory 的 ptr_arg 当成「调用之后才写好的输出缓冲」读（CCHmac 的 digest 出参、CCCrypt 的密文出参）。必须配 capture_memory 指定 ptr_arg；会自动启用返回值记录（post 路径）。默认 false"},
+                    @"capture_multi": @{@"type": @"string", @"description": @"多窗口抓取: 一次 hook 同时记录多个寄存器指向的内存, 换寄存器不必重启进程（一个 inline 目标只能装一个 hook 且槽位不回收）。语法 \"x0:64,x3:32,x5:128\"，寄存器 x0-x8，:N 为字节数，省略则用 capture_max_bytes。结果以 win xN @addr = N bytes: hex 写进事件 detail。默认关闭"},
                     @"capture_memory": @{
                         @"type": @"object",
                         @"description": @"命中瞬间按 x 寄存器参数抓一段内存到事件 input（x0..x8）。",
