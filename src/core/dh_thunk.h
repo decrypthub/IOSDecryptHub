@@ -22,7 +22,7 @@
 extern "C" {
 #endif
 
-#define DH_THUNK_COUNT 128   // thunk 槽位总数 (单调分配, 不回收)
+#define DH_THUNK_COUNT 256   // thunk 槽位总数 (单调分配; 软停不回收, 硬停后退休)
 
 // 槽位类型 —— 决定处理器如何解读寄存器快照。
 typedef enum {
@@ -35,6 +35,7 @@ typedef enum {
 typedef struct {
     int          slot;
     int          enabled;
+    int          retired;   // 已硬卸载并恢复原代码; 槽位不再复用
     dh_hook_kind kind;
     uint64_t     hits;
     const char  *name;    // 符号名 / "-[Class sel]"
@@ -76,6 +77,12 @@ int  dh_thunk_set_capture(int slot, int ptr_arg, int len_arg, int max_bytes);
 
 // 原子关闭一个 hook(停止记录, 仍透明转发)。越界/未用返回 -1, 成功返回 0。
 int  dh_thunk_disable(int slot);
+
+// 卸载一个 hook。hard=0: 只停记录(软停, patch 保留);
+// hard=1: inline 恢复原函数入口字节(DobbyCodePatch, 不释放 Dobby 蹦床, 避免在途线程 UAF),
+//         method 恢复原 IMP; import 不支持硬卸载(-5)。硬卸载后槽位标记 retired、不再复用。
+// 返回 0 成功; -1 槽位无效; -4 恢复失败; -5 该类型不支持硬卸载。
+int  dh_thunk_uninstall(int slot, int hard, char *err, size_t errsz);
 
 // 枚举所有生效槽位, 回填到 out(最多 max 个), 返回实际写入条数。
 int  dh_thunk_list(dh_hook_info *out, int max);

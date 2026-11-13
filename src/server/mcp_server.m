@@ -1412,7 +1412,7 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     NSString *capErr = nil;
     if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
     int slot = dh_thunk_install_import(sym.UTF8String, label.UTF8String);
-    if (slot == -1) return tool_err(@"thunk slots exhausted (max 128)");
+    if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
     if (slot == -2) return tool_err([NSString stringWithFormat:
         @"symbol '%@' not found in any image's import table — it is statically linked or not imported, so fishhook cannot rebind it. Try list_imports to confirm the symbol is an external import.", sym]);
     BOOL describe = [args[@"describe_args"] boolValue];
@@ -1476,7 +1476,9 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
         module.length ? module.UTF8String : NULL,
         symbol.length ? symbol.UTF8String : NULL,
         addr, label.length ? label.UTF8String : NULL, errbuf, sizeof(errbuf));
-    if (slot == -1) return tool_err(@"thunk slots exhausted (max 128)");
+    if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
+    if (slot == -5) return tool_err([NSString stringWithFormat:
+        @"inline hook 拒绝安装: %s", errbuf[0] ? errbuf : "already hooked"]);
     if (slot == -2) return tool_err([NSString stringWithFormat:
         @"内联目标无法解析/不是可执行地址: %s. 传 module+symbol（如 \"libsystem_kernel.dylib\"+\"getpid\"）或绝对 addr。",
         errbuf[0] ? errbuf : "unknown"]);
@@ -1498,7 +1500,7 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
         @"backend": @(dh_thunk_inline_backend()),
         @"describe_args": describe ? @YES : @NO,
         @"note": @"record-only inline hook: 命中时记录 x0-x8 + 调用栈后尾调用原函数（原返回值不变）。"
-                 @" events land in category 'other' as algorithm 'inline-hook'. unhook 只做软停（停止记录，patch 保留）。"
+                 @" events land in category 'other' as algorithm 'inline-hook'. unhook 默认软停；unhook {hard:true} 恢复目标入口原始字节并退休槽位。"
     } mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
     if (capEcho) {
@@ -1559,7 +1561,9 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
     NSString *capErr = nil;
     if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
     int slot = dh_thunk_install_method(cls.UTF8String, sel.UTF8String, classMethod ? 1 : 0);
-    if (slot == -1) return tool_err(@"thunk slots exhausted (max 128)");
+    if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
+    if (slot == -5) return tool_err([NSString stringWithFormat:
+        @"-[%@ %@] is already method-hooked; unhook it first (hard:true restores the original IMP)", cls, sel]);
     if (slot == -3) return tool_err([NSString stringWithFormat:@"class '%@' or its %@ method '%@' not found",
                                      cls, classMethod ? @"class" : @"instance", sel]);
     BOOL describe = [args[@"describe_args"] boolValue];
@@ -1598,6 +1602,7 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
             @"name":    info[i].name ? @(info[i].name) : @"",
             @"hits":    @(info[i].hits),
             @"enabled": info[i].enabled ? @YES : @NO,
+            @"retired": info[i].retired ? @YES : @NO,
         } mutableCopy];
         NSDictionary *cap = dh_capture_echo(info[i].capture_ptr_arg, info[i].capture_len_arg,
                                             info[i].capture_max_bytes);
@@ -1607,14 +1612,39 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
     return tool_ok(@{@"count": @((NSInteger)arr.count), @"capacity": @(DH_THUNK_COUNT), @"hooks": arr});
 }
 
-// unhook — 原子关闭一个 hook (停止记录, thunk 仍透明转发, 槽位不回收)。
+// unhook — 卸载一个 hook。默认软停(停止记录, thunk 仍透明转发); hard=true 硬卸载:
+// inline 恢复目标入口原始字节、method 恢复原 IMP, 槽位标记 retired 不再复用。
 static NSDictionary *tool_unhook(NSDictionary *args) {
     NSNumber *slot = args[@"slot"];
     if (![slot isKindOfClass:NSNumber.class]) return tool_err(@"slot (number) required");
-    int r = dh_thunk_disable(slot.intValue);
-    if (r != 0) return tool_err([NSString stringWithFormat:@"slot %@ is not an active hook", slot]);
-    return tool_ok(@{@"slot": slot, @"enabled": @NO,
-                     @"note": @"recording stopped; the thunk keeps forwarding transparently (slot not reclaimed)."});
+    BOOL hard = [args[@"hard"] boolValue];
+    char errbuf[256] = {0};
+    int r = dh_thunk_uninstall(slot.intValue, hard ? 1 : 0, errbuf, sizeof(errbuf));
+    if (r == -1) return tool_err([NSString stringWithFormat:@"slot %@ is not an active hook", slot]);
+    if (r == -5) return tool_err([NSString stringWithFormat:@"slot %@: %s", slot,
+                                  errbuf[0] ? errbuf : "hard unhook unsupported"]);
+    if (r != 0) return tool_err([NSString stringWithFormat:@"slot %@ 卸载失败: %s", slot,
+                                 errbuf[0] ? errbuf : "unknown"]);
+    dh_hook_info info[DH_THUNK_COUNT];
+    int n = dh_thunk_list(info, DH_THUNK_COUNT);
+    const char *kind = "unknown";
+    BOOL retired = NO;
+    for (int i = 0; i < n; i++) {
+        if (info[i].slot != slot.intValue) continue;
+        kind = info[i].kind == DH_HOOK_METHOD ? "method"
+             : (info[i].kind == DH_HOOK_INLINE ? "inline" : "import");
+        retired = info[i].retired ? YES : NO;
+        break;
+    }
+    BOOL restored = hard && (strcmp(kind, "inline") == 0 || strcmp(kind, "method") == 0);
+    NSString *note = hard
+        ? (restored
+            ? @"原函数入口/IMP 已恢复；槽位 retired，不再复用。Dobby 蹦床保留以避免在途线程 use-after-free，属于有界泄漏。"
+            : @"hard unhook 对 fishhook import hook 不适用，已保持软停。")
+        : @"recording stopped; the thunk keeps forwarding transparently (slot not reclaimed).";
+    return tool_ok(@{@"slot": slot, @"enabled": @NO, @"hard": hard ? @YES : @NO,
+                     @"kind": @(kind), @"restored": restored ? @YES : @NO,
+                     @"retired": retired ? @YES : @NO, @"note": note});
 }
 
 // 事件是否通过「增量过滤」(output_hex/output_len/thread_id/时间窗/stack_contains)。
@@ -2618,7 +2648,7 @@ static NSArray *tool_definitions(void) {
         },
         @{
             @"name": @"hook_method",
-            @"description": @"Install a record-only hook on an Objective-C method via method_setImplementation swizzle. On each call it snapshots self (x0), _cmd/SEL (x1), and arg registers, records an event (category 'other', algorithm 'objc-hook'), then forwards to the original IMP. Observe-only.",
+            @"description": @"Install a record-only hook on an Objective-C method via method_setImplementation swizzle. On each call it snapshots self (x0), _cmd/SEL (x1), and arg registers, records an event (category 'other', algorithm 'objc-hook'), then forwards to the original IMP. Observe-only. unhook {hard:true} restores the original IMP and retires the slot; reinstalling the same Method after hard unhook reuses that retired slot when its IMP is still the original.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
@@ -2641,7 +2671,7 @@ static NSArray *tool_definitions(void) {
         },
         @{
             @"name": @"hook_inline",
-            @"description": @"Install a record-only inline hook (Dobby backend) on ANY native function: module+symbol or an absolute code address. Unlike hook_import (GOT) this also works for statically linked functions and direct calls inside a module. On each hit it snapshots x0-x8 + call stack, then tail-calls the original function's trampoline, so the original return value and behavior are preserved (entry observation only). Events land in category 'other' as algorithm 'inline-hook'. unhook only soft-disables recording; the patch stays (no safe unbind). Available in the arm64 jailbreak build; arm64e slice refuses instead of silently falling back.",
+            @"description": @"Install a record-only inline hook (Dobby backend) on ANY native function: module+symbol or an absolute code address. Unlike hook_import (GOT) this also works for statically linked functions and direct calls inside a module. On each hit it snapshots x0-x8 + call stack, then tail-calls the original function's trampoline, so the original return value and behavior are preserved (entry observation only). Events land in category 'other' as algorithm 'inline-hook'. unhook defaults to soft stop; unhook {hard:true} restores the original entry bytes via DobbyCodePatch and retires the slot (Dobby trampoline is kept to avoid in-flight use-after-free). Available in the arm64 jailbreak build; arm64e slice refuses instead of silently falling back.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
@@ -2679,15 +2709,15 @@ static NSArray *tool_definitions(void) {
         },
         @{
             @"name": @"list_hooks",
-            @"description": @"List all dynamic hooks installed this session (slot, kind, name, hit count, enabled). Slots are not reclaimed; a disabled hook still shows with enabled=false.",
+            @"description": @"List all dynamic hooks installed this session (slot, kind, name, hit count, enabled, retired). Slots are monotonic; a soft-disabled hook shows enabled=false, a hard-unhooked hook shows retired=true.",
             @"inputSchema": @{@"type": @"object", @"properties": @{}},
         },
         @{
             @"name": @"unhook",
-            @"description": @"Atomically disable a dynamic hook by slot (from hook_import/hook_method/list_hooks). Stops recording; the thunk keeps forwarding transparently so there is no unbind race.",
+            @"description": @"Uninstall a dynamic hook by slot. Default soft stop: recording stops, thunk keeps forwarding, patch stays. hard=true restores the original code (inline: saved entry bytes via DobbyCodePatch; method: original IMP) and marks the slot retired; import hooks only support soft. Hard unhook is best-effort against already-running threads (in-flight calls finish through the retained trampoline).",
             @"inputSchema": @{
                 @"type": @"object",
-                @"properties": @{@"slot": @{@"type": @"number", @"description": @"Hook slot id"}},
+                @"properties": @{@"slot": @{@"type": @"number", @"description": @"Hook slot id"}, @"hard": @{@"type": @"boolean", @"description": @"true: restore original code/IMP and retire the slot; false/default: only stop recording"}},
                 @"required": @[@"slot"],
             },
         },

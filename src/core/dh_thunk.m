@@ -29,17 +29,24 @@
 // asm 尾调用要用的「原函数指针表」—— thunk 用 slot 索引它跳转。必须是全局符号(asm 引用)。
 void *g_dh_thunk_orig[DH_THUNK_COUNT];
 
-// 槽位注册表 (单调分配, 不回收)。
+// 槽位注册表 (单调分配; 软停不回收, 硬停后退休)。
 typedef struct {
     char             name[160];
     _Atomic uint64_t hits;
     _Atomic int      enabled;
+    _Atomic int      retired;         // 已硬卸载: 原代码已恢复, 槽位不再复用
     _Atomic int      describe_args;   // method hook: 记录时反引用前几个参数内容
     _Atomic int      capture_ptr_arg;   // >=0: 抓该寄存器位置的指针参数
     _Atomic int      capture_len_arg;   // >=0: 从该寄存器取长度; -1: 固定长度
     _Atomic int      capture_max_bytes;
     dh_hook_kind     kind;
     int              used;
+    void            *target;          // inline: DobbyHook 的目标地址
+    void            *method;          // method: Method 指针 (硬卸载恢复 IMP)
+    uint8_t          saved[32];       // inline: 安装前的原始入口字节 (硬卸载恢复)
+    int              saved_len;
+    uint8_t          patched[32];     // inline: Dobby 安装后的入口字节 (硬卸载后重装同目标时复用)
+    int              patched_len;
 } dh_slot_t;
 
 static dh_slot_t g_slots[DH_THUNK_COUNT];
@@ -57,7 +64,7 @@ __asm__(
 ".globl _dh_thunk_table\n"
 "_dh_thunk_table:\n"
 ".set _dht_idx, 0\n"
-".rept 128\n"                       // 必须与 DH_THUNK_COUNT 一致
+".rept 256\n"                       // 必须与 DH_THUNK_COUNT 一致
 "  movz x17, #_dht_idx\n"
 "  b    _dh_thunk_trampoline\n"
 "  .set _dht_idx, _dht_idx + 1\n"
@@ -344,12 +351,35 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
                            : class_getInstanceMethod(cls, sel);
     if (!m) return -3;
     pthread_mutex_lock(&g_install_lock);
+    int total = atomic_load_explicit(&g_next_slot, memory_order_relaxed);
+    if (total > DH_THUNK_COUNT) total = DH_THUNK_COUNT;
+    for (int i = 0; i < total; i++) {
+        dh_slot_t *old = &g_slots[i];
+        if (!old->used || old->kind != DH_HOOK_METHOD || old->method != (void *)m) continue;
+        if (!atomic_load_explicit(&old->retired, memory_order_relaxed)) {
+            pthread_mutex_unlock(&g_install_lock);
+            return -5;   // 同一 Method 已有 active hook
+        }
+        // hard-unhook 后原 IMP 已恢复且未被别的插件改写: 复用原槽位/原蹦床。
+        if (g_dh_thunk_orig[i] &&
+            method_getImplementation(m) == (IMP)g_dh_thunk_orig[i]) {
+            method_setImplementation(m, (IMP)dh_slot_addr(i));
+            atomic_store_explicit(&old->retired, 0, memory_order_release);
+            atomic_store_explicit(&old->enabled, 1, memory_order_release);
+            pthread_mutex_unlock(&g_install_lock);
+            return i;
+        }
+    }
     int slot = dh_alloc_slot();
     if (slot < 0) { pthread_mutex_unlock(&g_install_lock); return -1; }
     dh_slot_t *s = &g_slots[slot];
     snprintf(s->name, sizeof(s->name), "%c[%s %s]", classMethod ? '+' : '-', className, selector);
     s->kind = DH_HOOK_METHOD;
     s->used = 1;
+    s->method = (void *)m;
+    s->target = NULL;
+    s->saved_len = 0;
+    atomic_store_explicit(&s->retired, 0, memory_order_relaxed);
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
     g_dh_thunk_orig[slot] = (void *)method_getImplementation(m);
     atomic_store_explicit(&s->enabled, 1, memory_order_release);
@@ -418,6 +448,21 @@ static void *dh_resolve_inline_target(const char *module, const char *symbol,
     return target;
 }
 
+static int dh_save_code_bytes(void *target, uint8_t *out, size_t cap) {
+    size_t want = cap < 32 ? cap : 32;
+    vm_size_t copied = 0;
+    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)target,
+                                         (vm_size_t)want, (vm_address_t)out, &copied);
+    if (kr == KERN_SUCCESS && copied == want) return (int)want;
+    if (want > 16) {
+        copied = 0;
+        kr = vm_read_overwrite(mach_task_self(), (vm_address_t)target, 16,
+                               (vm_address_t)out, &copied);
+        if (kr == KERN_SUCCESS && copied == 16) return 16;
+    }
+    return 0;
+}
+
 int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t addr,
                             const char *label, char *err, size_t errsz) {
     if (err && errsz) err[0] = '\0';
@@ -455,6 +500,55 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
     if (!target) return -2;
 
     pthread_mutex_lock(&g_install_lock);
+    // 同一目标不允许重复 inline hook: 旧补丁会把入口改成 thunk, 再 DobbyHook 会去 hook thunk 本身。
+    int total = atomic_load_explicit(&g_next_slot, memory_order_relaxed);
+    if (total > DH_THUNK_COUNT) total = DH_THUNK_COUNT;
+    for (int i = 0; i < total; i++) {
+        dh_slot_t *old = &g_slots[i];
+        if (old->used && !atomic_load_explicit(&old->retired, memory_order_relaxed) &&
+            old->kind == DH_HOOK_INLINE && old->target == target) {
+            pthread_mutex_unlock(&g_install_lock);
+            if (err) snprintf(err, errsz,
+                "target 0x%llx is already inline-hooked at slot %d; unhook it first (hard:true restores the original code)",
+                (unsigned long long)(uintptr_t)target, i);
+            return -5;
+        }
+    }
+    // 同一目标 hard-unhook 后再次安装: 复用原槽位和原 Dobby 蹦床, 重新写回 patched 字节。
+    // 不调用 DobbyHook(它会因内部 closure 表已有该地址而拒绝), 也不回收槽位给别的目标。
+    for (int i = total - 1; i >= 0; i--) {
+        dh_slot_t *old = &g_slots[i];
+        if (!old->used || old->kind != DH_HOOK_INLINE || old->target != target) continue;
+        if (!atomic_load_explicit(&old->retired, memory_order_relaxed)) continue;
+        if (old->saved_len <= 0 || old->patched_len != old->saved_len) {
+            pthread_mutex_unlock(&g_install_lock);
+            if (err) snprintf(err, errsz,
+                "slot %d was hard-unhooked but has no reusable patch image; restart the process to hook 0x%llx again",
+                i, (unsigned long long)(uintptr_t)target);
+            return -5;
+        }
+        uint8_t cur[32];
+        int curlen = dh_save_code_bytes(target, cur, sizeof(cur));
+        if (curlen < old->saved_len ||
+            memcmp(cur, old->saved, (size_t)old->saved_len) != 0) {
+            pthread_mutex_unlock(&g_install_lock);
+            if (err) snprintf(err, errsz,
+                "target 0x%llx was hard-unhooked but its entry bytes changed since then; refusing to re-hook (a stale hook or another patch owns it)",
+                (unsigned long long)(uintptr_t)target);
+            return -5;
+        }
+        int prc = DobbyCodePatch(target, old->patched, (uint32_t)old->patched_len);
+        if (prc != 0) {
+            pthread_mutex_unlock(&g_install_lock);
+            if (err) snprintf(err, errsz, "DobbyCodePatch re-apply failed: rc=%d", prc);
+            return -4;
+        }
+        if (label && label[0]) snprintf(old->name, sizeof(old->name), "%s", label);
+        atomic_store_explicit(&old->retired, 0, memory_order_release);
+        atomic_store_explicit(&old->enabled, 1, memory_order_release);
+        pthread_mutex_unlock(&g_install_lock);
+        return i;
+    }
     int slot = dh_alloc_slot();
     if (slot < 0) {
         pthread_mutex_unlock(&g_install_lock);
@@ -474,6 +568,9 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
     }
     s->kind = DH_HOOK_INLINE;
     s->used = 1;
+    s->target = target;
+    s->saved_len = dh_save_code_bytes(target, s->saved, sizeof(s->saved));
+    atomic_store_explicit(&s->retired, 0, memory_order_relaxed);
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
     g_dh_thunk_orig[slot] = NULL;
     atomic_store_explicit(&s->enabled, 0, memory_order_release);
@@ -483,6 +580,9 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
     if (rc != 0 || g_dh_thunk_orig[slot] == NULL) {
         s->used = 0;
         s->name[0] = '\0';
+        s->target = NULL;
+        s->saved_len = 0;
+        s->patched_len = 0;
         int last = slot + 1;
         atomic_compare_exchange_strong_explicit(&g_next_slot, &last, slot,
                                                 memory_order_relaxed, memory_order_relaxed);
@@ -491,6 +591,7 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
                           (unsigned long long)(uintptr_t)target, rc, g_dh_thunk_orig[slot]);
         return -4;
     }
+    s->patched_len = dh_save_code_bytes(target, s->patched, sizeof(s->patched));
     atomic_store_explicit(&s->enabled, 1, memory_order_release);
     pthread_mutex_unlock(&g_install_lock);
     return slot;
@@ -537,6 +638,68 @@ int dh_thunk_disable(int slot) {
     return 0;
 }
 
+int dh_thunk_uninstall(int slot, int hard, char *err, size_t errsz) {
+    if (err && errsz) err[0] = '\0';
+    if (slot < 0 || slot >= DH_THUNK_COUNT || !g_slots[slot].used) {
+        if (err) snprintf(err, errsz, "slot %d is not an active hook", slot);
+        return -1;
+    }
+    pthread_mutex_lock(&g_install_lock);
+    dh_slot_t *s = &g_slots[slot];
+    atomic_store_explicit(&s->enabled, 0, memory_order_release);
+    if (!hard) {   // 软停: 停止记录, patch 保留
+        pthread_mutex_unlock(&g_install_lock);
+        return 0;
+    }
+    if (atomic_load_explicit(&s->retired, memory_order_relaxed)) {
+        pthread_mutex_unlock(&g_install_lock);
+        if (err) snprintf(err, errsz, "slot %d is already hard-unhooked (retired)", slot);
+        return 0;
+    }
+    if (s->kind == DH_HOOK_INLINE) {
+#if DH_HAVE_INLINE
+        if (!s->target || s->saved_len <= 0) {
+            pthread_mutex_unlock(&g_install_lock);
+            if (err) snprintf(err, errsz,
+                "slot %d has no saved original bytes; hard unhook unavailable, use soft unhook", slot);
+            return -5;
+        }
+        // 只恢复目标入口的原始字节, 不调用 DobbyDestroy: 后者会释放 Dobby 的原函数蹦床,
+        // 而在途线程可能已经进入 thunk 并即将 br 到该蹦床; 保留蹦床可避免 use-after-free。
+        int rc = DobbyCodePatch(s->target, s->saved, (uint32_t)s->saved_len);
+        if (rc != 0) {
+            pthread_mutex_unlock(&g_install_lock);
+            if (err) snprintf(err, errsz, "DobbyCodePatch restore failed: rc=%d", rc);
+            return -4;
+        }
+        atomic_store_explicit(&s->retired, 1, memory_order_release);
+        pthread_mutex_unlock(&g_install_lock);
+        return 0;
+#else
+        pthread_mutex_unlock(&g_install_lock);
+        if (err) snprintf(err, errsz, "Dobby backend is not linked in this slice (arm64e)");
+        return -5;
+#endif
+    }
+    if (s->kind == DH_HOOK_METHOD) {
+        Method m = (Method)s->method;
+        IMP orig = (IMP)g_dh_thunk_orig[slot];
+        if (!m || !orig) {
+            pthread_mutex_unlock(&g_install_lock);
+            if (err) snprintf(err, errsz, "slot %d has no original IMP", slot);
+            return -5;
+        }
+        method_setImplementation(m, orig);
+        atomic_store_explicit(&s->retired, 1, memory_order_release);
+        pthread_mutex_unlock(&g_install_lock);
+        return 0;
+    }
+    pthread_mutex_unlock(&g_install_lock);
+    if (err) snprintf(err, errsz,
+        "hard unhook is not supported for fishhook import hooks; use soft unhook");
+    return -5;
+}
+
 int dh_thunk_list(dh_hook_info *out, int max) {
     int total = atomic_load_explicit(&g_next_slot, memory_order_relaxed);
     if (total > DH_THUNK_COUNT) total = DH_THUNK_COUNT;
@@ -545,6 +708,7 @@ int dh_thunk_list(dh_hook_info *out, int max) {
         if (!g_slots[i].used) continue;
         out[n].slot    = i;
         out[n].enabled = atomic_load_explicit(&g_slots[i].enabled, memory_order_relaxed);
+        out[n].retired = atomic_load_explicit(&g_slots[i].retired, memory_order_relaxed);
         out[n].kind    = g_slots[i].kind;
         out[n].hits    = atomic_load_explicit(&g_slots[i].hits, memory_order_relaxed);
         out[n].name    = g_slots[i].name;

@@ -93,5 +93,22 @@
 - 对照结论：同一种 Dobby inline 在主二进制上，学习通稳定、联想 SIGILL；联想是自身完整性/反篡改，不是引擎或 Dobby 的通用缺陷。
 - 测试后已 unhook 全部 slot（enabled=false，patch 保留），学习通进程未重启。
 
+## 2026-11-13：Inline / Method 硬卸载与同目标重装（1.28.2）
+
+- 槽位从 128 扩到 **256**；同一目标已有 active inline hook 时再次安装直接报错（不再叠一层 hook）。
+- `unhook` 默认仍是软停；`hard:true` 才是硬卸载：
+  - **inline**：安装前保存目标入口 32B 原始字节；DobbyHook 成功后再保存 patched 字节。硬停用 `DobbyCodePatch` 写回原始字节，**不调用 `DobbyDestroy`**——后者会释放 Dobby 原函数蹦床，而在途线程可能已经进入 thunk 并即将 `br` 到该蹦床，保留蹦床避免 use-after-free。槽位标记 retired。
+  - **method**：把 IMP 恢复成安装前保存的原 IMP，槽位 retired。
+  - **import (fishhook)**：不支持硬停，返回 -5，保持软停（没有安全的 GOT 反向恢复路径）。
+- **同一目标重装不消耗新槽**：
+  - inline 先读当前入口字节，必须与保存的原始字节一致，才用 `DobbyCodePatch` 重新写回 patched 字节并复用原槽位/原蹦床；字节被别人改过则拒绝，避免把别人的 patch 盖掉。
+  - method 要求当前 IMP 仍等于原 IMP，才复用 retired 槽位；否则走新槽。
+- 槽位仍不回收给**别的**目标（在途线程可能还持有旧 thunk 的地址），Dobby 蹦床按 hook 次数有界泄漏。准确语义是“同目标可反复装载/硬卸载”，不是“无限槽位回收”。
+- 真机（学习通，rootless 1.28.2，pid 10746）：
+  - `write` inline slot0 hits=98 → `hard:true` 返回 `restored=true, retired=true`，hits 冻结在 98；重装同目标复用 slot0，hits 升到 123；重复安装返回 `already inline-hooked at slot 0`。
+  - `-[AppDelegate setupCXLaunchAd]` method slot0 → hard 返回 `restored=true, retired=true` → 重装复用 slot0；重复 method hook 返回 `already method-hooked`。
+  - 全程 App 存活。
+
+
 
 
