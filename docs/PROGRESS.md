@@ -146,3 +146,29 @@
 ### 未解决（下一步）
 
 b4（base64 解码后 537 字节，非 16 倍数）/ b5 / b6 的构造仍未还原：已排除 46 种单/双/三字段 SHA256 组合、以及用 CCCrypt 抓到的 16B key 做 HMAC。最可能依赖 `JDGS_pentane` 的 `svrtk`/`umidT`/`pwdTable`/`appkey` 等属性，需要 hook 这些 getter 的返回值继续追。
+## 2026-11-13 夜间：objc_call oracle 与重复 hook 修复（1.28.9 → 1.28.15）
+
+### 新增工具
+| 工具 | 用途 |
+|---|---|
+| `objc_call` | 直接调用 ObjC 方法并把签名函数变成 oracle。参数按 NSString 编组，`{"$intptr":0}` 传 int32 出参地址（结果回读在 `out_params`）。`class_method:true` 走 +method |
+| `objc_dump_ivars` | 沿完整父类链读 ivar（owner/name/type/offset/value/raw_u64），支持 `class`+`shared:true` |
+| `objc_export_data` | 把 NSData/NSString ivar 写到 app `Documents/<name>.bin`，便于 scp 取大块数据 |
+
+### capture_after
+`capture_ptr_arg` 指向的出参缓冲只有在**函数返回后**才有效（CCHmac 摘要、CCCrypt 密文）。
+新增 `capture_after` 标志自动切到 post 路径，在 handler 里读该缓冲并写进 `outputHex`/detail。
+
+### 修掉的两个真 bug
+1. **重复 hook_import 会让旧槽位永久 0 命中**：fishhook 按符号改 GOT，再装一次会把 GOT
+   指向新槽位，旧槽位还留在 `list_hooks` 里看着像装好了。现在检测到已装就返回 -3，
+   MCP 层改成**复用已有槽位**并在回复里带 `reused:true`。
+2. **`g_dh_thunk_orig` 残留导致假成功**：dylib 在同进程被 reload 后，上一代的值还在，
+   `rebind_symbols` 失败也会被当成成功。现在 rebind 前先清零。
+3. `hook_method` 的 +method 解析：元类优先 → `class_getClassMethod` → 扫方法列表。
+
+### 踩到的坑（重要）
+**`hook_method` 的 class method 参数名是 `classMethod`（驼峰），`objc_call` 用的是
+`class_method`（下划线）。** 传错不报错，只会被当成 instance 语义，返回
+"class 'X' or its instance method 'Y' not found"——看起来像类方法不存在。
+这个坑让整轮排查里所有下游 inline hook 都是 0 命中，误判成「函数没被调用」。
