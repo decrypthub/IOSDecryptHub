@@ -159,7 +159,7 @@ b4（base64 解码后 537 字节，非 16 倍数）/ b5 / b6 的构造仍未还�
 `capture_ptr_arg` 指向的出参缓冲只有在**函数返回后**才有效（CCHmac 摘要、CCCrypt 密文）。
 新增 `capture_after` 标志自动切到 post 路径，在 handler 里读该缓冲并写进 `outputHex`/detail。
 
-### 修掉的两个真 bug
+### 修掉的三个真 bug
 1. **重复 hook_import 会让旧槽位永久 0 命中**：fishhook 按符号改 GOT，再装一次会把 GOT
    指向新槽位，旧槽位还留在 `list_hooks` 里看着像装好了。现在检测到已装就返回 -3，
    MCP 层改成**复用已有槽位**并在回复里带 `reused:true`。
@@ -172,3 +172,25 @@ b4（base64 解码后 537 字节，非 16 倍数）/ b5 / b6 的构造仍未还�
 `class_method`（下划线）。** 传错不报错，只会被当成 instance 语义，返回
 "class 'X' or its instance method 'Y' not found"——看起来像类方法不存在。
 这个坑让整轮排查里所有下游 inline hook 都是 0 命中，误判成「函数没被调用」。
+## 2026-11-13 深夜：复审发现的 blocker（已修，真机验证）
+
+`objc_call` 的 `{"$intptr":N}` 在 ARC 下 **100% 崩宿主**：`argv[]` 默认是 `__strong`，
+把栈上 `int` 的地址当 `id` 赋值会触发 `objc_storeStrong` → retain 读 isa → SIGSEGV，
+崩在赋值语句本身，根本走不到方法调用。改成 `__unsafe_unretained` 后真机验证通过
+（传 `{"$intptr":0}` 正常返回 jdgs JSON，`out_params` 回读到 `arg1_int=0`）。
+教训：把「不是对象的指针」伪装成 `id` 传参，在 ARC 下是崩溃而不是警告。
+
+`capture_after` 原先从**返回后**的寄存器快照取 `ptr_arg`，而 x0 此时已被返回值覆盖：
+`ptr_arg=0` 时读到 0 → 恒失效；函数返回指针时会把返回值当出参缓冲，抓到完全无关的
+内存并当成证据上报（假数据比失败更难发现）。现在 trampoline 在 `blr` 之前把入口
+`x0..x8` 另存到 `[sp,#0xE0]`，post handler 用它取 ptr/len。
+
+顺带修的：
+- `hook_import` 重复符号改由 core 返回 `-(slot+10)` 精确带出槽位（原来 MCP 层用
+  `strncmp` 前缀匹配，查 `CCHmac` 会命中 `CCHmacInit` 的槽位，静默改错 hook）
+- 删掉 `hook_method` 里对 Swift 类恒无效的第三级兜底（扫元类继承链 == 重实现
+  `class_getInstanceMethod`，找不到任何新东西）
+- `capture_after` 缺 `capture_memory` 时直接报错（原为悬空语义、静默无效），
+  且 MCP 层把 `capture_memory` 提到 `capture_after` 之前设置
+- `capture_multi` 语法非法时返回错误，不再静默降级
+- `objc_call` 参数上限 8 → 6（switch 只实现到 6）
