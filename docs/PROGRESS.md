@@ -194,3 +194,25 @@ b4（base64 解码后 537 字节，非 16 倍数）/ b5 / b6 的构造仍未还�
   且 MCP 层把 `capture_memory` 提到 `capture_after` 之前设置
 - `capture_multi` 语法非法时返回错误，不再静默降级
 - `objc_call` 参数上限 8 → 6（switch 只实现到 6）
+## 2026-11-13 深夜：第二轮复审（capture_multi）的 blocker
+
+`hook_import` 的**首次安装**路径只声明了 `capMulti`，从没调用 `dh_thunk_set_capture_multi`，
+但回包照样显示 `capture_multi` —— 用户以为配好了，slot 里其实还是空串，handler 永远不进
+多窗口分支，一条 `win` 都产不出来。`hook_import` 是抓静态加密库 key 的主力路径，
+这条**假成功**会让分析员基于「没有 win 输出」得出错误结论。
+
+同轮修掉的：
+- `%@` 传 `char[96]` 是未定义行为（`clang -Wformat` 会报），改 `%s`。触发条件是所有窗口
+  都读失败，排查期很常见，原来会崩在宿主 App 的 hook 线程上。
+- 三处 `capMulti = nil` 改为返回错误；复用分支补 `capture_multi` 回显。
+- `dh_thunk_list` 回填 `capture_multi`，`list_hooks` 输出它 —— 否则用户没有任何事后
+  自查手段，这也是上面假成功能漏过去的原因。
+- 新增 `dh_thunk_abort_install`：参数校验失败时回收槽位。原来只 `disable`，槽位会以
+  「名字是旧 label、配置是新参数」的混合状态留在表里。
+- `capture_multi` 写入端加 shadow + 原子 `ready` 标志：它是普通 `char[96]` 不是 `_Atomic`，
+  MCP 线程写、hook 线程读，无锁会读到写了一半的混合串并抓错寄存器。
+- 多窗口 hex 改查表 + `stringWithCharacters` 一次成串：逐字节 `appendFormat` 在热函数上
+  是几万次格式化调用，会把命中耗时拉到毫秒级、改变目标时序。
+
+验收（iPhone X 真机）：非法规格 `x9:64` 明确报错且不留槽位；合法 `x3:32,x5:64` 回显一致、
+`list_hooks` 可见；触发后事件里有完整 `win x3 = HELLO` 与 `win x5 = 配置对象`。
