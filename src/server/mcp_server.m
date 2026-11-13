@@ -2164,37 +2164,57 @@ static NSDictionary *tool_wait_events(NSDictionary *args) {
     NSString *stackHas  = [args[@"stack_contains"] isKindOfClass:NSString.class] ? args[@"stack_contains"] : nil;
     NSString *op        = [args[@"operation"] isKindOfClass:NSString.class] ? args[@"operation"] : nil;
 
-    // 超时上限 30s。HTTP 客户端通常 60s 超时, 留一半余量。
+    // 超时上限必须**低于客户端超时**, 否则工具正常工作却表现为失败:
+    // 服务端还在等, 客户端已经报 timed out, 请求也没被取消, 服务端仍占着连接。
+    // idh-cli 的 http_mcp.py 默认 timeout=15.0s（gateway 三条路径都不传 timeout），
+    // 所以取 12000ms, 留 3s 给传输和客户端处理。
     NSInteger timeoutMs = [args[@"timeout_ms"] isKindOfClass:NSNumber.class] ? [args[@"timeout_ms"] integerValue] : 5000;
     if (timeoutMs < 0) timeoutMs = 0;
-    if (timeoutMs > 30000) timeoutMs = 30000;
+    if (timeoutMs > 12000) timeoutMs = 12000;
 
     DHLogStore *store = [DHLogStore shared];
     uint64_t since = [args[@"since_seq"] isKindOfClass:NSNumber.class]
                    ? [args[@"since_seq"] unsignedLongLongValue] : 0;
     BOOL autoSince = (since == 0);
+    NSDate *startedAt = [NSDate date];
     if (autoSince) {
         // 取当前最新 seq 作为游标: 只等「调用之后」产生的事件。
         NSArray *cur = [store snapshotMatching:nil category:-1 minInputSize:0 maxInputSize:0];
         since = cur.count ? ((DHLogEntry *)cur.lastObject).seq : 0;
     }
 
+    // 采集被暂停时新事件不可能产生, 必然烧满整个 timeout 才返回空 ——
+    // 那正是这个工具要消灭的「事件看起来没产生」。直接给带原因的快速失败。
+    if (store.paused) {
+        return tool_ok(@{
+            @"count": @0, @"timeout": @NO, @"events": @[],
+            @"since_seq": @(since), @"next_seq": @(since), @"waited_ms": @0,
+            @"error": @"capture is paused (set_pause) — no new events can be recorded; resume it first",
+        });
+    }
+
     NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:(timeoutMs / 1000.0)];
-    NSDate *startedAt = [NSDate date];
     NSArray *found = @[];
-    uint64_t seenMax = since;
+    uint64_t scannedMax = since;   // 扫到哪: 包含被过滤器排除的事件
+    uint64_t returnedMax = since;  // 返回了哪: 只含真正命中并返回的事件
     while (1) {
-        NSArray *src = [store snapshotMatching:q category:cat minInputSize:minSize maxInputSize:maxSize];
-        NSMutableArray *hit = [NSMutableArray array];
-        for (DHLogEntry *e in src) {
-            if (e.seq <= since) continue;
-            if (e.seq > seenMax) seenMax = e.seq;
-            if (op && ![e.operation isEqualToString:op]) continue;
-            if (!event_passes_extra(e, outHexEq, outHexPre, outLen, tid, 0, 0, stackHas)) continue;
-            [hit addObject:e];
-            if ((NSInteger)hit.count >= limit) break;
+        // 每轮必须有 autoreleasepool。25Hz × 12s = 300 轮, 每轮 snapshotMatching
+        // 返回最多上万条并对关键词做 lowercaseString —— 不放进 pool 会全堆在
+        // 函数返回时才释放, 在 2-3GB 设备上是几十 MB 的峰值。
+        @autoreleasepool {
+            NSArray *src = [store snapshotMatching:q category:cat minInputSize:minSize maxInputSize:maxSize];
+            NSMutableArray *hit = [NSMutableArray array];
+            for (DHLogEntry *e in src) {
+                if (e.seq <= since) continue;
+                if (e.seq > scannedMax) scannedMax = e.seq;
+                if (op && ![e.operation isEqualToString:op]) continue;
+                if (!event_passes_extra(e, outHexEq, outHexPre, outLen, tid, 0, 0, stackHas)) continue;
+                [hit addObject:e];
+                if (e.seq > returnedMax) returnedMax = e.seq;
+                if ((NSInteger)hit.count >= limit) break;
+            }
+            if (hit.count) { found = hit; break; }
         }
-        if (hit.count) { found = hit; break; }
         if ([deadline timeIntervalSinceNow] <= 0) break;
         // 40ms 一轮: 目标命中通常在毫秒级, 再密就是空转; 再疏会明显增加检测延迟。
         usleep(40 * 1000);
@@ -2203,21 +2223,32 @@ static NSDictionary *tool_wait_events(NSDictionary *args) {
     NSMutableArray *out = [NSMutableArray array];
     for (DHLogEntry *e in found) [out addObject:dh_log_entry_summary(e)];
     NSInteger waitedMs = (NSInteger)(-[startedAt timeIntervalSinceNow] * 1000.0);
+    BOOL timedOut = (out.count == 0 && [deadline timeIntervalSinceNow] <= 0);
     return tool_ok(@{
         @"count":   @(out.count),
-        @"timeout": @(out.count == 0),
+        @"timeout": @(timedOut),
         @"events":  out,
         @"since_seq": @(since),
-        @"next_seq":  @(seenMax),
-        @"waited_ms": @(waitedMs),
+        // 两个游标语义不同, 别混用:
+        //   next_seq     = 已**返回**的最大 seq, 安全用于「继续等同一过滤器」;
+        //   scanned_seq  = 已**判断过**的最大 seq, 包含被 operation/其它过滤器排除的。
+        // 换过滤器时用 next_seq(否则会漏掉两个窗口之间只有新过滤器才匹配的事件);
+        // 只想跳过已看过的时间段、不关心漏不漏时用 scanned_seq。
+        @"next_seq":    @(returnedMax),
+        @"scanned_seq": @(scannedMax),
+        @"waited_ms":   @(waitedMs),
     });
 }
 
-// agent_ping —— 最轻量探活，5 秒硬超时。
+// agent_ping —— 最轻量探活。
 //
 // 为什么需要: 引擎/目标一崩，客户端看到的是 RemoteDisconnected 或超时，
 // 分不清「目标崩了」还是「这条命令很慢」。这个工具只回答「你还活着吗」，
-// 失败快、成本低，是排查第一步该调的。
+// 是排查第一步该调的。
+//
+// 注意这里**没有**服务端超时: tool_get_stats 是同步调用, 无法被安全放弃。
+// 客户端侧的超时(idh-cli 默认 15s)才是真正的兜底。别在这个工具的文档里
+// 承诺它自己会限时 —— 那是虚假保证。
 static NSDictionary *tool_agent_ping(NSDictionary *args) {
     NSDate *t0 = [NSDate date];
     // tool_get_stats 返回的是已经包装好的 MCP 响应，真实数据在 structuredContent 下。
@@ -2226,7 +2257,8 @@ static NSDictionary *tool_agent_ping(NSDictionary *args) {
     NSTimeInterval ms = -[t0 timeIntervalSinceNow] * 1000.0;
     return tool_ok(@{
         @"alive": @YES,
-        @"rtt_ms": @((NSInteger)ms),
+        // 进程内耗时, 不含网络往返。和客户端 15s 超时对比时不要当成 RTT。
+        @"elapsed_ms": @((NSInteger)ms),
         @"pid": proc[@"pid"] ?: @0,
         @"app": proc[@"appName"] ?: @"",
     });
@@ -2978,7 +3010,7 @@ static NSArray *tool_definitions(void) {
         },
         @{
             @"name": @"wait_events",
-            @"description": @"Block on the server until a matching event arrives or the timeout expires, then return once. This is the replacement for client-side polling loops: no repeated round trips, no missed hits between polls, no stale events. Returns timeout:true with an empty list on expiry (that is a normal result, not an error). next_seq can be fed straight back as since_seq.",
+            @"description": @"Block on the server until a matching event arrives or the timeout expires, then return once. This is the replacement for client-side polling loops: no repeated round trips, no missed hits between polls, no stale events. Returns timeout:true with an empty list on expiry (that is a normal result, not an error). Two cursors come back: next_seq = highest seq RETURNED (safe to feed back as since_seq when you keep the same filter), scanned_seq = highest seq EXAMINED including filtered-out events (use it only when you do not need the gap — feeding it back after changing operation/query can skip events only the new filter would match).",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
@@ -2994,13 +3026,13 @@ static NSArray *tool_definitions(void) {
                     @"thread_id": @{@"type": @"number", @"description": @"Only events on this thread"},
                     @"stack_contains": @{@"type": @"string", @"description": @"Only events whose call stack contains this substring"},
                     @"limit": @{@"type": @"number", @"description": @"Max results to return once matched (default 20, max 200)"},
-                    @"timeout_ms": @{@"type": @"number", @"description": @"How long to wait (default 5000, max 30000). Returns as soon as something matches"},
+                    @"timeout_ms": @{@"type": @"number", @"description": @"How long to wait (default 5000, max 12000). Returns as soon as something matches. Capped below the idh-cli client timeout (15s) on purpose"},
                 },
             },
         },
         @{
             @"name": @"agent_ping",
-            @"description": @"Cheapest possible liveness probe with a hard 5s bound. Answers only 'is the engine still responsive' and returns rtt_ms. Use it FIRST when a call hangs or the connection drops, to tell 'target crashed' apart from 'this command is just slow' — those two look identical to an HTTP client.",
+            @"description": @"Cheapest possible liveness probe. Answers only 'is the engine still responsive' and returns rtt_ms. Use it FIRST when a call hangs or the connection drops, to tell 'target crashed' apart from 'this command is just slow' — those two look identical to an HTTP client.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{},

@@ -66,24 +66,43 @@ list_hooks                          # 看 hits 是不是 > 0
 ### 3.1.1 别写轮询循环，用 wait_events
 
 ```json
-wait_events { "operation": "<你给 hook 的 label>", "timeout_ms": 8000 }
+wait_events { "category": "other", "operation": "<你给 hook 的 label>", "timeout_ms": 8000 }
 ```
 
 服务端阻塞等待，命中就立刻返回，超时返回 `timeout:true` + 空列表（**这是正常结果，
-不是错误**）。`next_seq` 可以直接喂回 `since_seq` 续接。
+不是错误**）。
 
-比客户端轮询好在三点：没有往返开销、不会漏掉轮询间隔里的命中、不会拿到上一轮的
-旧事件。这轮排查里我就因为轮询窗口不对，误判过「事件没产生」。
+**一定要带 `category`。** 不传等于扫全部 9 个桶再全排序，是整个 store 最贵的路径；
+25Hz 轮询会和 hook 写事件抢同一把锁。`hook_inline` 的事件在 `other`。
+
+两个游标别混用：
+
+| 字段 | 含义 | 什么时候用 |
+|---|---|---|
+| `next_seq` | 已**返回**的最大 seq | 继续等同一过滤器（安全） |
+| `scanned_seq` | 已**判断过**的最大 seq，含被过滤掉的 | 只跳过时间段、不在乎漏事件时 |
+
+**换了 `operation`/`query` 就必须用 `next_seq`**。用 `scanned_seq` 会漏掉两个窗口
+之间产生的、只有新过滤器才匹配的事件。
+
+`timeout_ms` 上限是 12000，故意压在 `idh-cli` 的 15s 客户端超时之下——服务端等得比
+客户端久的话，工具明明在工作却表现为失败，而且请求没被取消、连接还被占着。
+
+采集被暂停（`set_pause`）时新事件不可能产生，它会立刻返回 `error` 而不是烧满超时。
 
 ### 3.1.2 卡住时先 agent_ping
 
 ```
-agent_ping → { alive: true, rtt_ms: 8, pid: 16500, app: "七鲜" }
+agent_ping → { alive: true, elapsed_ms: 8, pid: 16500, app: "七鲜" }
 ```
 
 HTTP 客户端看到的 `RemoteDisconnected` 或超时，分不清「目标崩了」还是「命令很慢」。
-`agent_ping` 只回答「你还活着吗」，7-8ms 返回。**先 ping 再排查**，能省掉一整轮
+`agent_ping` 只回答「你还活着吗」，毫秒级返回。**先 ping 再排查**，能省掉一整轮
 错误归因。
+
+`elapsed_ms` 是**进程内耗时**，不含网络往返——别拿它和客户端 15s 超时对比。这个
+工具本身也没有服务端超时（`get_stats` 是同步调用，无法安全放弃），真正的兜底是
+客户端超时。
 
 ### 3.2 同轮对照
 

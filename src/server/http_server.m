@@ -115,7 +115,11 @@ static BOOL write_all(int fd, const void *buf, size_t len) {
     const char *p = buf;
     size_t left = len;
     while (left > 0) {
-        ssize_t n = send(fd, p, left, 0);
+        // MSG_NOSIGNAL 与 accept 时设的 SO_NOSIGPIPE 是同一目的的两道保险:
+        // 客户端提前关连接时, 这里必须返回 EPIPE 而不是让 SIGPIPE 杀掉目标进程。
+        // 两道都留是有意的 —— 万一将来有人改 accept 路径漏掉 setsockopt,
+        // 写路径自己仍然安全。Darwin 上 MSG_NOSIGNAL 与 SO_NOSIGPIPE 语义等价。
+        ssize_t n = send(fd, p, left, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) continue;
             return NO;
@@ -1003,6 +1007,14 @@ static void accept_loop(void) {
         backoff = 0;
         int yes = 1;
         setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+        // SIGPIPE 防护。客户端在服务端回写前关连接时, send() 会触发 SIGPIPE,
+        // 默认动作是**终止进程** —— 也就是把目标 App 打死。
+        // 以前所有工具都在客户端超时前返回, socket 还开着, 这个隐患碰不到;
+        // wait_events 是第一个故意把连接握到客户端超时之后才回写的工具,
+        // 于是「客户端 15s 超时 → 服务端 30s 才写 → 撞 RST」成了可复现的崩溃路径。
+        // SO_NOSIGPIPE 让 send 返回 EPIPE 而不是发信号, 比全局忽略 SIGPIPE 安全:
+        // 后者会掩盖目标进程里其他库的真实问题。
+        setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &yes, sizeof(yes));
         // 拿信号量, 超出并发上限就在 accept 线程上等; 这反向给客户端施加压力
         dispatch_semaphore_wait(gConcurrency, DISPATCH_TIME_FOREVER);
         dispatch_async(gWorkerQ, ^{
