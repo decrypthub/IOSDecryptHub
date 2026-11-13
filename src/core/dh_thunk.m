@@ -405,7 +405,11 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
         }
         // 多窗口: 一次 hook 同时记录多个寄存器指向的内存。
         // 一个 inline 目标只能装一个 hook 且槽位不回收, 换寄存器就得重启进程, 所以这是分析多参数函数的关键能力。
-        if (atomic_load_explicit(&s->capture_multi_ready, memory_order_acquire) && s->capture_multi[0]) {
+        // seqlock 读: 前后各读一次 ready, 都是 1 才认为这串是完整的。
+        // 单次 check-then-act 挡不住「读端已看到 ready==1、写端随即开始 memcpy」的窗口。
+        int sq1 = atomic_load_explicit(&s->capture_multi_ready, memory_order_acquire);
+        BOOL multiOK = (sq1 == 1 && s->capture_multi[0]);
+        if (multiOK) {
             NSArray *wins = dh_capture_multi(s, gpr);
             for (NSDictionary *w in wins) {
                 int reg = [w[@"reg"] intValue];
@@ -431,6 +435,7 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
                 }
             }
             if (!wins.count) [d appendFormat:@"\nwin [%s] unreadable (所有窗口都读不到: 地址<4GB 或 vm_read_overwrite 失败)", s->capture_multi];
+            if (atomic_load_explicit(&s->capture_multi_ready, memory_order_acquire) != sq1) [d appendString:@"\n(注意: 抓取期间 capture_multi 被改写, 本次窗口可能来自旧规格)"];
         }
         [d appendFormat:@"\nsp=0x%llx lr=0x%llx", caller_sp, lr];
         e.detail    = d;
@@ -608,7 +613,15 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
     s->target = NULL;
     s->saved_len = 0;
     atomic_store_explicit(&s->retired, 0, memory_order_relaxed);
+    // method 路径也要清 capture 配置: 槽位可能被 abort/回退复用, 残留的规格会让新 hook 抓错寄存器。
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
+    atomic_store_explicit(&s->capture_len_arg, -1, memory_order_relaxed);
+    atomic_store_explicit(&s->capture_max_bytes, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
+    atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
+    s->capture_multi[0] = 0;
+    atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
+    g_dh_thunk_post[slot] = 0;
     g_dh_thunk_orig[slot] = (void *)method_getImplementation(m);
     atomic_store_explicit(&s->enabled, 1, memory_order_release);
     method_setImplementation(m, (IMP)dh_slot_addr(slot));
@@ -896,17 +909,15 @@ int dh_thunk_set_capture_after(int slot, int on) {
 // 多窗口抓取: 一次 hook 同时观察多个寄存器指向的内存。
 // 一个 inline 目标只能装一个 hook，没有这个能力就只能卸了重装换寄存器；
 // 而 inline 槽位分配后不回收，换一次寄存器就要重启目标进程一次。
-int dh_thunk_set_capture_multi(int slot, const char *spec) {
-    if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
-    dh_slot_t *s = &g_slots[slot];
-    if (!s->used) return -1;
-    if (!spec || !spec[0]) {
-        atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
-        s->capture_multi[0] = '\\0';
-        return 0;
-    }
-    if (strlen(spec) >= sizeof(s->capture_multi)) return -1;
-    // 语法预检: 只接受 "x<0-8>[:N]" 的逗号序列，其它一律拒绝（不让坏规格静默变成空抓取）。
+// 纯语法校验（不改任何状态）。
+// 为什么单独抽出来: 安装 hook 时槽位先分配、参数后校验。如果校验失败才去「撤销安装」,
+// 就必须把目标上已经改好的跳转/IMP/GOT 全部回滚 —— 漏一步就是进程级内存安全事件
+// (import 的 GOT 仍指向 thunk 而 orig 被清空 → 下一次调用直接跳 NULL)。
+// 所以改成「分配槽位之前先把参数校验完」, 校验不过就根本不装。
+// 返回 0 = 合法; -1 = 语法错; -2 = 超长。
+int dh_thunk_validate_capture_multi(const char *spec) {
+    if (!spec || !spec[0]) return 0;
+    if (strlen(spec) >= 96) return -2;
     const char *p = spec;
     while (*p) {
         while (*p == ' ' || *p == ',') p++;
@@ -922,39 +933,26 @@ int dh_thunk_set_capture_multi(int slot, const char *spec) {
         }
         if (*p && *p != ',' && *p != ' ') return -1;
     }
-    // 写入端与 hook 命中线程的读取端没有锁。若直接 strlcpy 覆盖, 读到的是「写了一半」的混合串
-    // (例如旧 "x0:64,x3:32" 被新 "x5:128" 覆盖时读到 "x5:64,x3:32"), 会抓错寄存器产出错误证据。
-    // 做法: 先把新规格写进 shadow, 再原子翻转 ready 标志; 读取端只在 ready 为 1 时整串读。
-    strlcpy(s->capture_multi_shadow, spec, sizeof(s->capture_multi_shadow));
-    atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
-    strlcpy(s->capture_multi, s->capture_multi_shadow, sizeof(s->capture_multi));
-    atomic_store_explicit(&s->capture_multi_ready, 1, memory_order_release);
     return 0;
 }
 
-// 撤销一次刚完成的安装（参数校验失败时用）。
-// 为什么需要: 装 hook 时槽位先分配、参数后校验；校验失败如果只 disable 不回收，
-// 槽位会以「已用但半配置」的状态留在表里，list_hooks 会显示一个名字是旧 label、
-// 配置是新参数的混合体 —— 排查时完全误导。
-int dh_thunk_abort_install(int slot) {
+int dh_thunk_set_capture_multi(int slot, const char *spec) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
-    pthread_mutex_lock(&g_install_lock);
     dh_slot_t *s = &g_slots[slot];
-    if (s->used) {
-        s->used = 0;
-        s->name[0] = '\0';
-        s->capture_multi[0] = '\0';
+    if (!s->used) return -1;
+    int v = dh_thunk_validate_capture_multi(spec);
+    if (v != 0) return v;
+    if (!spec || !spec[0]) {
         atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
-        atomic_store_explicit(&s->enabled, 0, memory_order_release);
-        atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
-        atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
-        atomic_store_explicit(&s->capture_after, 0, memory_order_relaxed);
-        g_dh_thunk_post[slot] = 0;
-        int last = slot + 1;
-        atomic_compare_exchange_strong_explicit(&g_next_slot, &last, slot,
-                                                memory_order_relaxed, memory_order_relaxed);
+        s->capture_multi[0] = 0;
+        return 0;
     }
-    pthread_mutex_unlock(&g_install_lock);
+    // 用 seqlock 语义而不是 check-then-act: 写端把 ready 从 1 推到 2 (写作中),
+    // 拷完再推到 1; 读端读两次 ready, 前后都是 1 且相等才认为读到的是完整串。
+    // 原来的「清 0 → 写 → 置 1」在「读端已看到 1、正要去读」时挡不住撕裂。
+    atomic_store_explicit(&s->capture_multi_ready, 2, memory_order_release);
+    strlcpy(s->capture_multi, spec, sizeof(s->capture_multi));
+    atomic_store_explicit(&s->capture_multi_ready, 1, memory_order_release);
     return 0;
 }
 
@@ -1039,7 +1037,11 @@ int dh_thunk_list(dh_hook_info *out, int max) {
         out[n].hits    = atomic_load_explicit(&g_slots[i].hits, memory_order_relaxed);
         out[n].name    = g_slots[i].name;
         // capture_multi 必须回填: 否则 list_hooks 看不到多窗口配置, 用户没法自查是否真的生效。
-        strlcpy(out[n].capture_multi, g_slots[i].capture_multi, sizeof(out[n].capture_multi));
+        // capture_multi 回填前必须确认 ready: 否则可能报出一个用户从没设过、或写了一半的规格。
+        if (atomic_load_explicit(&g_slots[i].capture_multi_ready, memory_order_acquire) == 1)
+            strlcpy(out[n].capture_multi, g_slots[i].capture_multi, sizeof(out[n].capture_multi));
+        else
+            out[n].capture_multi[0] = 0;
         out[n].capture_ptr_arg   = atomic_load_explicit(&g_slots[i].capture_ptr_arg, memory_order_acquire);
         out[n].capture_len_arg   = atomic_load_explicit(&g_slots[i].capture_len_arg, memory_order_relaxed);
         out[n].capture_max_bytes = atomic_load_explicit(&g_slots[i].capture_max_bytes, memory_order_relaxed);

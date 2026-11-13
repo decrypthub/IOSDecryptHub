@@ -1687,6 +1687,14 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     int capPtr = -1, capLen = -1, capMax = 0;
     NSString *capErr = nil;
     if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
+    // 先校验 capture_multi 再分配槽位: 槽位一旦分配, 目标上的跳转/IMP/GOT 就已经改好了,
+    // 这时再因为参数不合法去「撤销」就必须完整回滚补丁 —— 漏一步就是内存安全事件。
+    {
+        NSString *pre = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
+        int pv = dh_thunk_validate_capture_multi(pre.UTF8String);
+        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pre.length]);
+        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pre]);
+    }
     int slot = dh_thunk_install_import(sym.UTF8String, label.UTF8String);
     if (slot <= -10) {
         // 同一符号已经装过: fishhook 只会把 GOT 指向一个槽位, 再装一次会让旧槽位永远 0 命中。
@@ -1704,12 +1712,13 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
             if (wantRet && dh_thunk_set_return(slot, 1) == 0) r[@"capture_return"] = @YES;
             BOOL wantAfter = [args[@"capture_after"] boolValue];
             if (wantAfter && dh_thunk_set_capture_after(slot, 1) == 0) r[@"capture_after"] = @YES;
-            // 多窗口: 一次 hook 同时抓多个寄存器, 换寄存器不必重启进程
+            // 复用分支绝不能因为新参数不合法就把原本正常的 hook 停掉（dh_thunk_disable 会让它永久失效）。
+            // 先用纯校验函数查规格，不合法就直接返回，槽位保持原状。
             NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-            if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
-                dh_thunk_disable(slot);
-                return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
-            }
+            if (dh_thunk_validate_capture_multi(capMulti.UTF8String) != 0)
+                return tool_err([NSString stringWithFormat:@"capture_multi 非法: %@。只接受 x0..x8 加可选 :N（每段最长 95 字节），逗号分隔，例如 x0:64,x3:32；已有 hook 未受影响", capMulti]);
+            if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0)
+                return tool_err(@"capture_multi 应用失败（规格已通过校验，说明槽位状态异常）");
             if (capMulti.length) r[@"capture_multi"] = capMulti;
             if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) == 0)
                 r[@"capture"] = @{@"ptr_arg": @(capPtr), @"len_arg": @(capLen), @"max_bytes": @(capMax)};
@@ -1726,17 +1735,17 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
     // 多窗口: 一次 hook 同时抓多个寄存器, 换寄存器不必重启进程
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
     if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
-        dh_thunk_abort_install(slot);
+        dh_thunk_disable(slot);
         return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
     }
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
-        dh_thunk_abort_install(slot);
+        dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
     }
     // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
     BOOL wantAfter = [args[@"capture_after"] boolValue];
     if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
-        dh_thunk_abort_install(slot);
+        dh_thunk_disable(slot);
         return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
     }
     NSMutableDictionary *res = [@{@"slot": @(slot), @"symbol": sym, @"kind": @"import", @"enabled": @YES,
@@ -1792,6 +1801,14 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
     if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
 
     char errbuf[256] = {0};
+    // 先校验 capture_multi 再分配槽位: 槽位一旦分配, 目标上的跳转/IMP/GOT 就已经改好了,
+    // 这时再因为参数不合法去「撤销」就必须完整回滚补丁 —— 漏一步就是内存安全事件。
+    {
+        NSString *pre = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
+        int pv = dh_thunk_validate_capture_multi(pre.UTF8String);
+        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pre.length]);
+        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pre]);
+    }
     int slot = dh_thunk_install_inline(
         module.length ? module.UTF8String : NULL,
         symbol.length ? symbol.UTF8String : NULL,
@@ -1811,17 +1828,17 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
     if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
-        dh_thunk_abort_install(slot);
+        dh_thunk_disable(slot);
         return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
     }
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
-        dh_thunk_abort_install(slot);
+        dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
     }
     // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
     BOOL wantAfter = [args[@"capture_after"] boolValue];
     if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
-        dh_thunk_abort_install(slot);
+        dh_thunk_disable(slot);
         return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
     }
 
@@ -1895,6 +1912,14 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
     int capPtr = -1, capLen = -1, capMax = 0;
     NSString *capErr = nil;
     if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
+    // 先校验 capture_multi 再分配槽位: 槽位一旦分配, 目标上的跳转/IMP/GOT 就已经改好了,
+    // 这时再因为参数不合法去「撤销」就必须完整回滚补丁 —— 漏一步就是内存安全事件。
+    {
+        NSString *pre = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
+        int pv = dh_thunk_validate_capture_multi(pre.UTF8String);
+        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pre.length]);
+        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pre]);
+    }
     int slot = dh_thunk_install_method(cls.UTF8String, sel.UTF8String, classMethod ? 1 : 0);
     if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
     if (slot == -5) return tool_err([NSString stringWithFormat:
@@ -1907,17 +1932,17 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
     if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
     NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
     if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
-        dh_thunk_abort_install(slot);
+        dh_thunk_disable(slot);
         return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
     }
     if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
-        dh_thunk_abort_install(slot);
+        dh_thunk_disable(slot);
         return tool_err(@"capture_memory 应用失败");
     }
     // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
     BOOL wantAfter = [args[@"capture_after"] boolValue];
     if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
-        dh_thunk_abort_install(slot);
+        dh_thunk_disable(slot);
         return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
     }
     NSMutableDictionary *res = [@{@"slot": @(slot),
