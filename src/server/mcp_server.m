@@ -1535,7 +1535,7 @@ static NSDictionary *tool_trace_function(NSDictionary *args) {
         }
     }
     int maxInsns = [args[@"max_insns"] isKindOfClass:NSNumber.class] ? [args[@"max_insns"] intValue] : 256;
-    int maxMs = [args[@"max_ms"] isKindOfClass:NSNumber.class] ? [args[@"max_ms"] intValue] : 1000;
+    int maxMs = [args[@"max_ms"] isKindOfClass:NSNumber.class] ? [args[@"max_ms"] intValue] : 3000;
     if (maxInsns < 1) maxInsns = 1;
     if (maxInsns > 4096) maxInsns = 4096;
     if (maxMs < 50) maxMs = 50;
@@ -2673,7 +2673,7 @@ static NSArray *tool_definitions(void) {
                     @"addr":   @{@"type": @"string", @"description": @"Absolute code address (hex string or number); alternative to symbol"},
                     @"args":   @{@"type": @"array", @"items": @{@"type": @"number"}, @"description": @"Up to 8 integer/pointer arguments (x0-x7). Numbers or hex strings are accepted."},
                     @"max_insns": @{@"type": @"number", @"description": @"Recording budget 1..4096; default 256"},
-                    @"max_ms":    @{@"type": @"number", @"description": @"Wall-clock budget 50..10000 ms; default 1000"},
+                    @"max_ms":    @{@"type": @"number", @"description": @"Wall-clock budget 50..10000 ms; default 3000. The first trace in a process pays QBDI JIT warmup (observed >800 ms on a real app), so a small budget can end with stop_reason=time-limit on the first call."},
                 },
             },
         },

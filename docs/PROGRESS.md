@@ -72,3 +72,16 @@
 - inline hook 仅入口观测 + 软停，未做安全硬卸载；不做返回值/参数改写。
 - 尚未发布到 APT；1.28.0 仅本机构建并装到 iPhone X。
 
+## 2026-11-13：联想 App 真机 hook 实测 + QBDI 冷启动修正
+
+设备/目标：iPhone X（iPhone10,3 / iOS 15.6 / Dopamine rootless）；联想 App 7.4.0（`com.lenovo.LenovoClub`，pid 8129）经 Loader 正常注入，MCP 8088 返回 bundleId=`com.lenovo.LenovoClub`、appName=`联想`。
+
+- inline hook `libsystem_kernel.dylib!write`：安装成功（backend=dobby），App 正常响应；一次 `get_stats` 后 hits=32（更早一轮 716 次），App 持续存活。
+- ObjC 方法 hook（swizzle）：`-[JPUSHService applicationDidBecomeActive]`、`-[JPUSHService applicationWillEnterForeground]` 各命中 1 次，App 存活；`-[LCAppDelegate checkUpdate]` 可安装但空闲窗口未命中。
+- inline hook 联想自带 framework 代码（`SensorsAnalyticsSDK`、`SocketRocket`、`Reachability` 的方法）：安装成功、App 存活；空闲窗口内未命中，说明 patch 本身对 framework 是安全的。
+- **inline hook 联想主二进制代码会触发 App 自身保护**：对 `LCAppDelegate.checkUpdate`、`LCAppDelegate.myAds`、`LenovoIDInlandSDK.leInlandLogout:`（当前进程实时解析的 IMP）装 inline hook 后 10–20 秒内 App 以 SIGILL 退出，即使目标方法从未被调用；崩溃线程停在 mach_msg_trap。对照：SevenFresh 主二进制同方式 inline hook 安装后 20 秒仍稳定，说明不是引擎/Dobby 的通用问题，而是联想主二进制的完整性/反篡改。
+- QBDI trace 在真实 App 进程内可用，但**首次调用有 JIT 冷启动**：`max_ms=800` 时 `getpid` 只记录 1 条就 time-limit；同一进程随后 `max_ms=5000` 时 6 条 completed、retval=pid（8129）、65ms；`getuid` 4 条 completed、25ms。默认 `max_ms` 已由 1000 提高到 3000，并在 `time_limit && count<=3` 时返回「QBDI cold start，建议重试」的 warning。
+
+结论：真实 App 内的 inline hook（系统函数、App 自带 framework）和 ObjC 方法 hook 已可用；联想主二进制 inline 被其自身完整性保护拦下，是否做反检测绕过属于产品决策，当前不静默假装成功。
+
+

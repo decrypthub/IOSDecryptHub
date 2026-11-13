@@ -199,6 +199,9 @@ NSDictionary *DHQBDITraceFunction(NSString *module, NSString *symbol, uint64_t a
     [warnings addObject:@"arguments: only x0-x7 integer/pointer values are seeded; stack arguments and float/vector arguments are not reconstructed."];
     if (ctx.stop && strcmp(ctx.stop, "completed") != 0) {
         [warnings addObject:[NSString stringWithFormat:@"execution stopped early (%s); retval is not the function's return value.", ctx.stop]];
+        if (strcmp(ctx.stop, "time-limit") == 0 && ctx.count <= 3) {
+            [warnings addObject:@"QBDI cold start / JIT warmup likely: the first trace in a process can exceed a small budget. Retry with max_ms >= 3000 (the engine's default is 3000)."];
+        }
     }
 
     NSMutableDictionary *targetInfo = [NSMutableDictionary dictionary];
