@@ -46,8 +46,9 @@ typedef struct {
     _Atomic int      capture_return;   // 1 = post 路径, 记录返回值
     _Atomic int      capture_after;    // 1 = capture_ptr_arg 指向「调用后才写好的输出缓冲」
     char             capture_multi[96];        // 多窗口: "x0:64,x3:32,x5:128" (空=关闭)
-    char             capture_multi_shadow[96]; // 写入用的影子缓冲, 避免读到写了一半的串
     _Atomic int      capture_multi_ready;      // 1 = capture_multi 内容完整可读
+    char             capture_ret_multi[96];  // 同上, 但作用于「返回值寄存器」(post 路径)
+    _Atomic int      capture_ret_multi_ready;
     dh_hook_kind     kind;
     int              used;
     void            *target;          // inline: DobbyHook 的目标地址
@@ -234,38 +235,78 @@ static NSData *dh_capture_arg_memory(dh_slot_t *s, uint64_t *gpr) {
 // 分配不会回收 —— 每次换寄存器都得重启目标进程, 实测把一轮分析拖成十几分钟。
 // 语法: "x0:64,x3:32,x5:128" 或 "0:64,3:32"; len 用 :N 显式给, 不给就用 max_bytes 上限。
 // 返回 @[{reg, addr, bytes(NSData)}], 由调用方渲染。
-static NSArray *dh_capture_multi(dh_slot_t *s, uint64_t *gpr) {
-    NSString *spec = @(s->capture_multi);
-    if (!spec || spec.length == 0) return nil;
+static NSArray *dh_capture_spec(const char *specRaw, uint64_t *gpr, int defaultMax);
+
+// 把多窗口抓取结果渲染成事件 detail。入口路径与返回值路径共用。
+static void dh_render_windows(NSMutableString *d, const char *spec, _Atomic int *ready,
+                              uint64_t *gpr, int defaultMax, NSString *tag) {
+    int sq1 = atomic_load_explicit(ready, memory_order_acquire);
+    if (sq1 != 1 || !spec[0]) return;
+    NSArray *wins = dh_capture_spec(spec, gpr, defaultMax);
+    static const char hexd[] = "0123456789abcdef";
+    for (NSDictionary *w in wins) {
+        int reg = [w[@"reg"] intValue];
+        NSData *b = w[@"bytes"];
+        uint64_t waddr = [w[@"addr"] unsignedLongLongValue];
+        // 必须自己转完整 hex: NSData.description 会在 16 字节后折叠成 "...", 分析时等于白抓。
+        // 用查表 + stringWithCharacters 一次成串: 逐字节 appendFormat 在热函数上是几万次
+        // 格式化调用, 会把命中耗时拉长到毫秒级, 改变目标 App 的时序。
+        NSUInteger take = b.length;
+        unichar *hbuf = (unichar *)malloc(take * 2 * sizeof(unichar));
+        if (!hbuf) {
+            [d appendFormat:@"\n%@ x%d @0x%llx = %lu bytes (hex alloc failed)", tag, reg, waddr, (unsigned long)b.length];
+            continue;
+        }
+        const uint8_t *p = (const uint8_t *)b.bytes;
+        for (NSUInteger k = 0; k < take; k++) {
+            hbuf[k * 2]     = (unichar)hexd[p[k] >> 4];
+            hbuf[k * 2 + 1] = (unichar)hexd[p[k] & 0xF];
+        }
+        NSString *hex = [NSString stringWithCharacters:hbuf length:take * 2];
+        free(hbuf);
+        [d appendFormat:@"\n%@ x%d @0x%llx = %lu bytes: %@", tag, reg, waddr, (unsigned long)b.length, hex];
+    }
+    if (!wins.count) [d appendFormat:@"\n%@ [%s] unreadable (所有窗口都读不到: 地址<4GB 或 vm_read_overwrite 失败)", tag, spec];
+    if (atomic_load_explicit(ready, memory_order_acquire) != sq1)
+        [d appendFormat:@"\n(注意: 抓取期间 %@ 规格被改写, 本次窗口可能来自旧规格)", tag];
+}
+
+static NSArray *dh_capture_spec(const char *specRaw, uint64_t *gpr, int defaultMax) {
+    if (!specRaw || !specRaw[0]) return nil;
+    NSString *spec = @(specRaw);
+    if (!spec.length) return nil;
     NSMutableArray *out = [NSMutableArray array];
-    int defaultMax = atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed);
-    if (defaultMax <= 0 || defaultMax > DH_THUNK_CAPTURE_MAX) defaultMax = 256;
     for (NSString *piece in [spec componentsSeparatedByString:@","]) {
         NSString *tok = [piece stringByTrimmingCharactersInSet:
                          [NSCharacterSet whitespaceCharacterSet]];
-        if (tok.length == 0) continue;
-        NSString *regPart = tok;
-        size_t want = (size_t)defaultMax;
-        NSRange colon = [tok rangeOfString:@":"];
-        if (colon.location != NSNotFound) {
-            regPart = [tok substringToIndex:colon.location];
-            want = (size_t)[[tok substringFromIndex:colon.location + 1] integerValue];
-        }
-        if ([regPart hasPrefix:@"x"] || [regPart hasPrefix:@"X"]) regPart = [regPart substringFromIndex:1];
+        if (!tok.length) continue;
+        NSArray *parts = [tok componentsSeparatedByString:@":"];
+        NSString *regPart = parts[0];
+        if (regPart.length && ([regPart characterAtIndex:0] == 'x' || [regPart characterAtIndex:0] == 'X'))
+            regPart = [regPart substringFromIndex:1];
+        // 严格数字校验: 只靠 intValue 会把 "abc" 当成 0 去抓 x0。
+        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+        if (!regPart.length || [regPart rangeOfCharacterFromSet:nonDigits].location != NSNotFound) continue;
         int reg = [regPart intValue];
         if (reg < 0 || reg > 8) continue;
-        if (want == 0 || want > DH_THUNK_CAPTURE_MAX) want = DH_THUNK_CAPTURE_MAX;
+        int want = defaultMax;
+        if (parts.count > 1) {
+            NSString *n = parts[1];
+            if (!n.length || [n rangeOfCharacterFromSet:nonDigits].location != NSNotFound) continue;
+            want = [n intValue];
+        }
+        if (want <= 0 || want > DH_THUNK_CAPTURE_MAX) want = DH_THUNK_CAPTURE_MAX;
         uint64_t addr = gpr[reg];
         if (addr < 0x100000000ULL) continue;
-        NSMutableData *data = [NSMutableData dataWithLength:want];
-        if (!data) continue;
-        vm_size_t got = 0;
-        kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr,
-                                             (vm_size_t)want,
-                                             (mach_vm_address_t)data.mutableBytes, &got);
-        if (kr != KERN_SUCCESS || got == 0) continue;
-        if (got < want) data.length = got;
-        [out addObject:@{@"reg": @(reg), @"addr": @(addr), @"bytes": data}];
+        void *buf = malloc((size_t)want);
+        if (!buf) continue;
+        mach_vm_size_t got = 0;
+        kern_return_t kr = vm_read_overwrite(mach_task_self(), (mach_vm_address_t)addr,
+                                             (mach_vm_size_t)want, (mach_vm_address_t)buf, &got);
+        NSData *b = (kr == KERN_SUCCESS && got > 0) ? [NSData dataWithBytes:buf length:(NSUInteger)got] : nil;
+        free(buf);
+        if (!b.length) continue;
+        [out addObject:@{@"reg": @(reg), @"addr": @(addr), @"bytes": b}];
     }
     return out.count ? out : nil;
 }
@@ -403,41 +444,12 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
                  capPtr, capPtr, gpr[capPtr], capPtr, capLen, capMax];
             }
         }
+
         // 多窗口: 一次 hook 同时记录多个寄存器指向的内存。
-        // 一个 inline 目标只能装一个 hook 且槽位不回收, 换寄存器就得重启进程, 所以这是分析多参数函数的关键能力。
-        // seqlock 读: 前后各读一次 ready, 都是 1 才认为这串是完整的。
-        // 单次 check-then-act 挡不住「读端已看到 ready==1、写端随即开始 memcpy」的窗口。
-        int sq1 = atomic_load_explicit(&s->capture_multi_ready, memory_order_acquire);
-        BOOL multiOK = (sq1 == 1 && s->capture_multi[0]);
-        if (multiOK) {
-            NSArray *wins = dh_capture_multi(s, gpr);
-            for (NSDictionary *w in wins) {
-                int reg = [w[@"reg"] intValue];
-                NSData *b = w[@"bytes"];
-                uint64_t waddr = [w[@"addr"] unsignedLongLongValue];
-                // 必须自己转完整 hex: NSData.description 会在 16 字节后折叠成 "...", 分析时等于白抓。
-                // 用查表 + stringWithCharacters 一次性成串: 逐字节 appendFormat 在热函数上是几万次
-                // 格式化调用, 会把命中耗时拉长到毫秒级, 改变目标 App 的时序。
-                NSUInteger take = b.length;   // 已在 dh_capture_multi 里钳到 CAPTURE_MAX
-                static const char hexd[] = "0123456789abcdef";
-                unichar *hbuf = (unichar *)malloc(take * 2 * sizeof(unichar));
-                if (hbuf) {
-                    const uint8_t *p = (const uint8_t *)b.bytes;
-                    for (NSUInteger k = 0; k < take; k++) {
-                        hbuf[k * 2]     = (unichar)hexd[p[k] >> 4];
-                        hbuf[k * 2 + 1] = (unichar)hexd[p[k] & 0xF];
-                    }
-                    NSString *hex = [NSString stringWithCharacters:hbuf length:take * 2];
-                    free(hbuf);
-                    [d appendFormat:@"\nwin x%d @0x%llx = %lu bytes: %@", reg, waddr, (unsigned long)b.length, hex];
-                } else {
-                    [d appendFormat:@"\nwin x%d @0x%llx = %lu bytes (hex alloc failed)", reg, waddr, (unsigned long)b.length];
-                }
-            }
-            if (!wins.count) [d appendFormat:@"\nwin [%s] unreadable (所有窗口都读不到: 地址<4GB 或 vm_read_overwrite 失败)", s->capture_multi];
-            if (atomic_load_explicit(&s->capture_multi_ready, memory_order_acquire) != sq1) [d appendString:@"\n(注意: 抓取期间 capture_multi 被改写, 本次窗口可能来自旧规格)"];
-        }
-        [d appendFormat:@"\nsp=0x%llx lr=0x%llx", caller_sp, lr];
+        // 一个 inline 目标只能装一个 hook 且槽位不回收, 换寄存器就得重启进程,
+        // 所以这是分析多参数函数的关键能力。
+        dh_render_windows(d, s->capture_multi, &s->capture_multi_ready, gpr,
+                          atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed), @"win");
         e.detail    = d;
         e.callStack = DHCallStackFiltered();
         e.timestamp = DHTimestampNow();
@@ -496,6 +508,10 @@ void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_
                 }
             }
         }
+        // 返回值多窗口: 有些函数把结果放在 x1 指向的缓冲里 (例如序列化器返回
+        // (status, buffer)), 而那块内存在返回后可能立刻被释放 —— 只能在这里读。
+        dh_render_windows(d, s->capture_ret_multi, &s->capture_ret_multi_ready, regs,
+                          atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed), @"ret");
         e.detail    = d;
         e.callStack = DHCallStackFiltered();
         e.timestamp = DHTimestampNow();
@@ -953,6 +969,28 @@ int dh_thunk_set_capture_multi(int slot, const char *spec) {
     atomic_store_explicit(&s->capture_multi_ready, 2, memory_order_release);
     strlcpy(s->capture_multi, spec, sizeof(s->capture_multi));
     atomic_store_explicit(&s->capture_multi_ready, 1, memory_order_release);
+    return 0;
+}
+
+// 返回值寄存器的多窗口 (post 路径)。用于「函数返回 (status, buffer)」这种 ABI:
+// 缓冲在返回后可能立刻被释放, 只能在这里读。
+int dh_thunk_set_capture_ret_multi(int slot, const char *spec) {
+    if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
+    dh_slot_t *s = &g_slots[slot];
+    if (!s->used) return -1;
+    int v = dh_thunk_validate_capture_multi(spec);
+    if (v != 0) return v;
+    if (!spec || !spec[0]) {
+        atomic_store_explicit(&s->capture_ret_multi_ready, 0, memory_order_release);
+        s->capture_ret_multi[0] = 0;
+        return 0;
+    }
+    atomic_store_explicit(&s->capture_ret_multi_ready, 2, memory_order_release);
+    strlcpy(s->capture_ret_multi, spec, sizeof(s->capture_ret_multi));
+    atomic_store_explicit(&s->capture_ret_multi_ready, 1, memory_order_release);
+    // 返回值只有 post 路径才有
+    atomic_store_explicit(&s->capture_return, 1, memory_order_relaxed);
+    g_dh_thunk_post[slot] = 1;
     return 0;
 }
 

@@ -90,6 +90,8 @@ int  dh_thunk_set_capture_after(int slot, int on);
 // 返回 0=合法, -1=语法错, -2=超长(>=96 字节)
 int  dh_thunk_validate_capture_multi(const char *spec);
 int  dh_thunk_set_capture_multi(int slot, const char *spec);
+// 返回值寄存器的多窗口(post 路径): 抓 x1 指向的缓冲这类「返回后即释放」的输出
+int  dh_thunk_set_capture_ret_multi(int slot, const char *spec);
 
 // 原子关闭一个 hook(停止记录, 仍透明转发)。越界/未用返回 -1, 成功返回 0。
 int  dh_thunk_disable(int slot);
