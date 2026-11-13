@@ -60,8 +60,30 @@ list_hooks                          # 看 hits 是不是 > 0
 |---|---|
 | 地址算错了（slide 过期） | 重新 `get_macho_info` 核对 |
 | 函数没被调用 | 换一个确定会走的分支触发 |
-| hook 装失败但返回了成功 | `list_hooks` 看 enabled / `list_hooks` 看 enabled / hits |
+| hook 装失败但返回了成功 | `list_hooks` 看 `enabled` 与 `hits` |
 | 装了但被别的 hook 抢了 | 同一符号重复装时 GOT 只指向最后一个槽位 |
+
+### 3.1.1 别写轮询循环，用 wait_events
+
+```json
+wait_events { "operation": "<你给 hook 的 label>", "timeout_ms": 8000 }
+```
+
+服务端阻塞等待，命中就立刻返回，超时返回 `timeout:true` + 空列表（**这是正常结果，
+不是错误**）。`next_seq` 可以直接喂回 `since_seq` 续接。
+
+比客户端轮询好在三点：没有往返开销、不会漏掉轮询间隔里的命中、不会拿到上一轮的
+旧事件。这轮排查里我就因为轮询窗口不对，误判过「事件没产生」。
+
+### 3.1.2 卡住时先 agent_ping
+
+```
+agent_ping → { alive: true, rtt_ms: 8, pid: 16500, app: "七鲜" }
+```
+
+HTTP 客户端看到的 `RemoteDisconnected` 或超时，分不清「目标崩了」还是「命令很慢」。
+`agent_ping` 只回答「你还活着吗」，7-8ms 返回。**先 ping 再排查**，能省掉一整轮
+错误归因。
 
 ### 3.2 同轮对照
 
