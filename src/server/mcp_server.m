@@ -2111,6 +2111,102 @@ static NSDictionary *tool_query_events(NSDictionary *args) {
     return tool_ok(@{@"count": @(out.count), @"matched": @(matched), @"events": out});
 }
 
+// wait_events —— 服务端阻塞等待，直到出现匹配事件或超时，一次返回。
+//
+// 为什么需要: 客户端轮询的代价不只是往返延迟。目标 App 常常要几秒才发一次请求，
+// 按 50ms 轮询就是几十次请求；更糟的是轮询间隔里的命中可能被下一次 clear_events
+// 冲掉，或者拿到上一轮的旧事件 —— 排查时表现为「事件看起来没产生」。
+//
+// 语义:
+//   - since_seq 是游标。不传则用「当前最新 seq」，即只等调用之后产生的事件，
+//     不会把历史事件当成本次命中。
+//   - 命中即返回（不等满 timeoutMs）。返回里的 next_seq 可直接用作下次的 since_seq。
+//   - 超时返回 ok 但 timeout:true，events 为空。这是正常结果，不是错误。
+//   - 轮询间隔 40ms：比客户端轮询密，但每次只是内存快照，不开连接。
+static NSDictionary *tool_wait_events(NSDictionary *args) {
+    NSInteger cat = category_from_string(args[@"category"]);
+    NSString *q = [args[@"query"] isKindOfClass:NSString.class] ? args[@"query"] : @"";
+    NSUInteger minSize = [args[@"min_size"] isKindOfClass:NSNumber.class] ? [args[@"min_size"] unsignedIntegerValue] : 0;
+    NSUInteger maxSize = [args[@"max_size"] isKindOfClass:NSNumber.class] ? [args[@"max_size"] unsignedIntegerValue] : 0;
+    NSInteger limit = [args[@"limit"] isKindOfClass:NSNumber.class] ? [args[@"limit"] integerValue] : 20;
+    if (limit <= 0 || limit > 200) limit = 20;
+
+    NSString *outHexEq  = [args[@"output_hex"] isKindOfClass:NSString.class] ? args[@"output_hex"] : nil;
+    NSString *outHexPre = [args[@"output_hex_prefix"] isKindOfClass:NSString.class] ? args[@"output_hex_prefix"] : nil;
+    NSNumber *outLen    = [args[@"output_len"] isKindOfClass:NSNumber.class] ? args[@"output_len"] : nil;
+    NSNumber *tid       = [args[@"thread_id"] isKindOfClass:NSNumber.class] ? args[@"thread_id"] : nil;
+    NSString *stackHas  = [args[@"stack_contains"] isKindOfClass:NSString.class] ? args[@"stack_contains"] : nil;
+    NSString *op        = [args[@"operation"] isKindOfClass:NSString.class] ? args[@"operation"] : nil;
+
+    // 超时上限 30s。HTTP 客户端通常 60s 超时, 留一半余量。
+    NSInteger timeoutMs = [args[@"timeout_ms"] isKindOfClass:NSNumber.class] ? [args[@"timeout_ms"] integerValue] : 5000;
+    if (timeoutMs < 0) timeoutMs = 0;
+    if (timeoutMs > 30000) timeoutMs = 30000;
+
+    DHLogStore *store = [DHLogStore shared];
+    uint64_t since = [args[@"since_seq"] isKindOfClass:NSNumber.class]
+                   ? [args[@"since_seq"] unsignedLongLongValue] : 0;
+    BOOL autoSince = (since == 0);
+    if (autoSince) {
+        // 取当前最新 seq 作为游标: 只等「调用之后」产生的事件。
+        NSArray *cur = [store snapshotMatching:nil category:-1 minInputSize:0 maxInputSize:0];
+        since = cur.count ? ((DHLogEntry *)cur.lastObject).seq : 0;
+    }
+
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:(timeoutMs / 1000.0)];
+    NSDate *startedAt = [NSDate date];
+    NSArray *found = @[];
+    uint64_t seenMax = since;
+    while (1) {
+        NSArray *src = [store snapshotMatching:q category:cat minInputSize:minSize maxInputSize:maxSize];
+        NSMutableArray *hit = [NSMutableArray array];
+        for (DHLogEntry *e in src) {
+            if (e.seq <= since) continue;
+            if (e.seq > seenMax) seenMax = e.seq;
+            if (op && ![e.operation isEqualToString:op]) continue;
+            if (!event_passes_extra(e, outHexEq, outHexPre, outLen, tid, 0, 0, stackHas)) continue;
+            [hit addObject:e];
+            if ((NSInteger)hit.count >= limit) break;
+        }
+        if (hit.count) { found = hit; break; }
+        if ([deadline timeIntervalSinceNow] <= 0) break;
+        // 40ms 一轮: 目标命中通常在毫秒级, 再密就是空转; 再疏会明显增加检测延迟。
+        usleep(40 * 1000);
+    }
+
+    NSMutableArray *out = [NSMutableArray array];
+    for (DHLogEntry *e in found) [out addObject:dh_log_entry_summary(e)];
+    NSInteger waitedMs = (NSInteger)(-[startedAt timeIntervalSinceNow] * 1000.0);
+    return tool_ok(@{
+        @"count":   @(out.count),
+        @"timeout": @(out.count == 0),
+        @"events":  out,
+        @"since_seq": @(since),
+        @"next_seq":  @(seenMax),
+        @"waited_ms": @(waitedMs),
+    });
+}
+
+// agent_ping —— 最轻量探活，5 秒硬超时。
+//
+// 为什么需要: 引擎/目标一崩，客户端看到的是 RemoteDisconnected 或超时，
+// 分不清「目标崩了」还是「这条命令很慢」。这个工具只回答「你还活着吗」，
+// 失败快、成本低，是排查第一步该调的。
+static NSDictionary *tool_agent_ping(NSDictionary *args) {
+    NSDate *t0 = [NSDate date];
+    // tool_get_stats 返回的是已经包装好的 MCP 响应，真实数据在 structuredContent 下。
+    NSDictionary *st = tool_get_stats(@{});
+    NSDictionary *proc = st[@"structuredContent"][@"process"];
+    NSTimeInterval ms = -[t0 timeIntervalSinceNow] * 1000.0;
+    return tool_ok(@{
+        @"alive": @YES,
+        @"rtt_ms": @((NSInteger)ms),
+        @"pid": proc[@"pid"] ?: @0,
+        @"app": proc[@"appName"] ?: @"",
+    });
+}
+
+
 // correlate_request —— 以一次 net 请求为锚, 聚合时间窗内 crypto/sys 事件, 并按 X-Validator 反查命中。
 // 把「AES→Hash→设 Header→发包」串成一次请求, match 块给 AI「命中即闭合」的自动化验收。
 static NSDictionary *tool_correlate_request(NSDictionary *args) {
@@ -2855,6 +2951,36 @@ static NSArray *tool_definitions(void) {
             },
         },
         @{
+            @"name": @"wait_events",
+            @"description": @"Block on the server until a matching event arrives or the timeout expires, then return once. This is the replacement for client-side polling loops: no repeated round trips, no missed hits between polls, no stale events. Returns timeout:true with an empty list on expiry (that is a normal result, not an error). next_seq can be fed straight back as since_seq.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"category": @{@"type": @"string", @"enum": @[@"all", @"digest", @"hmac", @"sym", @"asym", @"file", @"sys", @"net", @"keychain", @"other"], @"description": @"Filter by category (default all)"},
+                    @"query": @{@"type": @"string", @"description": @"Keyword filter (algorithm/path/preview)"},
+                    @"operation": @{@"type": @"string", @"description": @"Exact operation/label match, e.g. the label you gave hook_inline"},
+                    @"min_size": @{@"type": @"number", @"description": @"Min input bytes"},
+                    @"max_size": @{@"type": @"number", @"description": @"Max input bytes (0 = no cap)"},
+                    @"since_seq": @{@"type": @"number", @"description": @"Wait for events with seq > this. Omit (or 0) to use the current newest seq — i.e. only wait for events produced AFTER this call"},
+                    @"output_hex": @{@"type": @"string", @"description": @"Exact output match (case-insensitive hex)"},
+                    @"output_hex_prefix": @{@"type": @"string", @"description": @"Output hex prefix match"},
+                    @"output_len": @{@"type": @"number", @"description": @"Exact output byte length"},
+                    @"thread_id": @{@"type": @"number", @"description": @"Only events on this thread"},
+                    @"stack_contains": @{@"type": @"string", @"description": @"Only events whose call stack contains this substring"},
+                    @"limit": @{@"type": @"number", @"description": @"Max results to return once matched (default 20, max 200)"},
+                    @"timeout_ms": @{@"type": @"number", @"description": @"How long to wait (default 5000, max 30000). Returns as soon as something matches"},
+                },
+            },
+        },
+        @{
+            @"name": @"agent_ping",
+            @"description": @"Cheapest possible liveness probe with a hard 5s bound. Answers only 'is the engine still responsive' and returns rtt_ms. Use it FIRST when a call hangs or the connection drops, to tell 'target crashed' apart from 'this command is just slow' — those two look identical to an HTTP client.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{},
+            },
+        },
+        @{
             @"name": @"correlate_request",
             @"description": @"Anchor on a captured network request (net_seq) and gather all crypto/keychain/net events within window_ms, sorted by deltaMs. Base64-decodes the request headers and reports which event's output matches each — 'matches' lists every header→event hit; 'match' surfaces the primary one (X-Validator first, else the first). Pass match_header to restrict to one header.",
             @"inputSchema": @{
@@ -3318,6 +3444,8 @@ static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
     // 取证: 读
     if ([name isEqualToString:@"get_stats"])             return tool_get_stats(args);
     if ([name isEqualToString:@"query_events"])          return tool_query_events(args);
+    if ([name isEqualToString:@"wait_events"])           return tool_wait_events(args);
+    if ([name isEqualToString:@"agent_ping"])            return tool_agent_ping(args);
     if ([name isEqualToString:@"correlate_request"])     return tool_correlate_request(args);
     if ([name isEqualToString:@"get_event"])             return tool_get_event(args);
     if ([name isEqualToString:@"export_events"])         return tool_export_events(args);

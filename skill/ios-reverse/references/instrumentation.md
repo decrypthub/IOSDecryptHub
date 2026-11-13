@@ -38,10 +38,12 @@ win x5 @0x2812c67f0 = 160 bytes: 0000000000000000...
 
 要点：
 
-- 寄存器 `x0..x8`，`:N` 是字节数，省略则用 `capture_max_bytes`
+- 寄存器 `x0..x8`，`:N` 是字节数，省略则用 `capture_max_bytes`（没配 `capture_memory` 时默认 256）
 - 地址 < 4GB 的窗口会被跳过（不是 0 就是无效指针）
 - 全部读失败会打印 `win [<spec>] unreadable`，**这本身就是信息**：说明这些寄存器此刻不是指针
-- 一个 inline 目标只能装一个 hook，且槽位不回收——**一次抓全，别逐个试**
+- 一个 inline 目标只能装一个 hook；换观察点用 `unhook{hard:true}` + 重装（秒级），
+  只有入口字节被第三方改动或 `patched_len != saved_len` 才需要重启目标
+- 规格总长上限 95 字符；合法组合最多 9 个窗口（`x0..x8`），实际很难超
 
 ## capture_after（出参缓冲来自入参寄存器）
 
@@ -54,7 +56,8 @@ hook_inline {
 ```
 
 `capture_after` 让 handler 在**原函数返回后**才去读 `x{ptr_arg}` 指向的缓冲。
-典型场景：`CCHmac(alg, key, keyLen, data, dataLen, out)` —— `out` 是第 6 个参数（`x7`）。
+典型场景：`CCHmac(algorithm, key, keyLength, data, dataLength, macOut)` ——
+6 个参数，`macOut` 是**第 6 个、`x5`**。
 
 要点：
 
@@ -86,6 +89,7 @@ ret x1 @0x281dde8b0 = 600 bytes: 91c34af6a1410000...
 - 只作用于 post 路径（会强制打开 `capture_return`）
 - 读的是**返回后**的寄存器快照，所以 `x0`/`x1` 都是返回值
 - 同样受 `capture_max_bytes` 上限约束
+- 关掉时传空串；`dh_thunk_sync_post` 会重算 post 标记，不会留下多余的栈帧
 
 ## objc_call（主动调用，不装 hook）
 
@@ -100,7 +104,7 @@ objc_call {
 }
 ```
 
-- `args` 按顺序编组，字符串直接给，`null` → nil
+- `args` 按顺序编组（最多 6 个），字符串直接给，`null` → nil
 - `{"$intptr": N}` → 分配一个 int32 初值 N，传它的**地址**，返回值在 `out_params.argN_int`
 - `class_method: true` 表示调用 `+method`（类方法）
 - 实例方法要传 `object`（地址），不是 `class`
@@ -110,14 +114,38 @@ objc_call {
 
 ## 组合示例：一次调用拿全
 
-```
+```json
 hook_inline {
   "addr": "0x1045a1234",
   "label": "sign",
-  "capture_multi": "x0:96,x3:64,x5:200",     // 入参、输入缓冲、配置对象
-  "capture_ret_multi": "x1:600",              // 返回的缓冲
+  "capture_multi": "x0:96,x3:64,x5:200",
+  "capture_ret_multi": "x1:600",
   "capture_return": true
 }
 ```
 
-一条事件里就能看到「进去什么、出来什么」，不用反复重启进程。
+一条事件里就能看到「进去什么、出来什么」，省掉一轮卸载重装。
+
+## 两套拼写，别搞混
+
+这是历史上真实花掉几小时、而且**不报错**的坑：
+
+| 工具 | 类方法参数 | 传错会怎样 |
+|---|---|---|
+| `objc_call` | `class_method`（下划线） | — |
+| `hook_method` | `classMethod`（驼峰） | 静默按实例方法处理，最后报 `class 'X' or its instance method 'Y' not found`，看起来像「这个方法不存在」 |
+
+`hook_method` 的完整参数：
+
+```json
+hook_method {
+  "class": "JDGB_unquilleted",
+  "selector": "maHWP__unpliableness:errCode:",
+  "classMethod": true,
+  "capture_return": true,
+  "capture_multi": "x2:64,x3:64"
+}
+```
+
+排查提示：如果你确定 `+method` 存在却报 "instance method not found"，
+第一件事是检查是不是把 `classMethod` 写成了 `class_method`。

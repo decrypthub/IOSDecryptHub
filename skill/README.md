@@ -1,7 +1,7 @@
 # IDH 逆向 Skill 索引
 
 给接手 iOS 目标 App 协议/算法逆向的 Agent 用。这里记录的不是「工具怎么调」——那些
-`analysis_guide` 会给——而是**判断顺序**和**踩过的坑**，目的是让你少走几小时的弯路。
+`get_capabilities` 会给——这里记的是**判断顺序**和**踩过的坑**，目的是让你少走几小时的弯路。
 
 ## 先读哪个
 
@@ -21,11 +21,11 @@
 ## 工具入口
 
 - 设备侧：`POST http://<device>:8088/api/mcp`，JSON-RPC 2.0 `tools/call`
-- 先 `analysis_guide(topic="start")`，再 `process_list` + `capabilities`
+- 先 `get_capabilities`（有哪些 op、槽位/抓取上限），再 `get_stats`（process.pid）与 `list_loaded_images`
 - 每次重启目标 App 后**必须重新取 slide**（`get_macho_info` 的 `load_address`），
   用旧 slide 算出来的地址会读到完全无关的代码——我因此误判过一次「二进制自解密改写代码段」
 
 ## 版本
 
-对应 IDH 1.28.24+。`capture_multi` / `capture_ret_multi` / `objc_call` 的
+对应 IDH 1.28.25+。`capture_multi` / `capture_ret_multi` / `objc_call` 的
 `{"$intptr":N}` 都是这一轮加的能力，更老的包没有。

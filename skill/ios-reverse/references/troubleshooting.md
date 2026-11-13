@@ -13,15 +13,15 @@
 list_hooks                    # 看有没有同名的两个槽位
 ```
 
-1.28.15 起 core 会返回 `-(slot+10)` 精确带出已有槽位，MCP 层返回 `reused:true`。
+1.28.19 起 core 会返回 `-(slot+10)` 精确带出已有槽位，MCP 层返回 `reused:true`。
 但**复用分支不会重新装**，只是改配置。
 
-**再查 `native_hook status` 的 verdict。** 有 `fired` / `installed-never-fired`
-两种，后者说明装上了但目标没走到。
+**再查 `list_hooks` 的 `enabled` 与 `hits`。** `enabled:true` 但 `hits:0` 说明装上了但目标没走到；
+`enabled:false` 说明槽位被停了。
 
 ## `already inline-hooked at slot N`
 
-同一地址只能有一个 inline hook，槽位不回收。换配置必须：
+同一地址只能有一个 inline hook。**换配置不用重启进程** —— hard unhook 会恢复原始字节并退休槽位，同目标重装会复用原槽位与原 Dobby 蹦床：
 
 ```
 unhook {slot: N, hard: true}    # 恢复原始字节，槽位退休
@@ -34,7 +34,7 @@ hook_inline {addr: ..., ...}    # 重新装
 
 ## 引擎失联 / RemoteDisconnected
 
-目标 App 崩了或 dylib 崩了。重新 `process_list` 看会话还在不在；
+目标 App 崩了或 dylib 崩了。重新 `get_stats`（返回 process.pid）/ `list_loaded_images` 看会话还在不在；
 不在就重启 App：
 
 ```bash
@@ -50,7 +50,7 @@ uiopen -b <bundleId>
 
 ## `{"$intptr":N}` 崩宿主
 
-1.28.18 及以前：`objc_call` 里 `id argv[8]` 默认 `__strong`，
+1.28.17 及以前（1.28.18 这个版本号从未存在）：`objc_call` 里 `id argv[8]` 默认 `__strong`，
 把栈上 `int` 的地址当 `id` 赋值会触发 `objc_storeStrong` → retain 读 isa → SIGSEGV，
 **崩在赋值语句本身**，走不到方法调用。
 
@@ -84,16 +84,21 @@ get_stats        # 或 dpkg -s com.iosdecrypthub
 list_hooks        # capture_multi 字段应该原样回显你设的规格
 ```
 
-## capture_multi 报「语法非法」但看起来没问题
+## capture_multi 报「语法非法」或「过长」
 
-规格总长上限 95 字节（`char[96]`）。12 个窗口很容易超。
+规格总长上限 95 字符（`char[96]`）。合法组合最多 **9** 个窗口（`x0..x8`），
+每个最长 `"x8:8192"` 7 字符 + 8 个逗号 = **71 字符**，正常写不满。
 
-```
-"x0:64,x1:64,x2:64,x3:64,x4:64,x5:64,x6:64,x7:64,x8:64"   # 71 字节，可以
-再翻倍                                                      # 超了
-```
+所以看到「过长」几乎一定是别的原因：传了非 ASCII 字符、或者把两段规格拼在一起了。
 
-超长会单独报「过长 N 字节, 上限 95」，不会和语法错误混在一起。
+语法错误则通常是：
+
+- 寄存器超出 `x0..x8`（`x9` 会被拒）
+- `:` 后面不是数字（`"x0:"`、`"x0:abc"`）
+- 多余段（`"x0:64:extra"` 会被拒，不再静默忽略）
+
+错误文案会指出**是哪个参数**失败（`capture_multi` 还是 `capture_ret_multi`），
+照它改就行。
 
 ## 编译期 / 编辑期的坑
 

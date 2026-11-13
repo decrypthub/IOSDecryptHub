@@ -9,7 +9,7 @@ description: 用 IDH（IOSDecryptHubJB）对 iOS 目标 App 做协议/算法逆�
 
 iOS App 的签名/加密参数（`X-Sign`、`jdgs`、`mtgsig` 这类）几乎都是：
 某个 ObjC 类方法或 C 函数，吃进去若干字符串/字典，吐出一个十六进制或 base64 串。
-难点不在「找到那个函数」（`list_images` + `objc_enum` + 交叉引用通常够），
+难点不在「找到那个函数」（`list_images` + `find_objc_methods` + 交叉引用通常够），
 而在于三件事：
 
 1. **证明它真的被执行了**——静态存在的代码不等于运行时走到的代码
@@ -21,8 +21,8 @@ iOS App 的签名/加密参数（`X-Sign`、`jdgs`、`mtgsig` 这类）几乎都
 ## 1. 先建立目标模型（不要急着 hook）
 
 ```
-process_list                      # 选对进程（App 常有多个 :xxx 子进程）
-capabilities                      # 这个 agent 支持哪些 op、槽位上限、抓取上限
+get_stats                      # 选对进程（App 常有多个 :xxx 子进程）
+get_capabilities                  # 这个 agent 支持哪些 op、槽位上限、抓取上限
 get_macho_info                    # 拿 load_address = slide 基准，记下来
 list_images                       # 主二进制叫什么、多大、cryptid 是否加密
 ```
@@ -34,10 +34,10 @@ list_images                       # 主二进制叫什么、多大、cryptid 是
 
 按可靠性从高到低：
 
-1. **`objc_enum` / `objc_dump_ivars`** — 类名/方法名本身带语义（`sign`、`encrypt`、`token`）
-2. **`list_imports` + `native_symbols`** — 目标用了 `CCCrypt`/`CC_SHA256` 就走系统加密库，好办
-3. **字符串交叉引用** — `list_strings` 找错误文案/URL/参数名，再找引用它的函数
-4. **`dex_search` 式的关键词**（iOS 上没有 dex，用 `memory_search` 搜明文）
+1. **`find_objc_methods` / `objc_dump_ivars`** — 类名/方法名本身带语义（`sign`、`encrypt`、`token`）
+2. **`list_imports` + `resolve_symbol` / `symbolicate`** — 目标用了 `CCCrypt`/`CC_SHA256` 就走系统加密库，好办
+3. **字符串交叉引用** — `search_memory` / `find_string_refs` 找错误文案/URL/参数名，再找引用它的函数
+4. **`search_memory` 搜明文**（iOS 上没有 dex，用 `search_memory` 搜明文）
 
 找不到就说明它被混淆了：名字被抹掉、字符串加密、或者干脆是自研 VM。
 这时不要硬啃反汇编，**直接进第 3 步做运行时观测**。
@@ -60,7 +60,7 @@ list_hooks                          # 看 hits 是不是 > 0
 |---|---|
 | 地址算错了（slide 过期） | 重新 `get_macho_info` 核对 |
 | 函数没被调用 | 换一个确定会走的分支触发 |
-| hook 装失败但返回了成功 | `list_hooks` 看 enabled / `native_hook status` 看 verdict |
+| hook 装失败但返回了成功 | `list_hooks` 看 enabled / `list_hooks` 看 enabled / hits |
 | 装了但被别的 hook 抢了 | 同一符号重复装时 GOT 只指向最后一个槽位 |
 
 ### 3.2 同轮对照
@@ -96,6 +96,7 @@ list_hooks                          # 看 hits 是不是 > 0
 读到 `0x0` 一直失败——正确做法是用 `capture_ret_multi` 或换 `ptr_arg`。
 
 ### 4.3 ObjC 方法的寄存器约定
+
 
 `x0 = self`，`x1 = _cmd`，`x2..x8` = 方法参数。
 所以「第一个参数」是 `x2` 不是 `x0`。写 `ptr_arg:0` 抓的是对象头。
