@@ -241,7 +241,7 @@ static NSArray *dh_capture_spec(const char *specRaw, uint64_t *gpr, int defaultM
 static void dh_render_windows(NSMutableString *d, const char *spec, _Atomic int *ready,
                               uint64_t *gpr, int defaultMax, NSString *tag) {
     int sq1 = atomic_load_explicit(ready, memory_order_acquire);
-    if (sq1 != 1 || !spec[0]) return;
+    if (sq1 == 0 || (sq1 & 1) || !spec[0]) return;   // 0=从未设置, 奇数=写作中
     NSArray *wins = dh_capture_spec(spec, gpr, defaultMax);
     static const char hexd[] = "0123456789abcdef";
     for (NSDictionary *w in wins) {
@@ -281,11 +281,12 @@ static NSArray *dh_capture_spec(const char *specRaw, uint64_t *gpr, int defaultM
                          [NSCharacterSet whitespaceCharacterSet]];
         if (!tok.length) continue;
         NSArray *parts = [tok componentsSeparatedByString:@":"];
+        if (parts.count > 2) continue;   // 多余段直接拒绝, 不静默忽略
         NSString *regPart = parts[0];
         if (regPart.length && ([regPart characterAtIndex:0] == 'x' || [regPart characterAtIndex:0] == 'X'))
             regPart = [regPart substringFromIndex:1];
         // 严格数字校验: 只靠 intValue 会把 "abc" 当成 0 去抓 x0。
-        NSCharacterSet *nonDigits = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
+        NSCharacterSet *nonDigits = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
         if (!regPart.length || [regPart rangeOfCharacterFromSet:nonDigits].location != NSNotFound) continue;
         int reg = [regPart intValue];
         if (reg < 0 || reg > 8) continue;
@@ -295,7 +296,11 @@ static NSArray *dh_capture_spec(const char *specRaw, uint64_t *gpr, int defaultM
             if (!n.length || [n rangeOfCharacterFromSet:nonDigits].location != NSNotFound) continue;
             want = [n intValue];
         }
-        if (want <= 0 || want > DH_THUNK_CAPTURE_MAX) want = DH_THUNK_CAPTURE_MAX;
+        // 未配 capture_memory 时 capture_max_bytes 是 0。此时不能钳到 CAPTURE_MAX(8192):
+        // 省略 :N 的窗口会变成 8KB/个, 4 个窗口就是 32KB 的 vm_read + 64K 字符 hex,
+        // 全在目标 App 的命中线程上跑, 而事件 detail 上限只有 8KB —— 又慢又拿不到数据。
+        if (want <= 0) want = 256;
+        if (want > DH_THUNK_CAPTURE_MAX) want = DH_THUNK_CAPTURE_MAX;
         uint64_t addr = gpr[reg];
         if (addr < 0x100000000ULL) continue;
         void *buf = malloc((size_t)want);
@@ -895,6 +900,9 @@ int dh_thunk_set_capture(int slot, int ptr_arg, int len_arg, int max_bytes) {   
     return 0;
 }
 
+
+static void dh_thunk_sync_post(int slot);   // 统一重算 post 标记, 定义见下
+
 int dh_thunk_set_return(int slot, int on) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
@@ -902,7 +910,7 @@ int dh_thunk_set_return(int slot, int on) {
     if (atomic_load_explicit(&s->retired, memory_order_relaxed)) return -1;
     // 先写槽位字段再发布汇编可见的标记位 (release), 保证 handler 看到 1 时字段已就绪。
     atomic_store_explicit(&s->capture_return, on ? 1 : 0, memory_order_relaxed);
-    g_dh_thunk_post[slot] = on ? 1 : 0;
+    dh_thunk_sync_post(slot);
     return 0;
 }
 
@@ -916,10 +924,8 @@ int dh_thunk_set_capture_after(int slot, int on) {
     // 只开 after 而不配 capture_memory 是悬空语义(没有 ptr_arg 可读), 直接拒绝而不是让它静默什么都不做。
     if (on && atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire) < 0) return -2;
     atomic_store_explicit(&s->capture_after, on ? 1 : 0, memory_order_relaxed);
-    if (on) {   // 输出缓冲只有返回后才有内容, 必须同时打开 post 路径
-        atomic_store_explicit(&s->capture_return, 1, memory_order_relaxed);
-        g_dh_thunk_post[slot] = 1;
-    }
+    // 输出缓冲只有返回后才有内容, 必须走 post 路径 —— 由 sync_post 统一决定
+    dh_thunk_sync_post(slot);
     return 0;
 }
 // 多窗口抓取: 一次 hook 同时观察多个寄存器指向的内存。
@@ -952,6 +958,20 @@ int dh_thunk_validate_capture_multi(const char *spec) {
     return 0;
 }
 
+// 统一重算 post 标记: 三个能力(capture_return / capture_after / capture_ret_multi)
+// 都需要 post 路径(多留一层栈帧到原函数返回)。任一开着就必须走 post, 全关才恢复尾调用。
+// 为什么必须集中算: 各 setter 单独置位会导致「关掉 A 却把 B 需要的 post 也关了」,
+// 或者「关掉 ret_multi 后 post 永久留着」—— 后者会让槽位再也回不到尾调用,
+// 而 inline 槽位不回收, 用户只能重启目标进程。
+static void dh_thunk_sync_post(int slot) {
+    if (slot < 0 || slot >= DH_THUNK_COUNT) return;
+    dh_slot_t *s = &g_slots[slot];
+    int need = atomic_load_explicit(&s->capture_return, memory_order_relaxed)
+            || atomic_load_explicit(&s->capture_after, memory_order_relaxed)
+            || atomic_load_explicit(&s->capture_ret_multi_ready, memory_order_acquire) != 0;
+    g_dh_thunk_post[slot] = need ? 1 : 0;
+}
+
 int dh_thunk_set_capture_multi(int slot, const char *spec) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
@@ -966,9 +986,11 @@ int dh_thunk_set_capture_multi(int slot, const char *spec) {
     // 用 seqlock 语义而不是 check-then-act: 写端把 ready 从 1 推到 2 (写作中),
     // 拷完再推到 1; 读端读两次 ready, 前后都是 1 且相等才认为读到的是完整串。
     // 原来的「清 0 → 写 → 置 1」在「读端已看到 1、正要去读」时挡不住撕裂。
-    atomic_store_explicit(&s->capture_multi_ready, 2, memory_order_release);
+    // 版本号语义: 写端每次 +2 (稳定值恒为偶数, 写作中为奇数)。
+    // 只比较「值是否相同」检测不到同值重写(1→2→1 读端首尾都是 1), 用递增版本号才行。
+    atomic_fetch_add_explicit(&s->capture_multi_ready, 1, memory_order_acq_rel);
     strlcpy(s->capture_multi, spec, sizeof(s->capture_multi));
-    atomic_store_explicit(&s->capture_multi_ready, 1, memory_order_release);
+    atomic_fetch_add_explicit(&s->capture_multi_ready, 1, memory_order_release);
     return 0;
 }
 
@@ -983,14 +1005,13 @@ int dh_thunk_set_capture_ret_multi(int slot, const char *spec) {
     if (!spec || !spec[0]) {
         atomic_store_explicit(&s->capture_ret_multi_ready, 0, memory_order_release);
         s->capture_ret_multi[0] = 0;
+        dh_thunk_sync_post(slot);
         return 0;
     }
-    atomic_store_explicit(&s->capture_ret_multi_ready, 2, memory_order_release);
+    atomic_fetch_add_explicit(&s->capture_ret_multi_ready, 1, memory_order_acq_rel);
     strlcpy(s->capture_ret_multi, spec, sizeof(s->capture_ret_multi));
-    atomic_store_explicit(&s->capture_ret_multi_ready, 1, memory_order_release);
-    // 返回值只有 post 路径才有
-    atomic_store_explicit(&s->capture_return, 1, memory_order_relaxed);
-    g_dh_thunk_post[slot] = 1;
+    atomic_fetch_add_explicit(&s->capture_ret_multi_ready, 1, memory_order_release);
+    dh_thunk_sync_post(slot);
     return 0;
 }
 
@@ -1076,10 +1097,16 @@ int dh_thunk_list(dh_hook_info *out, int max) {
         out[n].name    = g_slots[i].name;
         // capture_multi 必须回填: 否则 list_hooks 看不到多窗口配置, 用户没法自查是否真的生效。
         // capture_multi 回填前必须确认 ready: 否则可能报出一个用户从没设过、或写了一半的规格。
-        if (atomic_load_explicit(&g_slots[i].capture_multi_ready, memory_order_acquire) == 1)
+        int cmv = atomic_load_explicit(&g_slots[i].capture_multi_ready, memory_order_acquire);
+        if (cmv != 0 && !(cmv & 1))
             strlcpy(out[n].capture_multi, g_slots[i].capture_multi, sizeof(out[n].capture_multi));
         else
             out[n].capture_multi[0] = 0;
+        int crv = atomic_load_explicit(&g_slots[i].capture_ret_multi_ready, memory_order_acquire);
+        if (crv != 0 && !(crv & 1))
+            strlcpy(out[n].capture_ret_multi, g_slots[i].capture_ret_multi, sizeof(out[n].capture_ret_multi));
+        else
+            out[n].capture_ret_multi[0] = 0;
         out[n].capture_ptr_arg   = atomic_load_explicit(&g_slots[i].capture_ptr_arg, memory_order_acquire);
         out[n].capture_len_arg   = atomic_load_explicit(&g_slots[i].capture_len_arg, memory_order_relaxed);
         out[n].capture_max_bytes = atomic_load_explicit(&g_slots[i].capture_max_bytes, memory_order_relaxed);

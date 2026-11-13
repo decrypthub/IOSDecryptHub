@@ -1693,9 +1693,10 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
         NSString *pre = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
         NSString *preR = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
     int pv = dh_thunk_validate_capture_multi(pre.UTF8String);
-    if (pv == 0) pv = dh_thunk_validate_capture_multi(preR.UTF8String);
-        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pre.length]);
-        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pre]);
+    NSString *pvBad = pre;
+    if (pv == 0) { pv = dh_thunk_validate_capture_multi(preR.UTF8String); pvBad = preR; }
+        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pvBad.length]);
+        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pvBad]);
     }
     int slot = dh_thunk_install_import(sym.UTF8String, label.UTF8String);
     if (slot <= -10) {
@@ -1718,10 +1719,18 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
             // 先用纯校验函数查规格，不合法就直接返回，槽位保持原状。
             NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
             if (dh_thunk_validate_capture_multi(capMulti.UTF8String) != 0)
-                return tool_err([NSString stringWithFormat:@"capture_multi 非法: %@。只接受 x0..x8 加可选 :N（每段最长 95 字节），逗号分隔，例如 x0:64,x3:32；已有 hook 未受影响", capMulti]);
+                return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 非法: %@。只接受 x0..x8 加可选 :N（每段最长 95 字节），逗号分隔，例如 x0:64,x3:32；已有 hook 未受影响", capMulti]);
             if (capMulti.length && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0)
                 return tool_err(@"capture_multi 应用失败（规格已通过校验，说明槽位状态异常）");
             if (capMulti.length) r[@"capture_multi"] = capMulti;
+            // capture_ret_multi 也必须在这里处理: 漏掉的话对已 hook 的符号补窗口会返回
+            // ok:true + reused:true 但一条 ret 都不产生 —— 又是一种假成功。
+            NSString *capRet = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
+            if (dh_thunk_validate_capture_multi(capRet.UTF8String) != 0)
+                return tool_err([NSString stringWithFormat:@"capture_ret_multi 非法: %@。语法同 capture_multi；已有 hook 未受影响", capRet]);
+            if (capRet.length && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
+                return tool_err(@"capture_ret_multi 应用失败（规格已通过校验，说明槽位状态异常）");
+            if (capRet.length) r[@"capture_ret_multi"] = capRet;
             if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) == 0)
                 r[@"capture"] = @{@"ptr_arg": @(capPtr), @"len_arg": @(capLen), @"max_bytes": @(capMax)};
             return tool_ok(r);
@@ -1762,6 +1771,7 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
                                     : @"record-only; events land in category 'other' as algorithm 'import-hook'. 传 describe_args:true 可尝试记录字符串参数(如 getaddrinfo 域名/dlopen 路径)。"} mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
     if (capMulti.length) { res[@"capture_multi"] = capMulti; }
+    if (capRet.length) { res[@"capture_ret_multi"] = capRet; }
 
     if (capEcho) {
         res[@"capture"] = capEcho;
@@ -1814,9 +1824,10 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
         NSString *pre = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
         NSString *preR = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
     int pv = dh_thunk_validate_capture_multi(pre.UTF8String);
-    if (pv == 0) pv = dh_thunk_validate_capture_multi(preR.UTF8String);
-        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pre.length]);
-        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pre]);
+    NSString *pvBad = pre;
+    if (pv == 0) { pv = dh_thunk_validate_capture_multi(preR.UTF8String); pvBad = preR; }
+        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pvBad.length]);
+        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pvBad]);
     }
     int slot = dh_thunk_install_inline(
         module.length ? module.UTF8String : NULL,
@@ -1868,6 +1879,7 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
     } mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
     if (capMulti.length) { res[@"capture_multi"] = capMulti; }
+    if (capRet.length) { res[@"capture_ret_multi"] = capRet; }
 
     if (capEcho) {
         res[@"capture"] = capEcho;
@@ -1932,9 +1944,10 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
         NSString *pre = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
         NSString *preR = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
     int pv = dh_thunk_validate_capture_multi(pre.UTF8String);
-    if (pv == 0) pv = dh_thunk_validate_capture_multi(preR.UTF8String);
-        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pre.length]);
-        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pre]);
+    NSString *pvBad = pre;
+    if (pv == 0) { pv = dh_thunk_validate_capture_multi(preR.UTF8String); pvBad = preR; }
+        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pvBad.length]);
+        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pvBad]);
     }
     int slot = dh_thunk_install_method(cls.UTF8String, sel.UTF8String, classMethod ? 1 : 0);
     if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
@@ -1975,6 +1988,7 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
                                     : @"record-only; events land in category 'other' as algorithm 'objc-hook'. 传 describe_args:true 可直接记录参数内容。"} mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
     if (capMulti.length) { res[@"capture_multi"] = capMulti; }
+    if (capRet.length) { res[@"capture_ret_multi"] = capRet; }
 
     if (capEcho) {
         res[@"capture"] = capEcho;
@@ -2002,6 +2016,7 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
             @"capture_return": info[i].capture_return ? @YES : @NO,
             @"capture_after":  info[i].capture_after ? @YES : @NO,
             @"capture_multi":  info[i].capture_multi[0] ? @(info[i].capture_multi) : @"",
+            @"capture_ret_multi": info[i].capture_ret_multi[0] ? @(info[i].capture_ret_multi) : @"",
         } mutableCopy];
         NSDictionary *cap = dh_capture_echo(info[i].capture_ptr_arg, info[i].capture_len_arg,
                                             info[i].capture_max_bytes);

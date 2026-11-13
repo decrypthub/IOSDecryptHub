@@ -45,6 +45,7 @@ typedef struct {
     int          capture_len_arg;   // >=0: 从该寄存器位置取长度; -1: 用 capture_max_bytes 固定长度
     int          capture_max_bytes; // 单次最多抓多少字节
     char         capture_multi[96]; // 多窗口抓取规格: "x0:64,x3:32,x5:128" (空=关闭)
+    char         capture_ret_multi[96]; // 返回值寄存器的多窗口(仅 post 路径)
 } dh_hook_info;
 
 // 装导入符号 hook。symbol 去前导下划线的名字(与 list_imports 一致); label 可为 NULL。
