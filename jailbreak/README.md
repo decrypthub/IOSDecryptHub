@@ -1,7 +1,7 @@
-# 旧跨仓打包入口（迁移参考）
+# 越狱整包兼容入口
 
-本目录来自旧引擎仓，原流程是先编译 dylib 再复制到并列 IOSDecryptHubJB 打包。新项目已经是独立 IOSDecryptHubJB，该流程不再作为正式交付方式。
+本目录保留旧命令入口，统一转交本仓根目录的完整构建：`all` → `make deb`、`rootless` → `make deb-rootless`、`roothide` → `make deb-roothide`。
 
-组织正式仓的完整 v1 Makefile 与根目录 `build_deb.sh` 已恢复，本仓 `make deb` 可自动构建并打包 Manager、Loader、引擎和一次性 updater。它不是本文旧跨仓脚本；未来常驻服务与整包升级仍需在此基线上改造。
+本仓 `make deb` 自动编译并打包 Manager、Loader、引擎与 updater。准备 Dobby/QBDI 依赖、完整构建和验证步骤见 [README](../README.md)。兼容脚本不会修改版本、从巨魔仓复制引擎或把产物同步到另一套源码。
 
-产品与实施正本：[PRODUCT_ARCHITECTURE.md](../docs/PRODUCT_ARCHITECTURE.md)。旧脚本保留作迁移历史，正式流水线实现时替换，不跨仓写入另一套引擎。
+产品与实施正本：[PRODUCT_ARCHITECTURE.md](../docs/PRODUCT_ARCHITECTURE.md)。

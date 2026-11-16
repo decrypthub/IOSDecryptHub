@@ -1,4 +1,4 @@
-# IOSDecryptHubJB 架构边界
+# IOSDecryptHub 越狱版架构边界
 
 2026-10-25。完整架构与阶段验收以 [PRODUCT_ARCHITECTURE.md](./PRODUCT_ARCHITECTURE.md) 为准。
 

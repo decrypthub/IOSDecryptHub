@@ -63,7 +63,7 @@ echo "[前置] $HOST  prefix=${PREFIX:-/}"
 
 PKG_VERSION="$("${SSH[@]}" "dpkg -l com.iosdecrypthub 2>/dev/null | tail -1" | tr -s ' ' | cut -d' ' -f3)"
 [ -n "$PKG_VERSION" ] || { echo "设备上没有 com.iosdecrypthub；先装包：
-  ./scripts/device_install.sh --host $HOST --pkg IOSDecryptHubJB/build/deb/com.iosdecrypthub_1.24.11_rootless.deb"; exit 2; }
+  ./scripts/device_install.sh --host $HOST --pkg '$ROOT/build/deb/com.iosdecrypthub_<version>_rootless.deb'"; exit 2; }
 ok "主包已安装 (版本 $PKG_VERSION)"
 
 "${SSH[@]}" "[ -d '$APP_DIR/$APP_NAME.app' ]" || { echo "测试宿主未安装；先执行：

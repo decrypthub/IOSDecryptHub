@@ -1,4 +1,4 @@
-# IOSDecryptHubJB 手机 Manager UI 规格
+# IOSDecryptHub 越狱版手机 Manager UI 规格
 
 日期：2026-10-25。状态：交互规格，尚未实现新版页面。架构正本：[PRODUCT_ARCHITECTURE.md](./PRODUCT_ARCHITECTURE.md)。
 
