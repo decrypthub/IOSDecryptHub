@@ -444,7 +444,7 @@ BOOL DHWriteStopRequest(NSString *bundleID) {
 
 #pragma mark - 历史版本
 
-#define DH_RELEASES_API @"https://api.github.com/repos/decrypthub/IOSDecryptHubJB/releases?per_page=30"
+#define DH_RELEASES_API @"https://api.github.com/repos/decrypthub/IOSDecryptHub/releases?per_page=30"
 
 void DHFetchReleases(void (^completion)(NSArray<NSDictionary *> *_Nullable, NSError *_Nullable)) {
     NSURL *url = [NSURL URLWithString:DH_RELEASES_API];

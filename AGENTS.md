@@ -1,4 +1,4 @@
-# AGENTS.md — IOSDecryptHubJB 独立越狱项目
+# AGENTS.md — IOSDecryptHub 越狱主仓
 
 Always respond in Chinese-simplified.
 
@@ -8,12 +8,12 @@ Always respond in Chinese-simplified.
 2. `docs/PROGRESS.md`：当前实现/验证状态。
 3. 涉及 UI 读 `docs/MANAGER_UI.md`，涉及 Hook / Trace 读 `docs/HOOK_AND_TRACE_DESIGN.md`。
 4. 按用户要求先读本机该项目 Claude memory 索引，再用代码和现场状态核对记忆。
-5. 既有公开 v1 源码在 `https://github.com/decrypthub/IOSDecryptHub`（本机只读参考 remote：`legacy-public`），包含 app/、daemon/、src/loader.m、build_deb.sh 与 release workflow。开始重做组件前先核对，不把“本工作树没有”误认为“产品从未实现”。
+5. 本仓 `https://github.com/decrypthub/IOSDecryptHub` 自 2026-11-16 承接原 IOSDecryptHubJB 越狱主线。既有 v1 源码和发布历史保留；历史文档中的 `legacy-public/main` 指本仓整合前的 `a94a396`，不再是另一个活动产品仓。见 `docs/REPOSITORY_CONSOLIDATION_2026-11-16.md`。
 6. `docs/BASELINE_AUDIT_2026-10-26.md`：已校正的正式基线、完整组件、线上哈希与验证范围。不能仅凭 VERSION 一样就认为与正式代码一致。
 
 ## 产品定位
 
-- 本仓库是 IOSDecryptHubJB，只维护越狱版；巨魔版位于独立 IOSDecryptHub 仓库。
+- 本仓库是 IOSDecryptHub，只维护越狱版；巨魔版位于独立 IOSDecryptHubTrollStore 仓库。旧 IOSDecryptHubJB 不再作为开发或发布入口。
 - 所有本产品仓库均在 decrypthub 组织公开维护；不另建个人私有工作仓作为版本真相。
 - 使用自己的 main、版本和发布，不把巨魔仓的 jailbreak 分支作为开发入口。
 - 对用户只交付整包 deb，包含 daemon + Manager + Loader + Agent + 必需资源。内部 dylib 由整包任务自动编译，不需要从另一个项目手工构建或复制。

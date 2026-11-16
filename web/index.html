@@ -690,7 +690,7 @@
   <div class='modal'>
     <h3>审查日志<span class='diag-boards' id='diagBoards'></span><span class='spacer'></span>
       <button id='diagCopy'>复制</button><button id='diagIssue' class='issue' title='复制审查日志并打开 GitHub Issue'>提交 Issue</button><button id='diagDownload'>下载</button><button id='diagRefresh'>刷新</button><button id='diagClose'>关闭</button></h3>
-    <div class='diag-hint' id='diagHint'>发现问题？复制上方审查日志，到 <a id='diagRepoLink' href='https://github.com/decrypthub/IOSDecryptHubJB/issues/new/choose' target='_blank' rel='noopener'>GitHub 提交 Issue</a>，帮助我们自主进化改进。审查日志含版本与 hook 健康状态，不含加解密明文。</div>
+    <div class='diag-hint' id='diagHint'>发现问题？复制上方审查日志，到 <a id='diagRepoLink' href='https://github.com/decrypthub/IOSDecryptHub/issues/new/choose' target='_blank' rel='noopener'>GitHub 提交 Issue</a>，帮助我们自主进化改进。审查日志含版本与 hook 健康状态，不含加解密明文。</div>
     <pre id='diagBody'>加载中…</pre>
   </div>
 </div>
@@ -879,7 +879,7 @@
 </div>
 <div class='toast' id='toast'></div>
 <script>
-  const GITHUB_REPO = 'decrypthub/IOSDecryptHubJB';
+  const GITHUB_REPO = 'decrypthub/IOSDecryptHub';
   const CAT_NAMES = ['摘要','HMAC','对称','非对称','文件','系统','其它'];
   // 分类短名: 兜底值; 后端 /api/stats.categoryNames 到达后覆盖(单一真相源在后端分类表)。
   let CAT_CLS     = ['digest','hmac','sym','asym','file','sys','net','keychain','other'];

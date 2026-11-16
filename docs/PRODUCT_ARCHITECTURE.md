@@ -1,11 +1,13 @@
-# IOSDecryptHubJB：独立项目、手机常驻服务与整包交付
+# IOSDecryptHub：越狱项目、手机常驻服务与整包交付
+
+> 2026-11-16 仓库归属更新：越狱版正式主仓为 `decrypthub/IOSDecryptHub`，承接原 IOSDecryptHubJB 全部开发历史；巨魔版为 `decrypthub/IOSDecryptHubTrollStore`。下文带日期的旧仓归属、`legacy-public` 与“旧公开仓不覆盖”描述保留为迁移历史，不再代表当前开发入口。产品边界与验收要求不变，详见 [仓库整合说明](./REPOSITORY_CONSOLIDATION_2026-11-16.md)。
 
 日期：2026-10-25。状态：架构与产品交付设计，尚未实现新版守护程序 / Manager / 整包构建。
 
 ## 1. 最终产品边界
 
-- `IOSDecryptHub`：巨魔版独立项目，能力基本定型，维护现有注入和 Web / MCP 形态。
-- `IOSDecryptHubJB`：越狱版独立项目，本仓库；使用自己的 `main`、版本、构建、测试和发布。
+- `IOSDecryptHubTrollStore`：巨魔版独立项目，能力基本定型，维护现有注入和 Web / MCP 形态。
+- `IOSDecryptHub`：越狱版独立项目，本仓库；使用自己的 `main`、版本、构建、测试和发布。
 - 不再通过巨魔仓的 `jailbreak` 分支开发产品，也不再要求从巨魔仓先编译 dylib、复制进越狱仓后打包。
 - 越狱用户安装 **一个 deb 整包**，包含常驻服务、手机管理 App、注入加载器、采集 Agent、Web 资源和包维护脚本。rootless / RootHide 各生成适配本环境的一份整包，不是拆成用户需要手工拼装的多个组件。
 - dylib 仍是注入到目标进程所需的内部二进制，由整包任务自动编译、签名、校验并装入 deb，不单独作为用户的下载、构建或更新步骤。

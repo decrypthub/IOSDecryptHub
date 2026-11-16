@@ -108,7 +108,7 @@ PYEOF
     [ -f sim_uitest/AppIcon60x60@2x.png ] && cp sim_uitest/AppIcon60x60@2x.png "$APP_BUNDLE/"
     # 用与产品 App（IOSDecryptHubManager）完全相同的 entitlement 签名：
     # 只有这样，宿主里跑出来的"能否写越狱路径"结论才等于 App 的处境。
-    APP_ENT="$ROOT/../IOSDecryptHubJB/app/entitlements.plist"
+    APP_ENT="$ROOT/app/entitlements.plist"
     if [ -f "$APP_ENT" ]; then
         "$LDid" -S"$APP_ENT" "$APP_BUNDLE/$APP_NAME"
     else

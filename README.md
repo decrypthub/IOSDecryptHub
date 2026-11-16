@@ -1,20 +1,22 @@
-# IOSDecryptHubJB
+# IOSDecryptHub · 越狱版
 
 独立的 iOS 越狱运行时分析项目。面向 rootless / RootHide，以一个 deb 整包交付常驻守护程序、手机 Manager UI、注入 Loader 与 Agent 引擎，支持通过 APT 越狱源统一更新。
 
-本项目与 [IOSDecryptHub 巨魔版](https://github.com/decrypthub/IOSDecryptHubTrollStore) 分别维护自己的 main、版本和发布，不再通过同仓分支区分产品。
+本仓是 **IOSDecryptHub 越狱版正式主仓**，承接原 IOSDecryptHubJB 的开发历史。巨魔版独立维护于 [IOSDecryptHubTrollStore](https://github.com/decrypthub/IOSDecryptHubTrollStore)，两个版本分别维护自己的 main、版本和发布。
 
-本项目在 `decrypthub` 组织公开维护。既有公开 [IOSDecryptHub v1](https://github.com/decrypthub/IOSDecryptHub) 另有已发布的管理器、加载器、updater 和整包脚本，保留原地址和发布链路；v2 后续从这些实际实现迁移，不将其误判为不存在。
+本项目在 `decrypthub` 组织公开维护。2026-11-16 合并维护入口，保留本仓既有源码历史、Star、Issues、标签与历史 Release；原 JB 仓的 v1.27.6 完整包迁至本仓，既有官网域名、包 ID 与 APT 签名信任保持兼容。详见 [仓库整合说明](./docs/REPOSITORY_CONSOLIDATION_2026-11-16.md)。
 
 ## 当前版本与使用
 
-[v1.27.6 完整包](https://github.com/decrypthub/IOSDecryptHubJB/releases/tag/v1.27.6) 基于组织正式 `a94a396` 的完整 v1 源码，包含 Manager、Loader、一次性管理 daemon、引擎与资源。添加源 **https://ios.decrypthub.com**，在 Sileo / Zebra 安装 IOSDecryptHub；rootless / RootHide 请使用对应架构的完整 deb。
+[v1.27.6 完整包](https://github.com/decrypthub/IOSDecryptHub/releases/tag/v1.27.6) 基于组织正式 `a94a396` 的完整 v1 源码，包含 Manager、Loader、一次性管理 daemon、引擎与资源。添加源 **https://ios.decrypthub.com**，在 Sileo / Zebra 安装 IOSDecryptHub；rootless / RootHide 请使用对应架构的完整 deb。
 
 打开 Manager → 开启目标应用的注入 → 启动或手动重启目标 → 通过原有 Web / MCP 查看分析。关闭注入影响后续加载；已加载的引擎要在目标退出后才离开进程。
 
 v1.27.6 将版本检查切换到规范 APT 源，按安装包架构选择版本，更新与回退交给系统包管理器。Manager、Loader、daemon 与引擎统一升级；旧单引擎安装/回滚请求会被拒绝，遗留 staging 不再覆盖包内引擎。
 
-**后续规划**：参考 Android 项目改造手机常驻分析服务与新 Manager，增加真实会话/scope 状态、Inline Hook、出口采集和 Trace。当前 daemon 仍按请求或周期运行后退出，这些新能力尚未实现。
+**开发主线与正式包分开**：当前 main 为 1.28.28 开发代码，已包含后续 Inline Hook、QBDI Trace 与运行时操作的开发提交，验证范围和已知限制见 [当前进度](./docs/PROGRESS.md)。仓库整合不发布新的 1.28.x 安装包；上面的 v1.27.6 是已发布完整包。常驻分析服务、新 Manager 与 scope 架构继续按路线图推进。
+
+源码和问题反馈：[本仓 Issues](https://github.com/decrypthub/IOSDecryptHub/issues)。巨魔设备请使用 [巨魔版下载与说明](https://github.com/decrypthub/IOSDecryptHubTrollStore)。
 
 ## 构建与验证
 
