@@ -63,4 +63,4 @@ Import 安装前解析可执行符号，缺失/数据符号不注册 fishhook；
 - MCP：`python tests/hook_mcp_test.py --endpoint http://<authorized-device>:8088 --call-id <retained-nested-call>`。
 - 复杂方法拒绝：`python tests/method_hook_guard_test.py --endpoint http://<authorized-device>:8088 --class-name IDHABIProbe --selector floating:`。
 
-RootHide 当前整包仍不含 Inline/QBDI 后端。结构化 ObjC/Import 事件与调用关联不依赖这两个后端。
+1.28.35 起，RootHide 整包已链接真实 arm64 / arm64e Inline/QBDI 并经双机验证；操作前仍须用 get_capabilities 核对实际进程。动态跳板报告 callStackMode:direct-caller-only，以直接 LR/SP 和同步 callId 关联代替完整栈展开。原生后端自检、复制输入的 replay 与限制见 [RootHide 后端](ROOTHIDE_NATIVE_BACKENDS.md)。结构化 ObjC/Import 事件与调用关联不依赖这两个后端。
