@@ -8,7 +8,7 @@
 | [IOSDecryptHubTrollStore](https://github.com/decrypthub/IOSDecryptHubTrollStore) | 巨魔版源码、dylib 与发布 |
 | [IOSDecryptHubPage](https://github.com/decrypthub/IOSDecryptHubPage) | 官网与已有 APT 分发 |
 
-原 IOSDecryptHubJB 在代码、标签和 Release 迁移核验后删除；项目不再要求并列存在这个仓库。删除旧仓会使其 GitHub URL 失效，维护中的入口统一更新到上表，不承诺外部历史链接自动重定向。
+原 IOSDecryptHubJB 已在代码、标签和 Release 迁移核验后，按用户明确授权删除；项目不再要求并列存在这个仓库。旧 GitHub URL 已失效，维护中的入口统一更新到上表，外部历史链接不会自动重定向。本机迁移前副本和完整 Git bundle 保留备份。
 
 ## 历史与版本
 
@@ -28,6 +28,6 @@
 
 旧单引擎更新器依赖原仓的 `releases/latest` 和 dylib 资产。迁入 v1.27.6 完整包时设置 `make_latest=false`，保留原先 v1.27.5 的 latest 指向；越狱安装使用对应版本 Release 或现有 APT 源。以后改变 latest 必须先核对旧更新器及资产兼容性。
 
-新的源码中，Manager 版本列表 API、Web 面板反馈链接和 Issue 模板均使用本仓。已安装的历史二进制不会随源码迁移自动改写；若其版本历史列表仍访问旧 JB 地址，删除旧仓后该列表可能不可用，整包更新仍以原有 APT 源为准。
+新的源码中，Manager 版本列表 API、Web 面板反馈链接和 Issue 模板均使用本仓。已安装的历史二进制不会随源码迁移自动改写；其版本历史列表仍访问旧 JB 地址时会失效。用户已确认接受这一影响，整包更新仍以原有 APT 源为准。
 
-本机 Windows 无 iOS 原生构建工具链，仓库迁移中的静态检查与主机测试不等于新的 iOS 构建或真机验收；完整包发布仍执行原有架构、签名、依赖、安装与升级验证。
+首次迁移的 CI 暴露了新签出源码缺少 Dobby/QBDI 静态库的依赖准备问题。经用户授权，CI 增加依赖构建并修正 QBDI 静态配置头文件路径；[CI 43802304063](https://github.com/decrypthub/IOSDecryptHub/actions/runs/43802304063) 在 `4e59e48` 完整通过，包括更新策略测试、rootless / RootHide 实际整包构建与测试产物上传。1.28.28 两份 CI 产物未作为正式 Release 或 APT 更新发布，本轮未在手机安装验收。完整包正式发布仍执行既有架构、签名、依赖、安装与升级验证。

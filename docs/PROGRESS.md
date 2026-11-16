@@ -2,11 +2,13 @@
 
 ## 2026-11-16：越狱主线归并原公开仓
 
-- 用户决定由 `decrypthub/IOSDecryptHub` 继续研发越狱版，巨魔版保留独立 `IOSDecryptHubTrollStore`；旧 IOSDecryptHubJB 在迁移核验后删除。
+- 用户决定由 `decrypthub/IOSDecryptHub` 继续研发越狱版，巨魔版保留独立 `IOSDecryptHubTrollStore`；旧 IOSDecryptHubJB 已在迁移核验后删除。用户明确接受旧安装版 Manager 历史版本列表失效，APT 整包更新继续使用原源。
 - 原公开主线 `a94a396` 已包含在 JB 开发主线 `ef62acb` 历史中；按祖先关系推进，保留原提交、标签、Star 与 Issues，不重写历史。
 - 原 JB 远端 v1.27.6 标签及两份完整 deb 迁至本仓；保留各自 SHA-256 和原发布源码提交。保留旧版 `latest` 指向，不把只有完整 deb 的迁移 Release 推给旧单引擎更新器。
 - main 的 1.28.28 源码和此前本地开发提交一并保留；本次不发布 1.28.x 安装包、不更新 APT 索引、不操作手机。
 - 官网、源码反馈入口与 Manager 历史版本 API 改指本仓；历史文档继续保留当时仓名，当前归属以本节与 [整合说明](./REPOSITORY_CONSOLIDATION_2026-11-16.md) 为准。
+- 用户授权补齐 CI 依赖：先构建 Dobby/QBDI 静态库，再运行原有更新策略与完整包检查；修正 QBDI Config.h 应取 `include-static/QBDI/Config.h` 的旧脚本错误。
+- [CI 43802304063](https://github.com/decrypthub/IOSDecryptHub/actions/runs/43802304063) 在 `4e59e48` 全部通过，实际生成并上传 1.28.28 rootless / RootHide 两份验证包。它们仅为 CI 测试产物，未发布 Release、未更新 APT、未安装手机，不代表本轮完成真机验收。
 
 ## 2026-10-25：独立工程与手机整包方案
 

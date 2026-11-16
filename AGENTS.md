@@ -48,6 +48,12 @@ Always respond in Chinese-simplified.
 - 提交格式 `type: 中文描述`。不提交构建产物、生成头、签名工具、私钥、凭据或捕获数据。
 - 远程 Mac 连接参数只在本机 memory，不写仓库。
 
-## 当前实现说明
+## 当前验证状态（2026-11-16）
+
+main 为 1.28.28 开发代码，包含 Inline Hook、QBDI Trace 与后续运行时操作；实现范围、架构限制和真机证据按 docs/PROGRESS.md 核对，不把规划中的常驻分析服务或新 Manager 视为已完成。旧 IOSDecryptHubJB GitHub 仓已按用户明确授权删除，本机旧目录只作备份。
+
+新签出源码先按 README 构建 Dobby/QBDI 依赖；CI 已补依赖准备并使用静态 Config.h。[CI 43802304063](https://github.com/decrypthub/IOSDecryptHub/actions/runs/43802304063) 已在 4e59e48 通过更新策略与 rootless / RootHide 完整包构建，产物仅用于验证。迁仓不发布 1.28.x 正式包、不更新 APT、不操作手机。
+
+## v1.27.6 实现快照（历史）
 
 已恢复组织正式 a94a396 的完整 v1。v1.27.6 按安装包架构检查 APT 源，安装与回退由包管理器负责；daemon 拒绝旧单引擎安装/回滚，updated.sh 不再应用旧 staging。Mac 本地回归和 make deb 双环境验证通过。当前管理 daemon 仍是一次性进程；常驻分析服务、新 Manager、scope IPC、Inline / Trace 未实现。未在手机验收安装、升级与包管理器跳转。
