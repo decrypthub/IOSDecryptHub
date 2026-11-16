@@ -13,6 +13,9 @@ description: 用 IDH（IOSDecryptHub 越狱版）对 iOS 目标 App 做协议/�
 - 已知单 GPR 方法的栈快照按 Darwin 自然大小/对齐解释，bool 可占相邻单字节；`caller_lr` 是命中时直接调用者，可补回溯栈的缺口。现有 post 不转发调用者栈参数：超过 6 个显式方法参数/复杂 ABI 会拒绝 post；未知 C/变参函数须先看实际签名和调用点，不能盲开返回后采集。
 - 同名/近似名的 SDK 方法必须逐轮用 hits 与实际返回→请求字节匹配确认，静态存在的旧入口可能是未使用分支。不要为了命中而调用签名 facade，把 oracle 输出当成内部算法已经还原。
 - `symbolicate` 的函数起点置信度与 `disassemble_function` 的函数尾部置信度分开解释；LC_FUNCTION_STARTS 的下一入口是末尾近似，工具当前标 medium。
+- 长函数按 `next_byte_offset` 续页，检查 `decode_start` 是否前进；仅改 address 会被函数归一重新拉回入口。收齐所有页才能声称覆盖完整函数，页间不要承诺 MOVK 常量传播。
+- `capture_after` 的入口 input 应为空，输出在 return 记录中。辨认阶段用 detail 首行 `slot=N return`，不能搜索任意位置的 return 单词（deferred until return 也出现在入口）。输入用独立入口窗口捕获，保留实际长度，固定窗口尾部的额外字节不是消息。
+- 纯算法闭环要用独立来源的环境/时钟/计数做输入，再与 facade 和 HTTP 参数比较；从最终签名反解字段再编码只能验证封装，不能证明完整签名已复现。白盒表驱动复现也不等于已恢复原 AES 密钥。
 
 ## 0. 这个 Skill 要解决的问题
 

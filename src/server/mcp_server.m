@@ -454,15 +454,26 @@ static NSDictionary *tool_disassemble_function(NSDictionary *args) {
     if (maxBytes == 0) maxBytes = 4096;
     if (maxBytes > 65536) maxBytes = 65536;
 
+    NSNumber *pageOffsetN = [args[@"byte_offset"] isKindOfClass:NSNumber.class] ? args[@"byte_offset"] : nil;
+    if (pageOffsetN && pageOffsetN.longLongValue < 0) return tool_err(@"byte_offset must be non-negative");
+    uint64_t pageOffset = pageOffsetN ? pageOffsetN.unsignedLongLongValue : 0;
+    unsigned int alignment = [arch isEqualToString:@"thumb"] ? 2 : 4;
+    if (pageOffset % alignment) return tool_err(@"byte_offset must align to the instruction size");
+
     AnalysisInsn *insns = calloc(1024, sizeof(AnalysisInsn));
     if (!insns) return tool_err(@"out of memory");
     AnalysisAddressInfo info;
     BOOL haveFunction = analysis_address_info(addr, &info) == 0 && info.has_function &&
                         info.function_end > info.function_start;
-    uint64_t readStart = haveFunction ? info.function_start : addr;
+    if (pageOffset && !haveFunction) { free(insns); return tool_err(@"byte_offset requires a known function boundary"); }
+    if (haveFunction && pageOffset >= info.function_end - info.function_start) {
+        free(insns); return tool_err(@"byte_offset is outside the resolved function");
+    }
+    uint64_t functionStart = haveFunction ? info.function_start : addr;
+    uint64_t readStart = functionStart + pageOffset;
     size_t readSize = maxBytes;
-    if (haveFunction && info.function_end - info.function_start < readSize)
-        readSize = (size_t)(info.function_end - info.function_start);
+    if (haveFunction && info.function_end - readStart < readSize)
+        readSize = (size_t)(info.function_end - readStart);
 
     int n = haveFunction
         ? analysis_disassemble_at(readStart, readSize, arch.UTF8String, insns, 1024)
@@ -477,8 +488,12 @@ static NSDictionary *tool_disassemble_function(NSDictionary *args) {
     NSMutableDictionary *result = [@{
         @"address": [NSString stringWithFormat:@"0x%llx", addr],
         @"requested_address": [NSString stringWithFormat:@"0x%llx", addr],
-        @"resolved_start": [NSString stringWithFormat:@"0x%llx", readStart],
-        @"requested_offset": @(addr - readStart),
+        @"resolved_start": [NSString stringWithFormat:@"0x%llx", functionStart],
+        @"requested_offset": @(addr - functionStart),
+        @"decode_start": [NSString stringWithFormat:@"0x%llx", readStart],
+        @"byte_offset": @(pageOffset),
+        @"instruction_limit": @1024,
+        @"next_byte_offset": truncated && haveFunction ? @(decodedEnd - functionStart) : (id)[NSNull null],
         @"arch": arch,
         @"count": @(n),
         @"ends_with_ret": @(endsWithRet),
@@ -1725,6 +1740,13 @@ static NSDictionary *dh_capture_echo(int ptrArg, int lenArg, int maxBytes) {
     return @{@"ptr_arg": @(ptrArg), @"len_arg": @(lenArg), @"max_bytes": @(maxBytes)};
 }
 
+static NSString *dh_capture_phase_note(BOOL after, int ptrArg, int lenArg, int maxBytes) {
+    return [NSString stringWithFormat:@" capture_memory: x%d, len_arg=%d, cap=%d bytes; %@",
+            ptrArg, lenArg, maxBytes, after
+            ? @"入口不读输出缓冲，返回后按入口指针采集到 output。"
+            : @"入口命中时采集到 input。"];
+}
+
 // hook_import — 对导入 C 符号装只读 hook (fishhook GOT)。命中即记录参数寄存器快照+调用栈, 再透明转发。
 static NSDictionary *tool_hook_import(NSDictionary *args) {
     NSString *sym = args[@"symbol"];
@@ -1835,8 +1857,8 @@ static NSDictionary *tool_hook_import(NSDictionary *args) {
 
     if (capEcho) {
         res[@"capture"] = capEcho;
-        res[@"note"] = [NSString stringWithFormat:@"%@ capture_memory: 命中瞬间把 arg%d 指向的内存(长度取自 arg%d%@, 上限 %d 字节)拷进事件 input。",
-                        res[@"note"], capPtr, capLen, capLen < 0 ? @"(未指定, 用固定上限)" : @"", capMax];
+        res[@"capture_phase"] = wantAfter ? @"return" : @"entry";
+        res[@"note"] = [res[@"note"] stringByAppendingString:dh_capture_phase_note(wantAfter, capPtr, capLen, capMax)];
     }
     return tool_ok(res);
 }
@@ -1940,8 +1962,9 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
         @"slot": @(slot), @"target": display, @"kind": @"inline", @"enabled": @YES,
         @"backend": @(dh_thunk_inline_backend()),
         @"describe_args": describe ? @YES : @NO,
-        @"note": @"record-only inline hook: 命中时记录 x0-x8 + 调用栈后尾调用原函数（原返回值不变）。"
-                 @" events land in category 'other' as algorithm 'inline-hook'. unhook 默认软停；unhook {hard:true} 恢复目标入口原始字节并退休槽位。"
+        @"note": (wantRet || wantAfter || capRet.length)
+            ? @"record-only inline hook: post 路径保留栈帧，记录返回寄存器/输出；当前不转发调用者栈参数，C ABI 须先核对。events: other/inline-hook；hard unhook 恢复入口并退休槽位。"
+            : @"record-only inline hook: 入口快照后尾调用原函数。events: other/inline-hook；hard unhook 恢复入口并退休槽位。"
     } mutableCopy];
     NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
     if (capMulti) { res[@"capture_multi"] = capMulti; }
@@ -1949,8 +1972,8 @@ static NSDictionary *tool_hook_inline(NSDictionary *args) {
 
     if (capEcho) {
         res[@"capture"] = capEcho;
-        res[@"note"] = [NSString stringWithFormat:@"%@ capture_memory: 命中瞬间把 x%d 指向的内存（长度取自 x%d%@，上限 %d 字节）拷进事件 input。",
-                        res[@"note"], capPtr, capLen, capLen < 0 ? @"(未指定, 用固定上限)" : @"", capMax];
+        res[@"capture_phase"] = wantAfter ? @"return" : @"entry";
+        res[@"note"] = [res[@"note"] stringByAppendingString:dh_capture_phase_note(wantAfter, capPtr, capLen, capMax)];
     }
     return tool_ok(res);
 }
@@ -2068,8 +2091,8 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
 
     if (capEcho) {
         res[@"capture"] = capEcho;
-        res[@"note"] = [NSString stringWithFormat:@"%@ capture_memory: 命中瞬间把 x%d 指向的内存(长度取自 x%d%@, 上限 %d 字节)拷进事件 input。",
-                        res[@"note"], capPtr, capLen, capLen < 0 ? @"(未指定, 用固定上限)" : @"", capMax];
+        res[@"capture_phase"] = wantAfter ? @"return" : @"entry";
+        res[@"note"] = [res[@"note"] stringByAppendingString:dh_capture_phase_note(wantAfter, capPtr, capLen, capMax)];
     }
     return tool_ok(res);
 }
@@ -2784,12 +2807,13 @@ static NSArray *tool_definitions(void) {
         },
         @{
             @"name": @"disassemble_function",
-            @"description": @"Disassemble the function containing `address` into structured instructions. When LC_FUNCTION_STARTS is available, an interior address is normalized to the real function start and decoding stops at the next function entry instead of the first ret. The response reports resolved_start/end, requested_offset, boundary_source/confidence and truncation. Falls back to a low-confidence ret heuristic only when function metadata is unavailable. ARM64 MOVZ/MOVN/MOVK constants are reconstructed only within the returned linear instruction stream.",
+            @"description": @"Disassemble the function containing `address` into structured instructions. LC_FUNCTION_STARTS normalizes an interior address to the real function start. Use byte_offset=next_byte_offset to page within that function (1024 instructions per response); decode_start is the page start and resolved_start/end remain the function bounds. Collect every page before claiming full coverage. Falls back to a low-confidence ret heuristic without metadata; paging then refuses. ARM64 constant reconstruction is local to each returned page.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
                     @"address": @{@"type": @"string", @"description": @"Function start address, e.g. \"0x1029ac000\""},
                     @"max_bytes": @{@"type": @"number", @"description": @"Read cap before forced stop (default 4096, max 65536)"},
+                    @"byte_offset": @{@"type": @"number", @"description": @"Aligned byte offset from resolved function start (default 0). Continue using next_byte_offset; requires function metadata."},
                     @"arch": @{@"type": @"string", @"enum": @[@"arm64", @"arm", @"thumb"], @"description": @"Default arm64"},
                 },
                 @"required": @[@"address"],

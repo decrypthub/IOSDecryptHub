@@ -16,6 +16,7 @@ class AnalysisMCPTests(unittest.TestCase):
     method_selector = None
     analysis_image = None
     analysis_selector = None
+    paging_address = None
 
     @classmethod
     def setUpClass(cls):
@@ -120,6 +121,26 @@ class AnalysisMCPTests(unittest.TestCase):
         self.assertTrue(result["scan"]["coverage_complete"])
         self.assertGreater(result["count"], 0)
 
+    def test_function_pagination(self):
+        if not self.paging_address:
+            self.skipTest("未提供用于长函数分页验证的地址")
+        first = self.call("disassemble_function", {"address": self.paging_address, "max_bytes": 65536})
+        self.assertEqual(first["count"], 1024)
+        self.assertTrue(first["truncated"])
+        self.assertGreater(first["next_byte_offset"], 0)
+        second = self.call("disassemble_function", {"address": self.paging_address,
+                           "byte_offset": first["next_byte_offset"], "max_bytes": 64})
+        self.assertEqual(second["resolved_start"], first["resolved_start"])
+        self.assertEqual(second["resolved_end"], first["resolved_end"])
+        self.assertEqual(second["decode_start"], first["next_address"])
+        self.assertEqual(second["instructions"][0]["address"], first["next_address"])
+        self.assertNotEqual(second["instructions"][0]["address"], first["instructions"][0]["address"])
+        size = first["function_size"]
+        last = self.call("disassemble_function", {"address": self.paging_address,
+                         "byte_offset": ((size - 1) // 4) * 4, "max_bytes": 64})
+        self.assertFalse(last["truncated"])
+        self.assertIsNone(last["next_byte_offset"])
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
@@ -129,6 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("--method-selector")
     parser.add_argument("--analysis-image")
     parser.add_argument("--analysis-selector")
+    parser.add_argument("--paging-address", help="已知超过 1024 条指令的 ARM64 函数")
     args = parser.parse_args()
     AnalysisMCPTests.endpoint = args.endpoint
     AnalysisMCPTests.expect_inline = None if args.expect_inline is None else args.expect_inline == "true"
@@ -136,4 +158,5 @@ if __name__ == "__main__":
     AnalysisMCPTests.method_selector = args.method_selector
     AnalysisMCPTests.analysis_image = args.analysis_image
     AnalysisMCPTests.analysis_selector = args.analysis_selector
+    AnalysisMCPTests.paging_address = args.paging_address
     unittest.main(argv=[__file__], verbosity=2)

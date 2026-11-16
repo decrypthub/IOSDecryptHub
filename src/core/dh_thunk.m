@@ -488,7 +488,8 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
             }
         }
         int capPtr = atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire);
-        if (capPtr >= 0 && capPtr <= 8) {
+        if (capPtr >= 0 && capPtr <= 8 &&
+            !atomic_load_explicit(&s->capture_after, memory_order_relaxed)) {
             int capLen = atomic_load_explicit(&s->capture_len_arg, memory_order_relaxed);
             int capMax = atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed);
             NSData *captured = dh_capture_arg_memory(s, gpr);
@@ -500,6 +501,8 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
                 [d appendFormat:@"\ncaptured arg%d(x%d) @0x%llx failed (ptr_arg=%d len_arg=%d max=%d)",
                  capPtr, capPtr, gpr[capPtr], capPtr, capLen, capMax];
             }
+        } else if (capPtr >= 0 && capPtr <= 8) {
+            [d appendFormat:@"\noutput arg%d(x%d) capture deferred until return", capPtr, capPtr];
         }
 
         // 多窗口: 一次 hook 同时记录多个寄存器指向的内存。
@@ -553,7 +556,7 @@ void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_
                 size_t want = (am > 0 && am <= DH_THUNK_CAPTURE_MAX) ? (size_t)am : 64;
                 if (al >= 0 && al <= 8) {
                     uint64_t n = src[al];
-                    if (n > 0 && n < (uint64_t)want) want = (size_t)n;
+                    if (n < (uint64_t)want) want = (size_t)n;
                 }
                 NSData *outBuf = dh_capture_at(bufPtr, want);
                 if (outBuf.length) {
