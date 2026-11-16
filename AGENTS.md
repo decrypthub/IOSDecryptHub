@@ -13,7 +13,7 @@ Always respond in Chinese-simplified.
 
 ## 产品定位
 
-- 本仓库是 IOSDecryptHub，只维护越狱版；巨魔版位于独立 IOSDecryptHubTrollStore 仓库。旧 IOSDecryptHubJB 不再作为开发或发布入口。
+- 本仓库是 IOSDecryptHub，只维护越狱版；巨魔版位于独立 IOSDecryptHubTrollStore 仓库。越狱版以后统一在本仓 main 开发，不再创建或使用并列 IOSDecryptHubJB 工作目录；旧项目只保留在迁移备份区用于恢复，不作为开发或发布入口。
 - 所有本产品仓库均在 decrypthub 组织公开维护；不另建个人私有工作仓作为版本真相。
 - 使用自己的 main、版本和发布，不把巨魔仓的 jailbreak 分支作为开发入口。
 - 对用户只交付整包 deb，包含 daemon + Manager + Loader + Agent + 必需资源。内部 dylib 由整包任务自动编译，不需要从另一个项目手工构建或复制。
@@ -50,7 +50,7 @@ Always respond in Chinese-simplified.
 
 ## 当前验证状态（2026-11-16）
 
-main 为 1.28.28 开发代码，包含 Inline Hook、QBDI Trace 与后续运行时操作；实现范围、架构限制和真机证据按 docs/PROGRESS.md 核对，不把规划中的常驻分析服务或新 Manager 视为已完成。旧 IOSDecryptHubJB GitHub 仓已按用户明确授权删除，本机旧目录只作备份。
+main 为 1.28.28 开发代码，包含 Inline Hook、QBDI Trace 与后续运行时操作；实现范围、架构限制和真机证据按 docs/PROGRESS.md 核对，不把规划中的常驻分析服务或新 Manager 视为已完成。旧 IOSDecryptHubJB GitHub 仓已按用户明确授权删除，本机旧目录已从工作区根移入迁移备份区。
 
 新签出源码先按 README 构建 Dobby/QBDI 依赖；CI 已补依赖准备并使用静态 Config.h。[CI 43802304063](https://github.com/decrypthub/IOSDecryptHub/actions/runs/43802304063) 已在 4e59e48 通过更新策略与 rootless / RootHide 完整包构建，产物仅用于验证。迁仓不发布 1.28.x 正式包、不更新 APT、不操作手机。
 

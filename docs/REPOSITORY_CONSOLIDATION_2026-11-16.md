@@ -8,7 +8,7 @@
 | [IOSDecryptHubTrollStore](https://github.com/decrypthub/IOSDecryptHubTrollStore) | 巨魔版源码、dylib 与发布 |
 | [IOSDecryptHubPage](https://github.com/decrypthub/IOSDecryptHubPage) | 官网与已有 APT 分发 |
 
-原 IOSDecryptHubJB 已在代码、标签和 Release 迁移核验后，按用户明确授权删除；项目不再要求并列存在这个仓库。旧 GitHub URL 已失效，维护中的入口统一更新到上表，外部历史链接不会自动重定向。本机迁移前副本和完整 Git bundle 保留备份。
+原 IOSDecryptHubJB 已在代码、标签和 Release 迁移核验后，按用户明确授权删除；项目不再要求并列存在这个仓库。旧 GitHub URL 已失效，维护中的入口统一更新到上表，外部历史链接不会自动重定向。用户随后要求移除同名本机工作目录；其内容已移入迁移备份区，同时保留完整目录 ZIP 和 Git bundle。工作区根不再保留 IOSDecryptHubJB，越狱研发统一在 IOSDecryptHub/main，迁移备份仅用于恢复。
 
 ## 历史与版本
 
