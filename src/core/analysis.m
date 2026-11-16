@@ -14,6 +14,7 @@
 #include "capstone/capstone.h"
 #include "analysis.h"
 #include "macho_dump.h"
+#include "dh_macho_sections.h"
 
 #include <os/proc.h>
 #include <TargetConditionals.h>
@@ -506,13 +507,19 @@ static void loaded_image_metadata(const struct mach_header_64 *mh, intptr_t slid
         if (lc->cmdsize < sizeof(*lc)) return;
         if (lc->cmd == LC_SEGMENT_64 && lc->cmdsize >= sizeof(struct segment_command_64)) {
             const struct segment_command_64 *sg = (const struct segment_command_64 *)lc;
-            BOOL executableSegment = strncmp(sg->segname, "__TEXT", sizeof(sg->segname)) == 0 ||
-                                     strncmp(sg->segname, "__TEXT_EXEC", sizeof(sg->segname)) == 0;
+            BOOL executableSegment = (sg->initprot & VM_PROT_EXECUTE) != 0;
             if (executableSegment && sg->vmsize > 0) {
                 uint64_t lo = (uint64_t)((intptr_t)sg->vmaddr + slide);
                 uint64_t hi = lo + sg->vmsize;
                 if (!o->text_start || lo < o->text_start) o->text_start = lo;
                 if (hi > o->text_end) o->text_end = hi;
+                if (o->executable_range_count < 16) {
+                    unsigned int ri = o->executable_range_count++;
+                    o->executable_ranges[ri].start = lo;
+                    o->executable_ranges[ri].end = hi;
+                    memcpy(o->executable_ranges[ri].segment, sg->segname, 16);
+                    o->executable_ranges[ri].segment[16] = 0;
+                } else o->executable_ranges_truncated = 1;
             }
         } else if (lc->cmd == LC_ENCRYPTION_INFO_64 &&
                    lc->cmdsize >= sizeof(struct encryption_info_command_64)) {
@@ -618,7 +625,7 @@ static const struct mach_header_64 *xref_select_image(const char *q, intptr_t *s
 static int xref_sect_range(const struct mach_header_64 *mh, intptr_t slide,
                            const char *seg, const char *sect,
                            uint64_t *start, uint64_t *end) {
-    const struct section_64 *s = getsectbynamefromheader_64(mh, seg, sect);
+    const struct section_64 *s = dh_macho_find_section(mh, seg, sect);
     if (!s || s->size == 0) return 0;
     *start = (uint64_t)((uintptr_t)s->addr + (uintptr_t)slide);
     *end   = *start + s->size;
@@ -637,9 +644,7 @@ static const struct mach_header_64 *image_containing_address(uint64_t addr,
             (const struct mach_header_64 *)_dyld_get_image_header(i);
         if (!mh || mh->magic != MH_MAGIC_64) continue;
         intptr_t slide = _dyld_get_image_vmaddr_slide(i);
-        AnalysisLoadedImage meta; memset(&meta, 0, sizeof(meta));
-        loaded_image_metadata(mh, slide, &meta);
-        if (addr < meta.text_start || addr >= meta.text_end) continue;
+        if (!dh_macho_contains_exec(mh, slide, addr)) continue;
 
         if (slide_out) *slide_out = slide;
         if (name_out && name_len) {
@@ -1173,7 +1178,8 @@ static int string_sec_global(uint64_t addr, char *out_label, size_t len, uint64_
     for (int i = 0; i < 4; i++) {
         uint64_t lo, hi;
         if (xref_sect_range(mh, sl, SS[i][0], SS[i][1], &lo, &hi) && addr >= lo && addr < hi) {
-            snprintf(out_label, len, "%s,%s", SS[i][0], SS[i][1]);
+            const struct section_64 *s = dh_macho_find_section(mh, SS[i][0], SS[i][1]);
+            snprintf(out_label, len, "%.16s,%.16s", s->segname, s->sectname);
             if (out_vmaddr) *out_vmaddr = addr - (uint64_t)sl;
             return 1;
         }
@@ -1204,20 +1210,19 @@ int analysis_find_string_refs(const char *image_query,
     int prep = prepare_scan(text_lo, text_hi, scan_offset, scan_size, &scan);
     if (prep != 0) return prep;
 
-    // 字符串 section(存字符本身)。label 用静态串, 免每次调用 strdup 泄漏。
+    // 字符串 section 可位于任意可读段；label 保留实际段名，避免伪报为 __TEXT。
     SecRange strsec[4]; int nstr = 0;
     static const char *SS[][2] = {
         {"__TEXT", "__cstring"}, {"__TEXT", "__objc_methname"},
         {"__TEXT", "__objc_classname"}, {"__TEXT", "__objc_methtype"},
     };
-    static const char *SS_LABEL[4] = {
-        "__TEXT,__cstring", "__TEXT,__objc_methname",
-        "__TEXT,__objc_classname", "__TEXT,__objc_methtype",
-    };
+    char stringLabels[4][40] = {{0}};
     for (int i = 0; i < 4; i++) {
         uint64_t lo, hi;
         if (xref_sect_range(mh, slide, SS[i][0], SS[i][1], &lo, &hi)) {
-            strsec[nstr].lo = lo; strsec[nstr].hi = hi; strsec[nstr].label = SS_LABEL[i];
+            const struct section_64 *s = dh_macho_find_section(mh, SS[i][0], SS[i][1]);
+            snprintf(stringLabels[nstr], sizeof(stringLabels[nstr]), "%.16s,%.16s", s->segname, s->sectname);
+            strsec[nstr].lo = lo; strsec[nstr].hi = hi; strsec[nstr].label = stringLabels[nstr];
             nstr++;
         }
     }

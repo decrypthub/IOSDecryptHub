@@ -50,6 +50,8 @@ Always respond in Chinese-simplified.
 
 ## 当前验证状态（2026-11-16）
 
+同日后续验证更新：1.28.31 研发包已按用户授权安装并核对两台测试手机，完成自定义 Mach-O 段识别、分支目标、方法参数证据和能力报告修复；验证范围与未完成的密码原语分析见 `docs/PROGRESS.md` 顶部。未发布到 Release / APT。下段 1.28.28 说明保留为迁仓时点快照。
+
 main 为 1.28.28 开发代码，包含 Inline Hook、QBDI Trace 与后续运行时操作；实现范围、架构限制和真机证据按 docs/PROGRESS.md 核对，不把规划中的常驻分析服务或新 Manager 视为已完成。旧 IOSDecryptHubJB GitHub 仓已按用户明确授权删除，本机旧目录已从工作区根移入迁移备份区。
 
 新签出源码先按 README 构建 Dobby/QBDI 依赖；CI 已补依赖准备并使用静态 Config.h。[CI 43802304063](https://github.com/decrypthub/IOSDecryptHub/actions/runs/43802304063) 已在 4e59e48 通过更新策略与 rootless / RootHide 完整包构建，产物仅用于验证。迁仓不发布 1.28.x 正式包、不更新 APT、不操作手机。

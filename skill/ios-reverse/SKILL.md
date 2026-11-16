@@ -5,6 +5,14 @@ description: 用 IDH（IOSDecryptHub 越狱版）对 iOS 目标 App 做协议/�
 
 # iOS 协议/算法逆向（IDH）
 
+## 2026-11-16 真机补充
+
+- 遇到方法 IMP 明明可读、但函数边界/xref 报找不到时，先核对完整镜像的 `executable_ranges` 与实际 section；代码和字符串不保证位于标准 `__TEXT`。1.28.31 已按权限/节名支持自定义段。
+- `list_hooks.declared_args` 与 `argument_mapping` 是方法参数解释边界。原始寄存器中可读的对象可能只是调用者残留；x8 也不是第七个 ObjC 参数。只以真实声明和 ABI 能力确认的 arg 字段作输入证据。
+- 浮点/聚合签名不按参数序号猜 x 寄存器；超过寄存器窗口的栈参数没有被观察到时，应明确写缺口。
+- 同名/近似名的 SDK 方法必须逐轮用 hits 与实际返回→请求字节匹配确认，静态存在的旧入口可能是未使用分支。不要为了命中而调用签名 facade，把 oracle 输出当成内部算法已经还原。
+- `symbolicate` 的函数起点置信度与 `disassemble_function` 的函数尾部置信度分开解释；LC_FUNCTION_STARTS 的下一入口是末尾近似，工具当前标 medium。
+
 ## 0. 这个 Skill 要解决的问题
 
 iOS App 的签名/加密参数（`X-Sign`、`jdgs`、`mtgsig` 这类）几乎都是：

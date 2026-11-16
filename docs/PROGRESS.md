@@ -1,5 +1,28 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-16：1.28.31 双设备协议分析验证（研发包）
+
+按用户授权，在 rootless iPhone X / iOS 15.6 与 RootHide iPhone 11 / iOS 16.2 的快手 14.10.10 上测试；只重启该目标，保留原注入名单。两台运行中 Agent 均已核对为 1.28.31。未发布 Release / APT。
+
+本轮修复：
+
+- ARM64 `TBZ/TBNZ` 的结构化 `target` 原来取到位编号 0/13；现取最后一个立即数，保留寄存器间接跳转的未知目标语义。
+- ObjC 方法查询先用 C 字符串过滤 selector，仅对返回页解析类名/符号。rootless 首次全局 selector 查询从实测 40.802s 降到 10.382s；这是一轮设备观察，不作为稳定延迟承诺。
+- 能力握手列出实际动态 Hook 和编译后端：rootless 报 Dobby/QBDI，RootHide 当前切片明确 unavailable。
+- ObjC Hook 按真实方法声明限定参数：原始 x2–x8 单列；仅声明中的 x2–x7 参数可标作 arg；仅对象类型可作对象描述。浮点/聚合/未知签名不猜参数位置，超出寄存器范围的参数明确未观测。安装时计算元数据，命中线程不查询方法类型。
+- Mach-O 分析按段权限与节名识别自定义代码/字符串段，修复仅认标准段名导致的函数边界、selector/string xref 漏查。镜像图返回分离的 `executable_ranges`，地址归属不把段间 DATA/空洞视为代码。
+
+验证：
+
+- Mac `make test-updater` 与 rootless / RootHide 完整 `make deb` 通过；新增纯 C 测试：24 个参数类型、10 个自定义 Mach-O 节/权限/边界场景。
+- 两台分别通过 5 项只读 MCP 测试，覆盖 12 类分支机器码、ObjC 查询分页/匹配、实际后端、真实自定义段方法起点与 selector 交叉引用。`symbolicate` 起点为 high；`disassemble_function` 按既有协议将下一入口近似出的函数尾部标 medium，不能混为一个置信度。
+- 真机 66 / 45 条新格式方法入口记录检查，未再出现越过真实声明参数数的 arg 标签；15 参数的核心调用明确报告 9 个栈参数未观测。
+- 现有离线 Python 用例 6 passed / 29 subtests；设备测试在未显式提供 endpoint 时跳过。
+
+分析进度：两台均抓到 `__NS_sig3` 请求；常规接口观察到 48 hex，资源预热接口另有 64 hex。多条真实请求与签名返回值逐字匹配，活动链已验证到 `KSSignatureDataEncryptor` → `KWSecurity` → `DefaultMatrixImplementation` → `KWSecuritySignature.atlasSignPlus` → `KWOpenSecureSignatureComponent` → 核心 command `0x28b2`。SDK 中存在但零命中的旧分支不作为执行证据。原始请求、标识、密钥候选和捕获数据只保存在本机任务目录，不提交。
+
+尚未完成：安全 SDK 内部各密码原语和纯算法的逐字节闭环；不能把捕获到 facade 返回值当作纯算法还原。QBDI 目前仍是显式 replay，不能用过期对象指针冒充正常请求的 live trace；RootHide 没有 QBDI 后端。本轮未对未知栈参数函数开启返回拦截。
+
 ## 2026-11-16：越狱主线归并原公开仓
 
 - 用户决定由 `decrypthub/IOSDecryptHub` 继续研发越狱版，巨魔版保留独立 `IOSDecryptHubTrollStore`；旧 IOSDecryptHubJB 已在迁移核验后删除。用户明确接受旧安装版 Manager 历史版本列表失效，APT 整包更新继续使用原源。

@@ -159,6 +159,9 @@ typedef struct {
     int64_t  slide;
     uint64_t text_start;
     uint64_t text_end;
+    unsigned int executable_range_count;
+    int executable_ranges_truncated;
+    struct { uint64_t start, end; char segment[17]; } executable_ranges[16];
     uint32_t filetype;
     uint32_t cryptid;
     uint64_t cryptsize;

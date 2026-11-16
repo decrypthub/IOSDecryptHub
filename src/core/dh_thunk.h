@@ -16,11 +16,15 @@
 
 #include <stdint.h>
 #include <stddef.h>
+
 #include <objc/runtime.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// 当前切片实际链接了 Inline 后端；不能仅凭工具名或 CPU 型号推断可用性。
+int dh_thunk_inline_available(void);
 
 #define DH_THUNK_COUNT 256   // thunk 槽位总数 (单调分配; 软停不回收, 硬停后退休)
 
@@ -38,6 +42,8 @@ typedef struct {
     int          retired;   // 已硬卸载并恢复原代码; 槽位不再复用
     int          capture_return;   // 1 = post 路径, 记录返回值
     int          capture_after;    // 1 = capture_ptr_arg 指向调用后才写好的输出缓冲
+    unsigned int method_arg_count; // ObjC 声明参数数，不含 self/_cmd
+    int          method_simple_gpr; // 0=只保留原始寄存器，不推断参数位置
     dh_hook_kind kind;
     uint64_t     hits;
     const char  *name;    // 符号名 / "-[Class sel]"

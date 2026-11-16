@@ -15,6 +15,7 @@
 #import "dh_thunk.h"
 #import "log_store.h"
 #import "fishhook.h"
+#include "dh_method_arg_type.h"
 
 // 内联 hook 后端：Dobby（静态链接）。arm64e 切片在 Makefile 里把 DH_HAVE_INLINE 置 0，
 // 因为 vendor 里的 Dobby/QBDI 静态库只有 arm64 切片；代码仍编译，只拒绝安装并说明原因。
@@ -25,6 +26,14 @@
 #if DH_HAVE_INLINE
 #include "dobby.h"
 #endif
+
+int dh_thunk_inline_available(void) {
+#if DH_HAVE_INLINE && (defined(__arm64__) || defined(__aarch64__))
+    return 1;
+#else
+    return 0;
+#endif
+}
 
 // asm 尾调用要用的「原函数指针表」—— thunk 用 slot 索引它跳转。必须是全局符号(asm 引用)。
 void *g_dh_thunk_orig[DH_THUNK_COUNT];
@@ -40,6 +49,9 @@ typedef struct {
     _Atomic int      enabled;
     _Atomic int      retired;         // 已硬卸载: 原代码已恢复, 槽位不再复用
     _Atomic int      describe_args;   // method hook: 记录时反引用前几个参数内容
+    unsigned int     method_arg_count; // 不含 self/_cmd 的真实声明参数数
+    int              method_simple_gpr; // 只对单 GPR 标量/指针签名解释参数位置
+    uint8_t          method_object_gprs; // 允许作为 ObjC 对象反引用的 x2..x7 位
     _Atomic int      capture_ptr_arg;   // >=0: 抓该寄存器位置的指针参数
     _Atomic int      capture_len_arg;   // >=0: 从该寄存器取长度; -1: 固定长度
     _Atomic int      capture_max_bytes;
@@ -420,12 +432,24 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
         if (s->kind == DH_HOOK_METHOD) {
             [d appendFormat:@"self=0x%llx _cmd=%s\n", gpr[0],
                 sel_getName((SEL)gpr[1]) ?: "?"];
-            for (int i = 2; i < 9; i++) [d appendFormat:@"arg%d(x%d)=0x%llx ", i - 2, i, gpr[i]];
-            if (atomic_load_explicit(&s->describe_args, memory_order_relaxed)) {
-                for (int i = 2; i <= 6; i++) {
-                    NSString *desc = dh_describe_arg(gpr[i]);
-                    if (desc.length) [d appendFormat:@"\n  arg%d = %@", i - 2, desc];
+            [d appendFormat:@"declared_args=%u argument_mapping=%s\nraw registers: ",
+                s->method_arg_count, s->method_simple_gpr ? "simple-gpr" : "unsupported-signature"];
+            for (int i = 2; i < 9; i++) [d appendFormat:@"x%d=0x%llx ", i, gpr[i]];
+            if (s->method_simple_gpr) {
+                unsigned int observed = s->method_arg_count < 6 ? s->method_arg_count : 6;
+                for (unsigned int ai = 0; ai < observed; ai++) {
+                    int reg = (int)ai + 2;
+                    [d appendFormat:@"\narg%u(x%d)=0x%llx", ai, reg, gpr[reg]];
+                    if (atomic_load_explicit(&s->describe_args, memory_order_relaxed) &&
+                        (s->method_object_gprs & (1u << reg))) {
+                        NSString *desc = dh_describe_arg(gpr[reg]);
+                        if (desc.length) [d appendFormat:@"\n  arg%u = %@", ai, desc];
+                    }
                 }
+                if (s->method_arg_count > observed)
+                    [d appendFormat:@"\nunobserved_args=%u (stack arguments are not captured)", s->method_arg_count - observed];
+            } else {
+                [d appendString:@"\nargument values not inferred for floating-point/aggregate/unknown signatures"];
             }
         } else {
             for (int i = 0; i < 9; i++) [d appendFormat:@"x%d=0x%llx ", i, gpr[i]];
@@ -634,6 +658,17 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
     s->kind = DH_HOOK_METHOD;
     s->used = 1;
     s->method = (void *)m;
+    unsigned int numberOfArgs = method_getNumberOfArguments(m);
+    s->method_arg_count = numberOfArgs >= 2 ? numberOfArgs - 2 : 0;
+    s->method_simple_gpr = 1;
+    s->method_object_gprs = 0;
+    for (unsigned int ai = 0; ai < s->method_arg_count; ai++) {
+        char *type = method_copyArgumentType(m, ai + 2);
+        int kind = dh_method_arg_type(type);
+        free(type);
+        if (!kind) s->method_simple_gpr = 0;
+        if (kind == 2 && ai < 6) s->method_object_gprs |= (uint8_t)(1u << (ai + 2));
+    }
     s->target = NULL;
     s->saved_len = 0;
     atomic_store_explicit(&s->retired, 0, memory_order_relaxed);
@@ -1156,6 +1191,8 @@ int dh_thunk_list(dh_hook_info *out, int max) {
         out[n].capture_max_bytes = atomic_load_explicit(&g_slots[i].capture_max_bytes, memory_order_relaxed);
         out[n].capture_return   = atomic_load_explicit(&g_slots[i].capture_return, memory_order_relaxed);
         out[n].capture_after    = atomic_load_explicit(&g_slots[i].capture_after, memory_order_relaxed);
+        out[n].method_arg_count = g_slots[i].method_arg_count;
+        out[n].method_simple_gpr = g_slots[i].method_simple_gpr;
         n++;
     }
     return n;   // 实际写入条数 (跳过被作废的槽)

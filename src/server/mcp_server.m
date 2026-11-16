@@ -189,7 +189,9 @@ static NSArray *insns_to_array(const AnalysisInsn *insns, int count, NSString *a
                 add_unique_reg(regsRead, op->base);
                 add_unique_reg(regsRead, op->index);
                 if (n->writeback) add_unique_reg(regsWritten, op->base);
-            } else if (!target && op->type == AnalysisOperandImmediate && (n->is_jump || n->is_call)) {
+            } else if (op->type == AnalysisOperandImmediate && (n->is_jump || n->is_call)) {
+                // ARM64 TBZ/TBNZ 的前一个立即数是位编号，最后一个才是跳转地址。
+                // B/BL/B.cond/CBZ/CBNZ 只有一个地址立即数；寄存器间接跳转不伪造目标。
                 target = [NSString stringWithFormat:@"0x%llx", (uint64_t)op->immediate];
             }
         }
@@ -373,6 +375,15 @@ static NSDictionary *tool_list_loaded_images(NSDictionary *args) {
     NSMutableArray *arr = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
     for (int i = 0; i < n; i++) {
         AnalysisLoadedImage *r = &rows[i];
+        NSMutableArray *ranges = [NSMutableArray array];
+        uint64_t executableBytes = 0;
+        for (unsigned int ri = 0; ri < r->executable_range_count; ri++) {
+            uint64_t lo = r->executable_ranges[ri].start, hi = r->executable_ranges[ri].end;
+            executableBytes += hi - lo;
+            [ranges addObject:@{@"segment": @(r->executable_ranges[ri].segment),
+                @"start": [NSString stringWithFormat:@"0x%llx", lo],
+                @"end": [NSString stringWithFormat:@"0x%llx", hi]}];
+        }
         [arr addObject:@{
             @"dyld_index": @(r->dyld_index),
             @"name": @(r->name),
@@ -385,6 +396,10 @@ static NSDictionary *tool_list_loaded_images(NSDictionary *args) {
             @"text_start": r->text_start ? (id)[NSString stringWithFormat:@"0x%llx", r->text_start] : (id)[NSNull null],
             @"text_end": r->text_end ? (id)[NSString stringWithFormat:@"0x%llx", r->text_end] : (id)[NSNull null],
             @"text_size": @(r->text_end > r->text_start ? r->text_end - r->text_start : 0),
+            @"text_bounds_kind": @"executable-envelope",
+            @"executable_ranges": ranges,
+            @"executable_ranges_complete": @(!r->executable_ranges_truncated),
+            @"executable_bytes": @(executableBytes),
             @"filetype": @(r->filetype),
             @"encrypted": r->cryptid ? @YES : @NO,
             @"cryptid": @(r->cryptid),
@@ -931,13 +946,6 @@ static NSDictionary *tool_objc_call(NSDictionary *args) {
     if (outs.count) out[@"out_params"] = outs;
     return tool_ok(out);
 }
-static BOOL objc_name_matches(NSString *value, NSString *query, NSString *mode) {
-    if (!query.length) return YES;
-    if ([mode isEqualToString:@"exact"]) return [value isEqualToString:query];
-    if ([mode isEqualToString:@"prefix"]) return [value hasPrefix:query];
-    return [value rangeOfString:query].location != NSNotFound;
-}
-
 // find_objc_methods —— 基于 ObjC runtime 的实体查询，只列类自身声明的方法。
 // ---- 运行时枚举的崩溃兜底 ----
 // iOS 16 上对某些 Swift 泛型类调用 class_getName() 会走进
@@ -1025,6 +1033,9 @@ static NSDictionary *tool_find_objc_methods(NSDictionary *args) {
     }
 
     NSString *classNeedle = classQuery.lowercaseString;
+    const char *selectorBytes = selector.UTF8String;
+    size_t selectorLength = selectorBytes ? strlen(selectorBytes) : 0;
+    int selectorMatch = [match isEqualToString:@"exact"] ? 1 : ([match isEqualToString:@"prefix"] ? 2 : 0);
     NSString *imageNeedle = imageQuery.lowercaseString;
     NSString *impNeedle = impImageQuery.lowercaseString;
     NSMutableArray *rows = [NSMutableArray arrayWithCapacity:(NSUInteger)limit];
@@ -1041,17 +1052,21 @@ static NSDictionary *tool_find_objc_methods(NSDictionary *args) {
 
     for (unsigned int ci = 0; ci < classCount; ci++) {
         Class cls = classes[ci];
+        NSString *classImage = nil;
+        if (imageNeedle.length) {
+            const char *cip = class_getImageName(cls);
+            classImage = cip ? @(cip) : @"";
+            if ([classImage.lowercaseString rangeOfString:imageNeedle].location == NSNotFound) continue;
+        }
         int aborted = 0;
-        const char *cn = dh_safe_class_getName(cls, &aborted);
-        if (aborted) { skippedLazyNames++; continue; }
-        if (!cn) continue;
-        NSString *className = @(cn);
-        if (classNeedle.length &&
-            [className.lowercaseString rangeOfString:classNeedle].location == NSNotFound) continue;
-        const char *cip = class_getImageName(cls);
-        NSString *classImage = cip ? @(cip) : @"";
-        if (imageNeedle.length &&
-            [classImage.lowercaseString rangeOfString:imageNeedle].location == NSNotFound) continue;
+        NSString *className = nil;
+        if (classNeedle.length) {
+            const char *cn = dh_safe_class_getName(cls, &aborted);
+            if (aborted) { skippedLazyNames++; continue; }
+            if (!cn) continue;
+            className = @(cn);
+            if ([className.lowercaseString rangeOfString:classNeedle].location == NSNotFound) continue;
+        }
         scannedClasses++;
 
         for (int kind = 0; kind < 2; kind++) {
@@ -1065,8 +1080,20 @@ static NSDictionary *tool_find_objc_methods(NSDictionary *args) {
             for (unsigned int mi = 0; mi < methodCount; mi++) {
                 Method method = methods[mi];
                 SEL sel = method_getName(method);
-                NSString *selName = sel ? NSStringFromSelector(sel) : @"";
-                if (!objc_name_matches(selName, selector, match)) continue;
+                const char *selBytes = sel ? sel_getName(sel) : "";
+                // 先在 C 字符串上筛选；大 App 可能有数百万方法，逐条创建 NSString
+                // 会在返回一页结果前产生大量临时对象（快手实测首次全局查询超过 40s）。
+                if (selectorLength) {
+                    if (selectorMatch == 1 && strcmp(selBytes, selectorBytes) != 0) continue;
+                    if (selectorMatch == 2 && strncmp(selBytes, selectorBytes, selectorLength) != 0) continue;
+                    if (selectorMatch == 0 && !strstr(selBytes, selectorBytes)) continue;
+                }
+
+                // 没有 IMP 镜像过滤时，页外匹配只计数，不做昂贵的符号化。
+                if (!impNeedle.length && (total < offset || rows.count >= (NSUInteger)limit)) {
+                    total++;
+                    continue;
+                }
 
                 IMP imp = method_getImplementation(method);
                 uint64_t rawImp = (uint64_t)(uintptr_t)imp, normalizedImp = rawImp, symoff = 0;
@@ -1079,6 +1106,16 @@ static NSDictionary *tool_find_objc_methods(NSDictionary *args) {
 
                 NSInteger idx = total++;
                 if (idx < offset || rows.count >= (NSUInteger)limit) continue;
+                if (!className) {
+                    const char *cn = dh_safe_class_getName(cls, &aborted);
+                    if (aborted || !cn) { skippedLazyNames++; continue; }
+                    className = @(cn);
+                }
+                NSString *selName = @(selBytes);
+                if (!classImage) {
+                    const char *cip = class_getImageName(cls);
+                    classImage = cip ? @(cip) : @"";
+                }
                 const char *enc = method_getTypeEncoding(method);
                 NSString *classBase = classImage.lastPathComponent ?: @"";
                 BOOL outside = classBase.length && impImageName.length &&
@@ -1618,6 +1655,10 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
     (void)args;
     uint32_t bits = dh_capability_bits();
     dh_variant v = dh_variant_current();
+    BOOL inlineAvailable = dh_thunk_inline_available() != 0;
+    BOOL traceAvailable = DHQBDIAvailable();
+    NSMutableArray *dynamicHooks = [NSMutableArray arrayWithArray:@[@"hook_import", @"hook_method"]];
+    if (inlineAvailable) [dynamicHooks addObject:@"hook_inline"];
     return tool_ok(@{
         @"pluginVersion":  @MCP_SERVER_VERSION,
         @"variant":        @(dh_variant_id(v)),
@@ -1628,11 +1669,16 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
             @"hook_import":   (bits & DH_CAPBIT_HOOK_IMPORT)   ? @YES : @NO,  // fishhook GOT 改写
             @"hook_method":   (bits & DH_CAPBIT_HOOK_METHOD)   ? @YES : @NO,  // ObjC swizzle
             @"unpack":        (bits & DH_CAPBIT_UNPACK)        ? @YES : @NO,   // 脱壳
+            @"hook_inline":   @(inlineAvailable),
+            @"trace_function": @(traceAvailable),
         },
         @"capabilityBits": @(bits),
         @"process":        [[DHLogStore shared] processInfo] ?: @{},
-        // 本变体暴露的动态 hook 工具名。一期尚未实现动态 hook, 故为空; 二期按能力位填充。
-        @"dynamicHookTools": @[],
+        @"dynamicHookTools": dynamicHooks,
+        @"backends": @{
+            @"inline": inlineAvailable ? @"dobby" : @"unavailable",
+            @"trace": traceAvailable ? @"qbdi" : @"unavailable",
+        },
         // 标准 crypto hook 全空时的通用排查路径。让 Agent 在第一次握手就拿到这条引导,
         // 而不是只对着 CCCrypt/EVP 空转。
         @"guidance": @{
@@ -2044,6 +2090,10 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
             @"capture_multi":  info[i].capture_multi[0] ? @(info[i].capture_multi) : @"",
             @"capture_ret_multi": info[i].capture_ret_multi[0] ? @(info[i].capture_ret_multi) : @"",
         } mutableCopy];
+        if (info[i].kind == DH_HOOK_METHOD) {
+            h[@"declared_args"] = @(info[i].method_arg_count);
+            h[@"argument_mapping"] = info[i].method_simple_gpr ? @"simple-gpr" : @"unsupported-signature";
+        }
         NSDictionary *cap = dh_capture_echo(info[i].capture_ptr_arg, info[i].capture_len_arg,
                                             info[i].capture_max_bytes);
         if (cap) h[@"capture"] = cap;
