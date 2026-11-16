@@ -14,6 +14,7 @@
 #import "dh_noise.h"
 #import "dh_spoof.h"
 #import "hook_webkit.h"
+#import "dh_event.h"
 
 extern void dh_install_digest_hooks(void);
 extern void dh_install_hmac_hooks(void);
@@ -53,6 +54,8 @@ static void dh_bootstrap(void) {
     // 在 hooked_open 内部触发 open/dlopen 递归(与 dh_in_hook 标志双保险).
     (void)DHTimestampNow();
     (void)DHCallStackFiltered();
+    (void)DHProcessGeneration();
+    (void)DHMonotonicNS();
     // 诊断落盘目录 + 捕获配置, 都在装 hook 前就绪(持久化的开关/诊断从一开始生效)。
     NSString *docsDir = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
     dh_diag_set_dir(docsDir.fileSystemRepresentation);

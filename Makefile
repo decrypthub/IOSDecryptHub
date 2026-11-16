@@ -18,8 +18,28 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.33
+VERSION := 1.28.34
 TARGET  := decrypt_helper.dylib
+.DEFAULT_GOAL := all
+.PHONY: test-hook-runtime test-hook-ios-build
+
+HOOK_TEST_SRC := tests/hook_runtime_test.m src/core/dh_thunk.m src/core/dh_call_context.c src/core/dh_event.m \
+    src/core/dh_hook_selftest.m \
+    src/core/log_store.m src/core/dh_capture.c src/core/dh_noise.m src/core/dh_health.c src/core/dh_capability.c \
+    src/core/fishhook.c src/server/dh_log_json.m
+
+test-hook-runtime:
+	@mkdir -p build
+	clang -std=gnu11 -Isrc/core tests/hook_context_test.c src/core/dh_call_context.c -lpthread -o build/hook_context_test
+	./build/hook_context_test
+	clang -ObjC -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation $(HOOK_TEST_SRC) -o build/hook_runtime_test
+	python3 tests/run_hook_runtime_test.py build/hook_runtime_test
+
+test-hook-ios-build:
+	@mkdir -p build
+	xcrun --sdk iphoneos clang -arch arm64 -arch arm64e -miphoneos-version-min=14.0 -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) \
+	    -ObjC -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation $(HOOK_TEST_SRC) -o build/hook_runtime_test_ios
+	ldid -S build/hook_runtime_test_ios
 
 # Capstone 反汇编库源文件（仅 ARM/ARM64 架构）
 CAPSTONE_SRC := src/core/capstone/cs.c \
@@ -44,6 +64,9 @@ SRC     := src/core/fishhook.c \
            src/core/dh_capture.c \
            src/core/dh_capability.c \
            src/core/dh_thunk.m \
+           src/core/dh_call_context.c \
+           src/core/dh_event.m \
+           src/core/dh_hook_selftest.m \
            src/core/dh_noise.m \
            src/core/dh_spoof.m \
            src/core/dh_symtab.c \

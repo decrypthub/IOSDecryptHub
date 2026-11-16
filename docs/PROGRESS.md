@@ -1,5 +1,18 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-16：1.28.34 P0 结构化事件、调用关联与 ABI 安全（研发包）
+
+- 增加 schema v2、进程代、Hook/调用 ID、entry/leave、同步父调用和单调时间。参数位置、对象、返回值、内存窗口及采集状态放入 `payload`，镜像 UUID/RVA 随 Hook 身份保存；不再依赖 detail 文本配对。
+- 新 `get_call` 返回有界保留的调用树与配对/缺失/截断状态；`query_events` 支持上下文精确过滤。默认密码/网络事件采集同步父 ID，网络响应合并保留请求上下文。journal 保存原始代标识，旧记录保留 schema 1。
+- 动态 Hook 配置安装前整体验证、发布后不可变；修改状态/执行目标的工具必须传当前 `process_generation`。方法 post 需要固定非变参声明，C post 需要显式固定 GPR ABI；最多 32 参数、256B Darwin 栈转发。void 不猜返回对象，复杂/变参/异常展开 post 拒绝。
+- 方法硬卸载核对 IMP 所有权并保留在途状态，退休槽位不复用；Inline 无线程静止机制时拒绝硬卸载。Import 修复缺失符号失败后仍保留未来镜像注册的风险，永久保存注册名并固定解析后的转发目标；不承诺保留逐镜像 interposer 链，必须用真实命中验证覆盖。关键分配器/runtime Hook 拒绝。
+- Mac 原生汇编测试通过：15 参数 packed stack、递归/并发、输出/零长度、实际 C 导入命中、配置拒绝、所有权与在途卸载、跨进程 journal/旧格式兼容；类型/段分析、更新策略、两种完整 deb 构建通过。离线 Python 6 项通过。
+- 两台授权手机实际 Agent 自检通过上述 8 组能力；两台 MCP 错误参数/过期代/预算/配对测试及复杂 ABI 拒绝通过，拒绝操作未修改 Hook 配置。重启后各检查 5 条恢复事件，确认旧进程代保留。journal 为有界尾部恢复，早期自检调用已淘汰时如实返回 unknown，不承诺保留所有历史调用。
+- 快手 14.10.10 正常 UI 操作：rootless / RootHide 各 15 棵完整同步调用树，分别 225 / 150 个配对调用；各 15 组核心 15 参数方法均有入口和正常 leave，两个 bool 的栈偏移为 0/+1、下一对象为 +8，void 返回不可用；30 组 facade 返回全部逐字匹配本轮真实 HTTP `__NS_sig3`。Rootless 原语额外离线验证 15 HMAC、45 白盒块、15 CRC，全部一致；使用 schema v2 ID/phase/payload 配对，没有按线程和时间猜测。
+- RootHide 仍无 Inline/QBDI，未把 rootless 原语验证外推为其能力。关联范围是已启用 post 的同步 Hook，异步因果图、完整 native 图、浮点/聚合 post 和异常展开尚不支持。直接 CLI 自检未证实执行，真机通过结论来自实际注入 Agent 的受控自检和真实请求。
+
+整包已安装两台，保留原 scope；未发布 Release / APT。详细协议和可复用验证入口见 [结构化事件 v2](STRUCTURED_EVENTS_V2.md)。
+
 ## 2026-11-16：1.28.33 长函数分页与采集阶段修正（研发包）
 
 - 长函数原受每响应 1024 条指令限制，即使给出 65536B 仍截断；用 `next_address` 再请求又会归一到入口。新增 `byte_offset / next_byte_offset / decode_start`：分页起点与真实函数边界分开报告，常量传播限于当前页；无边界信息时拒绝偏移分页。

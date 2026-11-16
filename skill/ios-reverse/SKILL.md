@@ -10,12 +10,22 @@ description: 用 IDH（IOSDecryptHub 越狱版）对 iOS 目标 App 做协议/�
 - 遇到方法 IMP 明明可读、但函数边界/xref 报找不到时，先核对完整镜像的 `executable_ranges` 与实际 section；代码和字符串不保证位于标准 `__TEXT`。1.28.31 已按权限/节名支持自定义段。
 - `list_hooks.declared_args` 与 `argument_mapping` 是方法参数解释边界。原始寄存器中可读的对象可能只是调用者残留；x8 也不是第七个 ObjC 参数。只以真实声明和 ABI 能力确认的 arg 字段作输入证据。
 - 浮点/聚合签名不按参数序号猜 x 寄存器；超过寄存器窗口的栈参数没有被观察到时，应明确写缺口。
-- 已知单 GPR 方法的栈快照按 Darwin 自然大小/对齐解释，bool 可占相邻单字节；`caller_lr` 是命中时直接调用者，可补回溯栈的缺口。现有 post 不转发调用者栈参数：超过 6 个显式方法参数/复杂 ABI 会拒绝 post；未知 C/变参函数须先看实际签名和调用点，不能盲开返回后采集。
+- 已知单 GPR 方法的栈快照按 Darwin 自然大小/对齐解释，bool 可占相邻单字节；`caller_lr` 是命中时直接调用者，可补回溯栈的缺口。1.28.34 支持最多 32 个固定 GPR 参数的有界栈转发。ObjC post 必须声明 `post_abi:"fixed-nonvariadic"`；C post 必须给出 `abi.arguments/return`。复杂 ABI、变参和异常展开不支持 post，不能虚报原型。
 - 同名/近似名的 SDK 方法必须逐轮用 hits 与实际返回→请求字节匹配确认，静态存在的旧入口可能是未使用分支。不要为了命中而调用签名 facade，把 oracle 输出当成内部算法已经还原。
 - `symbolicate` 的函数起点置信度与 `disassemble_function` 的函数尾部置信度分开解释；LC_FUNCTION_STARTS 的下一入口是末尾近似，工具当前标 medium。
 - 长函数按 `next_byte_offset` 续页，检查 `decode_start` 是否前进；仅改 address 会被函数归一重新拉回入口。收齐所有页才能声称覆盖完整函数，页间不要承诺 MOVK 常量传播。
-- `capture_after` 的入口 input 应为空，输出在 return 记录中。辨认阶段用 detail 首行 `slot=N return`，不能搜索任意位置的 return 单词（deferred until return 也出现在入口）。输入用独立入口窗口捕获，保留实际长度，固定窗口尾部的额外字节不是消息。
+- `capture_after` 的入口 input 应为空，输出在 `phase:"leave"` 记录中。1.28.34 按 `phase/callId/payload` 读取参数、内存窗口与返回值，不再正则解析 detail；旧 schema 1 才需要旧文本兼容。输入用独立入口窗口捕获，保留实际长度，固定窗口尾部的额外字节不是消息。
 - 纯算法闭环要用独立来源的环境/时钟/计数做输入，再与 facade 和 HTTP 参数比较；从最终签名反解字段再编码只能验证封装，不能证明完整签名已复现。白盒表驱动复现也不等于已恢复原 AES 密钥。
+
+## 1.28.34 结构化调用工作流
+
+先握手取得 `processGeneration`，将其作为 `process_generation` 传给 Hook、unhook、trace_function、objc_call 和显式自检。重启后重新握手和解析地址；过期代的操作在修改前拒绝。
+
+每次调用用 `callId` 配对 entry/leave，用 `parentCallId` 取同步父子关系；`get_call` 返回保留的子事件及缺失/截断状态。不要再按同线程时间相邻配对，递归和并发会误配。关系只覆盖正在执行的已启用 post 的 Hook，不宣称跨线程/异步完整调用图。
+
+返回、参数、窗口都从 `payload` 读取，检查 status、实际长度、截断和 ABI 来源。`capture_after` 用入口指针在 leave 抓输出；返回寄存器窗口用 `capture_ret_multi`，仅 x0/x1，void 没有合法返回对象。旧 journal schema 1 无上下文时不补造身份。
+
+配置在发布前整体校验且随后不可变。方法硬卸载必须仍持有 IMP；Inline/Import 用软停并在结束后重启目标清除 patch。不要按旧说明对运行中的 Inline 强行恢复入口字节。详细接口和验证命令见 [结构化事件 v2](../../docs/STRUCTURED_EVENTS_V2.md)。
 
 ## 0. 这个 Skill 要解决的问题
 
@@ -34,7 +44,7 @@ iOS App 的签名/加密参数（`X-Sign`、`jdgs`、`mtgsig` 这类）几乎都
 
 ```
 get_stats                      # 选对进程（App 常有多个 :xxx 子进程）
-get_capabilities                  # 这个 agent 支持哪些 op、槽位上限、抓取上限
+get_capabilities                  # 取得 processGeneration、实际后端和 ABI 边界
 get_macho_info                    # 拿 load_address = slide 基准，记下来
 list_images                       # 主二进制叫什么、多大、cryptid 是否加密
 ```
@@ -61,7 +71,7 @@ list_images                       # 主二进制叫什么、多大、cryptid 是
 ### 3.1 装 hook 后必须先看 hits
 
 ```
-hook_inline { addr, label }        # 或 hook_method / hook_import
+hook_inline { addr, label, process_generation }        # 或 hook_method / hook_import
 # 触发一次目标操作
 list_hooks                          # 看 hits 是不是 > 0
 ```
@@ -216,7 +226,7 @@ HTTP 客户端看到的 `RemoteDisconnected` 或超时，分不清「目标崩�
 1. `dh_slot_t` 加字段（`src/core/dh_thunk.m` 的结构体）
 2. 加 setter，做**纯校验函数**（校验必须在分配槽位之前，见 troubleshooting）
 3. 在 handler 里用上，注意入口路径用 `gpr`、返回路径用 `regs`
-4. MCP 层四处 hook 工具都要接（`hook_import` 首次/复用、`hook_inline`、`hook_method`）
+4. MCP 层三个 Hook 工具都经 `install_configured` 整体校验；重复 import 不复写原配置
 5. `dh_thunk_list` 回填 + `list_hooks` 输出，否则用户没法自查
 6. 加进 schema
 

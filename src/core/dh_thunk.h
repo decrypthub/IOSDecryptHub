@@ -5,8 +5,8 @@
 //
 // 机制: 预编译一排固定大小的汇编 thunk(活在本 dylib 自己签名的 __TEXT 里, 无需 JIT 内存,
 // 巨魔/非越狱也能用)。装 hook = 把目标的跳转入口(GOT 项 / ObjC IMP)改指向 thunk[i];
-// thunk 保存 x0-x8 / v0-v7 / lr, 调用 C 处理器记录, 再恢复寄存器尾调用原函数。因是「入口快照 +
-// 尾调用」, 对被 hook 函数完全透明(不介入返回值 —— 一期只观测)。
+// 默认入口路径恢复寄存器后尾调用；post 仅允许已确认固定 GPR 签名，按 Darwin ABI
+// 转发有界栈参数并保留调用帧。不支持变参/浮点聚合 post 或异常展开。
 //
 // unhook: 原子开关。thunk 永远留着(slot 不回收), 只把 enabled 翻成 0; 处理器见 0 即静默转发。
 // 无需改回 GOT/IMP, 天然免竞争。
@@ -35,6 +35,28 @@ typedef enum {
     DH_HOOK_INLINE = 2,   // 内联 hook (Dobby): 直接改写函数序言, x0.. = 原始参数
 } dh_hook_kind;
 
+// 完整配置在发布 patch 之前应用；发布后的槽位配置不可变。
+typedef struct {
+    int describe_args, capture_return, capture_after;
+    int fixed_abi; // ObjC 元数据不能识别 ...；post 需要调用者确认固定非变参原型。
+    int ptr_arg, len_arg, max_bytes;
+    char capture_multi[96], capture_ret_multi[96];
+    int abi_declared; // C 固定 GPR 签名由调用者显式声明，不代表二进制已自动验证。
+    unsigned int argument_count;
+    char argument_types[32]; // ObjC 标量编码；^=指针，不接受浮点/聚合/变参 post。
+    char return_type;
+} dh_hook_options;
+void dh_thunk_options_default(dh_hook_options *options);
+int dh_thunk_validate_options(const dh_hook_options *options, char *err, size_t errsz);
+// method: owner=class/name=selector；inline: owner=module/name=symbol；import: name=symbol。
+int dh_thunk_install_configured(dh_hook_kind kind, const char *owner, const char *name,
+    uint64_t address, int classMethod, const char *label, const dh_hook_options *options,
+    char *err, size_t errsz);
+#ifdef __OBJC__
+@class NSDictionary;
+NSDictionary *dh_thunk_metadata(int slot);
+#endif
+
 // 一个已装 hook 的运行时快照 (给 list_hooks 用)。
 typedef struct {
     int          slot;
@@ -56,13 +78,13 @@ typedef struct {
 } dh_hook_info;
 
 // 装导入符号 hook。symbol 去前导下划线的名字(与 list_imports 一致); label 可为 NULL。
-// 返回 slot(>=0) 成功; -1 槽位耗尽; -2 符号在任何 image 的导入表里都没找到(静态链接/未导入, hook 无效)。
-// 返回值: >=0 新槽位; -1 槽位耗尽; -2 符号不存在; -(slot+10) 该符号已装过, 用这个槽位
+// 返回值: >=0 新槽位(含未来镜像注册); -1 槽位耗尽; -2 符号不可解析/非代码;
+// -6 不安全符号; -(slot+10) 已注册，配置不变。原函数固定为 dlsym 结果，不保留逐镜像 interposer 链。
 int  dh_thunk_install_import(const char *symbol, const char *label);
 
 // 装 ObjC 方法 hook。classMethod!=0 走类方法。返回 slot(>=0); -1 槽位耗尽; -3 类/方法不存在。
 int  dh_thunk_install_method(const char *className, const char *selector, int classMethod);
-// post 路径尚未转发调用者栈参数：已知复杂/栈参数签名必须在安装前拒绝。
+// 已知固定 GPR/对象参数签名支持有界栈转发；复杂 ABI 明确拒绝。
 int dh_thunk_method_post_supported(const char *className, const char *selector, int classMethod);
 
 // 装内联 hook (Dobby)。module 可为 NULL/"" (退化为 RTLD_DEFAULT)，symbol 或 addr 二选一：
@@ -77,8 +99,8 @@ int  dh_thunk_install_inline(const char *module, const char *symbol, uint64_t ad
 const char *dh_thunk_inline_backend(void);
 
 // 打开某个 hook 的「参数反引用」(默认关闭, 返回 0 成功 / -1 槽位无效):
-//   - DH_HOOK_METHOD: 前几个参数当 ObjC 对象读 (NSData → hex 前缀, NSString → 文本, 其它 → description)
-//   - DH_HOOK_IMPORT: 前几个参数当「可打印 C 字符串」尝试 (如 getaddrinfo 的域名、dlopen 的路径)
+// 只对声明为对象的参数抓有界 NSString/NSData；其他对象只记类名与地址。
+// 以下配置 setter 在发布后均返回 -3；新调用方使用 install_configured，不在安装后改配置。
 int  dh_thunk_set_describe(int slot, int on);
 
 // 打开某个 hook 的「参数内存快照」(默认关闭, 返回 0 成功 / -1 参数或槽位无效):
@@ -99,6 +121,7 @@ int  dh_thunk_set_capture_after(int slot, int on);
 // 纯语法校验, 不改状态。安装 hook 之前先调它, 避免「装完再撤销」。
 // 返回 0=合法, -1=语法错, -2=超长(>=96 字节)
 int  dh_thunk_validate_capture_multi(const char *spec);
+int  dh_thunk_validate_capture_ret_multi(const char *spec);
 int  dh_thunk_set_capture_multi(int slot, const char *spec);
 // 返回值寄存器的多窗口(post 路径): 抓 x1 指向的缓冲这类「返回后即释放」的输出
 int  dh_thunk_set_capture_ret_multi(int slot, const char *spec);
@@ -107,8 +130,8 @@ int  dh_thunk_set_capture_ret_multi(int slot, const char *spec);
 int  dh_thunk_disable(int slot);
 
 // 卸载一个 hook。hard=0: 只停记录(软停, patch 保留);
-// hard=1: inline 恢复原函数入口字节(DobbyCodePatch, 不释放 Dobby 蹦床, 避免在途线程 UAF),
-//         method 恢复原 IMP; import 不支持硬卸载(-5)。硬卸载后槽位标记 retired、不再复用。
+// hard=1: method 仅在 IMP 仍由本 Hook 持有时恢复；inline 缺线程静止机制、import 不可安全解绑，
+//         均返回 -5 且状态不变。方法退休后槽位/配置不再复用，保留在途调用所需的原函数。
 // 返回 0 成功; -1 槽位无效; -4 恢复失败; -5 该类型不支持硬卸载。
 int  dh_thunk_uninstall(int slot, int hard, char *err, size_t errsz);
 

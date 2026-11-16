@@ -2,6 +2,10 @@
 
 在注入的 dylib 内提供一个 **MCP (Model Context Protocol) 服务器**，AI 客户端可通过 HTTP 调用 Capstone 反汇编与镜像分析能力。
 
+## 1.28.34 结构化 Hook 协议
+
+动态 Hook 和事件关联以 [结构化事件 v2](docs/STRUCTURED_EVENTS_V2.md) 为准。Hook/unhook/trace_function/objc_call/自检必须传当前 `process_generation`；函数阶段按 `phase`、调用按 `callId/parentCallId`、输入输出按 `payload` 解析。ObjC post 需要固定非变参声明，C post 需要显式 ABI。新 `get_call` 返回有界配对与同步子事件，`run_hook_selftest` 只测试 IDH 自有 fixture。下表的旧工具说明不能作为允许硬卸载 Inline 或安装后修改配置的依据。
+
 ## 传输与协议
 
 - **传输**：MCP Streamable HTTP，端点 `POST /api/mcp`，复用现有 8088 HTTP 服务（不额外占端口）。

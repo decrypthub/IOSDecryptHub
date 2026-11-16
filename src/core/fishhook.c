@@ -139,8 +139,8 @@ static void perform_rebinding_with_section(struct rebindings_entry *rebindings,
         if (symbol_name_longer_than_1 &&
             strcmp(&symbol_name[1], cur->rebindings[j].name) == 0) {
           if (cur->rebindings[j].replaced != NULL &&
-              indirect_symbol_bindings[i] != cur->rebindings[j].replacement) {
-            *(cur->rebindings[j].replaced) = indirect_symbol_bindings[i];
+              DH_PAC_STRIP(indirect_symbol_bindings[i]) != DH_PAC_STRIP(cur->rebindings[j].replacement)) {
+            *(cur->rebindings[j].replaced) = DH_PAC_STRIP(indirect_symbol_bindings[i]);
           }
           kern_return_t err = vm_protect (mach_task_self (),
               (uintptr_t)indirect_symbol_bindings, section->size, 0,
@@ -372,7 +372,7 @@ static void rebind_chained_segment(
           void *old_value = *slot;
 
           // 保存原始指针
-          if (rb->replaced != NULL && old_value != rb->replacement) {
+          if (rb->replaced != NULL && DH_PAC_STRIP(old_value) != DH_PAC_STRIP(rb->replacement)) {
 #if DH_IS_ARM64E
             *(rb->replaced) = DH_PAC_STRIP(old_value);
 #else

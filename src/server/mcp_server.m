@@ -18,6 +18,9 @@
 #include "dh_capture.h"
 #include "dh_capability.h"
 #include "dh_thunk.h"
+#include "dh_event.h"
+#include "dh_call_context.h"
+#include "dh_hook_selftest.h"
 #include "dh_health.h"
 #include "dh_noise.h"
 #include "dh_spoof.h"
@@ -26,6 +29,7 @@
 #include "hook_webkit.h"
 #include "../trace/qbdi_trace.h"
 #include <string.h>
+#include <math.h>
 
 #define MCP_SERVER_NAME     "ios-decrypt-helper"
 #ifndef DH_VERSION_STR
@@ -1676,6 +1680,9 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
     if (inlineAvailable) [dynamicHooks addObject:@"hook_inline"];
     return tool_ok(@{
         @"pluginVersion":  @MCP_SERVER_VERSION,
+        @"processGeneration": DHProcessGeneration(), @"eventSchemaVersion": @2,
+        @"hookABI": @{@"fixedGPRStackForwarding": @YES, @"maxStackBytes": @256, @"maxArguments": @32,
+            @"CPostRequiresDeclaration": @YES, @"floatAggregatePost": @NO, @"exceptionUnwind": @NO},
         @"variant":        @(dh_variant_id(v)),
         @"variantLabel":   @(dh_variant_label(v)),
         @"arch":           @(dh_cpu_arch()),
@@ -1721,6 +1728,17 @@ static BOOL dh_parse_capture_memory(NSDictionary *args, int *ptr_arg_out, int *l
         return NO;
     }
     NSDictionary *c = raw;
+    for (NSString *key in @[@"ptr_arg", @"len_arg", @"max_bytes"]) {
+        id value = c[key];
+        if (!value) continue;
+        double number = [value isKindOfClass:NSNumber.class] ? [value doubleValue] : NAN;
+        double low = [key isEqualToString:@"len_arg"] ? -1 : [key isEqualToString:@"max_bytes"] ? 1 : 0;
+        double high = [key isEqualToString:@"max_bytes"] ? DH_THUNK_CAPTURE_MAX : 8;
+        if (!isfinite(number) || floor(number) != number || number < low || number > high) {
+            if (error) *error = [key stringByAppendingString:@" must be an integer within capture_memory bounds"];
+            return NO;
+        }
+    }
     int ptrArg = c[@"ptr_arg"] ? [c[@"ptr_arg"] intValue] : 0;
     int lenArg = c[@"len_arg"] ? [c[@"len_arg"] intValue] : -1;
     int maxBytes = c[@"max_bytes"] ? [c[@"max_bytes"] intValue] : 256;
@@ -1747,120 +1765,90 @@ static NSString *dh_capture_phase_note(BOOL after, int ptrArg, int lenArg, int m
             : @"入口命中时采集到 input。"];
 }
 
-// hook_import — 对导入 C 符号装只读 hook (fishhook GOT)。命中即记录参数寄存器快照+调用栈, 再透明转发。
-static NSDictionary *tool_hook_import(NSDictionary *args) {
-    NSString *sym = args[@"symbol"];
-    if (![sym isKindOfClass:NSString.class] || sym.length == 0) return tool_err(@"symbol required");
-    NSString *label = [args[@"label"] isKindOfClass:NSString.class] ? args[@"label"] : nil;
-    int capPtr = -1, capLen = -1, capMax = 0;
-    NSString *capErr = nil;
-    if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
-    // 先校验 capture_multi 再分配槽位: 槽位一旦分配, 目标上的跳转/IMP/GOT 就已经改好了,
-    // 这时再因为参数不合法去「撤销」就必须完整回滚补丁 —— 漏一步就是内存安全事件。
-    {
-        NSString *pre = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-        NSString *preR = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
-    int pv = dh_thunk_validate_capture_multi(pre.UTF8String);
-    NSString *pvBad = pre;
-    if (pv == 0) { pv = dh_thunk_validate_capture_multi(preR.UTF8String); pvBad = preR; }
-        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pvBad.length]);
-        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pvBad]);
-    }
-    int slot = dh_thunk_install_import(sym.UTF8String, label.UTF8String);
-    if (slot <= -10) {
-        // 同一符号已经装过: fishhook 只会把 GOT 指向一个槽位, 再装一次会让旧槽位永远 0 命中。
-        // core 用 -(slot+10) 直接把准确槽位带回来 —— 不再按名字做前缀匹配
-        // (strncmp 没有右边界, 查 "CCHmac" 会命中 "CCHmacInit" 的槽位, 静默改错 hook)。
-        {
-            slot = -(slot + 10);
-            NSMutableDictionary *r = [@{
-                @"slot": @(slot), @"reused": @YES, @"symbol": sym,
-                @"note": @"this symbol was already hooked; returning the existing slot instead of installing a second one (a duplicate would leave the first slot permanently unhit)",
-            } mutableCopy];
-            BOOL describe = [args[@"describe_args"] boolValue];
-            if (describe && dh_thunk_set_describe(slot, 1) == 0) r[@"describe_args"] = @YES;
-            BOOL wantRet = [args[@"capture_return"] boolValue];
-            if (wantRet && dh_thunk_set_return(slot, 1) == 0) r[@"capture_return"] = @YES;
-            BOOL wantAfter = [args[@"capture_after"] boolValue];
-            if (wantAfter && dh_thunk_set_capture_after(slot, 1) == 0) r[@"capture_after"] = @YES;
-            // 复用分支绝不能因为新参数不合法就把原本正常的 hook 停掉（dh_thunk_disable 会让它永久失效）。
-            // 先用纯校验函数查规格，不合法就直接返回，槽位保持原状。
-            NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-            if (dh_thunk_validate_capture_multi(capMulti.UTF8String) != 0)
-                return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 非法: %@。只接受 x0..x8 加可选 :N（每段最长 95 字节），逗号分隔，例如 x0:64,x3:32；已有 hook 未受影响", capMulti]);
-            if (capMulti && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0)
-                return tool_err(@"capture_multi 应用失败（规格已通过校验，说明槽位状态异常）");
-            if (capMulti) r[@"capture_multi"] = capMulti;
-            // capture_ret_multi 也必须在这里处理: 漏掉的话对已 hook 的符号补窗口会返回
-            // ok:true + reused:true 但一条 ret 都不产生 —— 又是一种假成功。
-            NSString *capRet = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
-            if (dh_thunk_validate_capture_multi(capRet.UTF8String) != 0)
-                return tool_err([NSString stringWithFormat:@"capture_ret_multi 非法: %@。语法同 capture_multi；已有 hook 未受影响", capRet]);
-            // 返回值只有 x0/x1。x2..x8 在 post 快照里仍是入口值，允许它们会把
-            // 入参渲染成 ret xN 写进 detail —— 误导性证据。
-            for (NSString *tok in [capRet componentsSeparatedByString:@","]) {
-                NSString *t = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-                if (!t.length) continue;
-                if (!([t hasPrefix:@"x0"] || [t hasPrefix:@"X0"] || [t hasPrefix:@"x1"] || [t hasPrefix:@"X1"] || [t hasPrefix:@"0"] || [t hasPrefix:@"1"]))
-                    return tool_err([NSString stringWithFormat:@"capture_ret_multi 只接受 x0/x1（AAPCS64 只有这两个寄存器承载返回值）: %@", t]);
-            }
-            if (capRet && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
-                return tool_err(@"capture_ret_multi 应用失败（规格已通过校验，说明槽位状态异常）");
-            if (capRet) r[@"capture_ret_multi"] = capRet;
-            if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) == 0)
-                r[@"capture"] = @{@"ptr_arg": @(capPtr), @"len_arg": @(capLen), @"max_bytes": @(capMax)};
-            return tool_ok(r);
+static BOOL dh_hook_options_from_args(NSDictionary *args, dh_hook_options *o, NSString **error) {
+    dh_thunk_options_default(o);
+    for (NSString *key in @[@"describe_args", @"capture_return", @"capture_after", @"classMethod"]) {
+        id value = args[key];
+        if (value && (![value isKindOfClass:NSNumber.class] || ([value doubleValue] != 0 && [value doubleValue] != 1))) {
+            *error = [key stringByAppendingString:@" must be a boolean"]; return NO;
         }
     }
-    if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
-    if (slot == -2) return tool_err([NSString stringWithFormat:
-        @"symbol '%@' not found in any image's import table — it is statically linked or not imported, so fishhook cannot rebind it. Try list_imports to confirm the symbol is an external import.", sym]);
-    BOOL describe = [args[@"describe_args"] boolValue];
-    if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
-    BOOL wantRet = [args[@"capture_return"] boolValue];
-    if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
-    // 多窗口: 一次 hook 同时抓多个寄存器, 换寄存器不必重启进程
-    NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-    if (capMulti && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
-        dh_thunk_disable(slot);
-        return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
+    o->describe_args = [args[@"describe_args"] boolValue];
+    o->capture_return = [args[@"capture_return"] boolValue];
+    o->capture_after = [args[@"capture_after"] boolValue];
+    if (args[@"post_abi"] && ![args[@"post_abi"] isEqual:@"fixed-nonvariadic"]) {
+        *error = @"post_abi supports only fixed-nonvariadic"; return NO;
     }
-    NSString *capRet = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
-    if (dh_thunk_validate_capture_multi(capRet.UTF8String) != 0)
-        return tool_err([NSString stringWithFormat:@"capture_ret_multi 非法: %@。语法同 capture_multi", capRet]);
-    for (NSString *tok in [capRet componentsSeparatedByString:@","]) {
-        NSString *t = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        if (!t.length) continue;
-        if (!([t hasPrefix:@"x0"] || [t hasPrefix:@"X0"] || [t hasPrefix:@"x1"] || [t hasPrefix:@"X1"] || [t hasPrefix:@"0"] || [t hasPrefix:@"1"]))
-            return tool_err([NSString stringWithFormat:@"capture_ret_multi 只接受 x0/x1（AAPCS64 只有这两个寄存器承载返回值）: %@", t]);
+    o->fixed_abi = [args[@"post_abi"] isEqual:@"fixed-nonvariadic"];
+    if (!dh_parse_capture_memory(args, &o->ptr_arg, &o->len_arg, &o->max_bytes, error)) return NO;
+    for (NSString *key in @[@"capture_multi", @"capture_ret_multi"]) {
+        id value = args[key];
+        if (value && (![value isKindOfClass:NSString.class] || [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding] >= 96)) {
+            *error = [key stringByAppendingString:@" must be a string shorter than 96 bytes"]; return NO;
+        }
+        if (value) strlcpy([key isEqualToString:@"capture_multi"] ? o->capture_multi : o->capture_ret_multi, [value UTF8String], 96);
     }
-    if (capRet && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
-        return tool_err(@"capture_ret_multi 应用失败（规格已校验通过, 说明槽位状态异常）");
-    if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
-        dh_thunk_disable(slot);
-        return tool_err(@"capture_memory 应用失败");
+    if (args[@"abi"]) {
+        NSDictionary *abi = args[@"abi"];
+        if (![abi isKindOfClass:NSDictionary.class] || ![abi[@"arguments"] isKindOfClass:NSArray.class] ||
+            ![abi[@"return"] isKindOfClass:NSString.class] || [abi[@"arguments"] count] > 32) {
+            *error = @"abi requires arguments (0..32 fixed types) and return type"; return NO;
+        }
+        for (NSString *key in @[@"variadic", @"exception_unwind"]) {
+            id value = abi[key];
+            if (value && (![value isKindOfClass:NSNumber.class] || ([value doubleValue] != 0 && [value doubleValue] != 1))) {
+                *error = [key stringByAppendingString:@" must be a boolean"]; return NO;
+            }
+        }
+        if ([abi[@"variadic"] boolValue] || [abi[@"exception_unwind"] boolValue]) {
+            *error = @"variadic/exception-unwind ABI is not supported; use opaque entry-only capture"; return NO;
+        }
+        NSDictionary *types = @{@"pointer": @"^", @"object": @"@", @"u64": @"Q", @"i64": @"q",
+            @"u32": @"I", @"i32": @"i", @"u16": @"S", @"i16": @"s", @"u8": @"C", @"i8": @"c", @"bool": @"B", @"void": @"v"};
+        NSArray *arguments = abi[@"arguments"];
+        for (NSUInteger i = 0; i < arguments.count; i++) {
+            NSString *type = [arguments[i] isKindOfClass:NSString.class] ? types[arguments[i]] : nil;
+            if (!type || [type isEqualToString:@"v"]) { *error = @"ABI arguments support only fixed GPR scalar/pointer types"; return NO; }
+            o->argument_types[i] = [type UTF8String][0];
+        }
+        NSString *ret = types[abi[@"return"]];
+        if (!ret) { *error = @"ABI return supports void or GPR scalar/pointer types"; return NO; }
+        o->abi_declared = 1; o->argument_count = (unsigned)arguments.count; o->return_type = ret.UTF8String[0];
     }
-    // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
-    BOOL wantAfter = [args[@"capture_after"] boolValue];
-    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
-        dh_thunk_disable(slot);
-        return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
-    }
-    NSMutableDictionary *res = [@{@"slot": @(slot), @"symbol": sym, @"kind": @"import", @"enabled": @YES,
-                                  @"describe_args": describe ? @YES : @NO,
-                                  @"note": describe
-                                    ? @"record-only + C 字符串参数反引用(前 4 个参数里像可打印字符串的会被记内容); events land in category 'other' as algorithm 'import-hook'."
-                                    : @"record-only; events land in category 'other' as algorithm 'import-hook'. 传 describe_args:true 可尝试记录字符串参数(如 getaddrinfo 域名/dlopen 路径)。"} mutableCopy];
-    NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
-    if (capMulti) { res[@"capture_multi"] = capMulti; }
-    if (capRet) { res[@"capture_ret_multi"] = capRet; }
+    char reason[256] = {0};
+    if (dh_thunk_validate_options(o, reason, sizeof(reason))) { *error = @(reason); return NO; }
+    return YES;
+}
 
-    if (capEcho) {
-        res[@"capture"] = capEcho;
-        res[@"capture_phase"] = wantAfter ? @"return" : @"entry";
-        res[@"note"] = [res[@"note"] stringByAppendingString:dh_capture_phase_note(wantAfter, capPtr, capLen, capMax)];
+static NSDictionary *dh_install_hook(NSDictionary *args, dh_hook_kind kind, const char *owner,
+                                     const char *name, uint64_t address, NSString *label) {
+    dh_hook_options options; NSString *error = nil;
+    if (!dh_hook_options_from_args(args, &options, &error)) return tool_err(error);
+    if (kind == DH_HOOK_METHOD && options.abi_declared) return tool_err(@"method ABI comes from runtime; do not override it with a C declaration");
+    char reason[512] = {0};
+    int slot = dh_thunk_install_configured(kind, owner, name, address, [args[@"classMethod"] boolValue],
+        label.UTF8String, &options, reason, sizeof(reason));
+    if (slot <= -10) return tool_err([NSString stringWithFormat:@"symbol already hooked at slot %d; immutable configuration was not changed", -slot - 10]);
+    if (slot < 0) return tool_err([NSString stringWithFormat:@"hook install rejected (%d): %s", slot,
+        reason[0] ? reason : slot == -5 ? "target already hooked" : slot == -3 ? "method not found" : slot == -2 ? "target/import not found" : "installation unavailable"]);
+    NSMutableDictionary *out = [dh_thunk_metadata(slot) mutableCopy];
+    out[@"slot"] = @(slot); out[@"enabled"] = @YES;
+    out[@"kind"] = kind == DH_HOOK_METHOD ? @"method" : kind == DH_HOOK_INLINE ? @"inline" : @"import";
+    out[@"capture_return"] = @(options.capture_return); out[@"capture_after"] = @(options.capture_after);
+    out[@"capture_multi"] = @(options.capture_multi); out[@"capture_ret_multi"] = @(options.capture_ret_multi);
+    if (options.ptr_arg >= 0) {
+        out[@"capture"] = dh_capture_echo(options.ptr_arg, options.len_arg, options.max_bytes);
+        out[@"capture_phase"] = options.capture_after ? @"leave" : @"entry";
     }
-    return tool_ok(res);
+    out[@"note"] = @"configuration validated before patch publication; v2 events use phase/callId/parentCallId/payload; post supports declared fixed-GPR ABI with bounded stack forwarding, not exception unwinding";
+    return tool_ok(out);
+}
+
+static NSDictionary *tool_hook_import(NSDictionary *args) {
+    NSString *name = args[@"symbol"], *label = args[@"label"];
+    if (![name isKindOfClass:NSString.class] || !name.length) return tool_err(@"symbol required");
+    if (label && ![label isKindOfClass:NSString.class]) return tool_err(@"label must be a string");
+    return dh_install_hook(args, DH_HOOK_IMPORT, NULL, name.UTF8String, 0, label);
 }
 
 // hook_inline — 对任意函数装只读内联 hook (Dobby)。复用 thunk 表做入口快照 + 尾调用原函数。
@@ -1884,98 +1872,13 @@ static BOOL dh_parse_addr_arg(id raw, uint64_t *out) {
 }
 
 static NSDictionary *tool_hook_inline(NSDictionary *args) {
-    NSString *module = [args[@"module"] isKindOfClass:NSString.class] ? args[@"module"] : nil;
-    NSString *symbol = [args[@"symbol"] isKindOfClass:NSString.class] ? args[@"symbol"] : nil;
-    NSString *label  = [args[@"label"] isKindOfClass:NSString.class] ? args[@"label"] : nil;
-    uint64_t addr = 0;
-    BOOL hasAddr = (args[@"addr"] != nil);
-    if (hasAddr && !dh_parse_addr_arg(args[@"addr"], &addr)) {
-        return tool_err(@"addr 必须是数字或十六进制字符串（如 \"0x1004a2b30\"）");
-    }
-    if (!hasAddr && symbol.length == 0) {
-        return tool_err(@"symbol 或 addr 至少提供一个");
-    }
-    int capPtr = -1, capLen = -1, capMax = 0;
-    NSString *capErr = nil;
-    if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
-
-    char errbuf[256] = {0};
-    // 先校验 capture_multi 再分配槽位: 槽位一旦分配, 目标上的跳转/IMP/GOT 就已经改好了,
-    // 这时再因为参数不合法去「撤销」就必须完整回滚补丁 —— 漏一步就是内存安全事件。
-    {
-        NSString *pre = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-        NSString *preR = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
-    int pv = dh_thunk_validate_capture_multi(pre.UTF8String);
-    NSString *pvBad = pre;
-    if (pv == 0) { pv = dh_thunk_validate_capture_multi(preR.UTF8String); pvBad = preR; }
-        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pvBad.length]);
-        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pvBad]);
-    }
-    int slot = dh_thunk_install_inline(
-        module.length ? module.UTF8String : NULL,
-        symbol.length ? symbol.UTF8String : NULL,
-        addr, label.length ? label.UTF8String : NULL, errbuf, sizeof(errbuf));
-    if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
-    if (slot == -5) return tool_err([NSString stringWithFormat:
-        @"inline hook 拒绝安装: %s", errbuf[0] ? errbuf : "already hooked"]);
-    if (slot == -2) return tool_err([NSString stringWithFormat:
-        @"内联目标无法解析/不是可执行地址: %s. 传 module+symbol（如 \"libsystem_kernel.dylib\"+\"getpid\"）或绝对 addr。",
-        errbuf[0] ? errbuf : "unknown"]);
-    if (slot < 0) return tool_err([NSString stringWithFormat:
-        @"内联 hook 安装失败: %s", errbuf[0] ? errbuf : "unknown"]);
-
-    BOOL describe = [args[@"describe_args"] boolValue];
-    if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
-    BOOL wantRet = [args[@"capture_return"] boolValue];
-    if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
-    NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-    if (capMulti && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
-        dh_thunk_disable(slot);
-        return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
-    }
-    NSString *capRet = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
-    if (dh_thunk_validate_capture_multi(capRet.UTF8String) != 0)
-        return tool_err([NSString stringWithFormat:@"capture_ret_multi 非法: %@。语法同 capture_multi", capRet]);
-    for (NSString *tok in [capRet componentsSeparatedByString:@","]) {
-        NSString *t = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        if (!t.length) continue;
-        if (!([t hasPrefix:@"x0"] || [t hasPrefix:@"X0"] || [t hasPrefix:@"x1"] || [t hasPrefix:@"X1"] || [t hasPrefix:@"0"] || [t hasPrefix:@"1"]))
-            return tool_err([NSString stringWithFormat:@"capture_ret_multi 只接受 x0/x1（AAPCS64 只有这两个寄存器承载返回值）: %@", t]);
-    }
-    if (capRet && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
-        return tool_err(@"capture_ret_multi 应用失败（规格已校验通过, 说明槽位状态异常）");
-    if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
-        dh_thunk_disable(slot);
-        return tool_err(@"capture_memory 应用失败");
-    }
-    // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
-    BOOL wantAfter = [args[@"capture_after"] boolValue];
-    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
-        dh_thunk_disable(slot);
-        return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
-    }
-
-    NSString *display = label.length ? label
-        : (symbol.length ? (module.length ? [NSString stringWithFormat:@"%@!%@", module, symbol] : symbol)
-                         : [NSString stringWithFormat:@"0x%llx", (unsigned long long)addr]);
-    NSMutableDictionary *res = [@{
-        @"slot": @(slot), @"target": display, @"kind": @"inline", @"enabled": @YES,
-        @"backend": @(dh_thunk_inline_backend()),
-        @"describe_args": describe ? @YES : @NO,
-        @"note": (wantRet || wantAfter || capRet.length)
-            ? @"record-only inline hook: post 路径保留栈帧，记录返回寄存器/输出；当前不转发调用者栈参数，C ABI 须先核对。events: other/inline-hook；hard unhook 恢复入口并退休槽位。"
-            : @"record-only inline hook: 入口快照后尾调用原函数。events: other/inline-hook；hard unhook 恢复入口并退休槽位。"
-    } mutableCopy];
-    NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
-    if (capMulti) { res[@"capture_multi"] = capMulti; }
-    if (capRet) { res[@"capture_ret_multi"] = capRet; }
-
-    if (capEcho) {
-        res[@"capture"] = capEcho;
-        res[@"capture_phase"] = wantAfter ? @"return" : @"entry";
-        res[@"note"] = [res[@"note"] stringByAppendingString:dh_capture_phase_note(wantAfter, capPtr, capLen, capMax)];
-    }
-    return tool_ok(res);
+    NSString *module = args[@"module"], *symbol = args[@"symbol"], *label = args[@"label"];
+    for (id value in @[module ?: @"", symbol ?: @"", label ?: @""])
+        if (![value isKindOfClass:NSString.class]) return tool_err(@"module/symbol/label must be strings");
+    uint64_t address = 0;
+    if (args[@"addr"] && !dh_parse_addr_arg(args[@"addr"], &address)) return tool_err(@"invalid address");
+    if (!address && !symbol.length) return tool_err(@"symbol or non-zero address required");
+    return dh_install_hook(args, DH_HOOK_INLINE, module.UTF8String, symbol.UTF8String, address, label);
 }
 
 // trace_function — QBDI 指令级 trace（一次显式函数调用 + 有界指令记录）。
@@ -2019,82 +1922,10 @@ static NSDictionary *tool_trace_function(NSDictionary *args) {
 
 // hook_method — 对 ObjC 方法装只读 hook (method_setImplementation swizzle)。同一套 thunk, x0=self x1=_cmd。
 static NSDictionary *tool_hook_method(NSDictionary *args) {
-    NSString *cls = args[@"class"];
-    NSString *sel = args[@"selector"];
-    if (![cls isKindOfClass:NSString.class] || cls.length == 0) return tool_err(@"class required");
-    if (![sel isKindOfClass:NSString.class] || sel.length == 0) return tool_err(@"selector required");
-    BOOL classMethod = [args[@"classMethod"] boolValue];
-    BOOL needsPost = [args[@"capture_return"] boolValue] || [args[@"capture_after"] boolValue] ||
-        ([args[@"capture_ret_multi"] isKindOfClass:NSString.class] && [args[@"capture_ret_multi"] length] > 0);
-    if (needsPost && dh_thunk_method_post_supported(cls.UTF8String, sel.UTF8String, classMethod) == 0)
-        return tool_err(@"此方法含栈参数或复杂 ABI，当前 post 路径不能透明转发；请使用入口采集（不启用 capture_return/capture_after/capture_ret_multi）");
-    int capPtr = -1, capLen = -1, capMax = 0;
-    NSString *capErr = nil;
-    if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
-    // 先校验 capture_multi 再分配槽位: 槽位一旦分配, 目标上的跳转/IMP/GOT 就已经改好了,
-    // 这时再因为参数不合法去「撤销」就必须完整回滚补丁 —— 漏一步就是内存安全事件。
-    {
-        NSString *pre = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-        NSString *preR = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
-    int pv = dh_thunk_validate_capture_multi(pre.UTF8String);
-    NSString *pvBad = pre;
-    if (pv == 0) { pv = dh_thunk_validate_capture_multi(preR.UTF8String); pvBad = preR; }
-        if (pv == -2) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 过长: %lu 字节, 上限 95. 拆成更少的窗口。", (unsigned long)pvBad.length]);
-        if (pv != 0) return tool_err([NSString stringWithFormat:@"capture_multi/capture_ret_multi 非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", pvBad]);
-    }
-    int slot = dh_thunk_install_method(cls.UTF8String, sel.UTF8String, classMethod ? 1 : 0);
-    if (slot == -1) return tool_err([NSString stringWithFormat:@"thunk slots exhausted (max %d)", DH_THUNK_COUNT]);
-    if (slot == -5) return tool_err([NSString stringWithFormat:
-        @"-[%@ %@] is already method-hooked; unhook it first (hard:true restores the original IMP)", cls, sel]);
-    if (slot == -3) return tool_err([NSString stringWithFormat:@"class '%@' or its %@ method '%@' not found",
-                                     cls, classMethod ? @"class" : @"instance", sel]);
-    BOOL describe = [args[@"describe_args"] boolValue];
-    if (describe && dh_thunk_set_describe(slot, 1) != 0) describe = NO;
-    BOOL wantRet = [args[@"capture_return"] boolValue];
-    if (wantRet && dh_thunk_set_return(slot, 1) != 0) wantRet = NO;
-    NSString *capMulti = [args[@"capture_multi"] isKindOfClass:NSString.class] ? args[@"capture_multi"] : nil;
-    if (capMulti && dh_thunk_set_capture_multi(slot, capMulti.UTF8String) != 0) {
-        dh_thunk_disable(slot);
-        return tool_err([NSString stringWithFormat:@"capture_multi 语法非法: %@。只接受 x0..x8 加可选 :N，逗号分隔，例如 x0:64,x3:32", capMulti]);
-    }
-    NSString *capRet = [args[@"capture_ret_multi"] isKindOfClass:NSString.class] ? args[@"capture_ret_multi"] : nil;
-    if (dh_thunk_validate_capture_multi(capRet.UTF8String) != 0)
-        return tool_err([NSString stringWithFormat:@"capture_ret_multi 非法: %@。语法同 capture_multi", capRet]);
-    for (NSString *tok in [capRet componentsSeparatedByString:@","]) {
-        NSString *t = [tok stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        if (!t.length) continue;
-        if (!([t hasPrefix:@"x0"] || [t hasPrefix:@"X0"] || [t hasPrefix:@"x1"] || [t hasPrefix:@"X1"] || [t hasPrefix:@"0"] || [t hasPrefix:@"1"]))
-            return tool_err([NSString stringWithFormat:@"capture_ret_multi 只接受 x0/x1（AAPCS64 只有这两个寄存器承载返回值）: %@", t]);
-    }
-    if (capRet && dh_thunk_set_capture_ret_multi(slot, capRet.UTF8String) != 0)
-        return tool_err(@"capture_ret_multi 应用失败（规格已校验通过, 说明槽位状态异常）");
-    if (capPtr >= 0 && dh_thunk_set_capture(slot, capPtr, capLen, capMax) != 0) {
-        dh_thunk_disable(slot);
-        return tool_err(@"capture_memory 应用失败");
-    }
-    // capture_after 依赖 capture_ptr_arg, 必须在 capture_memory 之后设置。
-    BOOL wantAfter = [args[@"capture_after"] boolValue];
-    if (wantAfter && dh_thunk_set_capture_after(slot, 1) != 0) {
-        dh_thunk_disable(slot);
-        return tool_err(@"capture_after 需要同时给 capture_memory 指定 ptr_arg");
-    }
-    NSMutableDictionary *res = [@{@"slot": @(slot),
-                                  @"target": [NSString stringWithFormat:@"%@[%@ %@]", classMethod ? @"+" : @"-", cls, sel],
-                                  @"kind": @"method", @"enabled": @YES,
-                                  @"describe_args": describe ? @YES : @NO,
-                                  @"note": describe
-                                    ? @"record-only + 参数反引用(NSData→hex, NSString→文本, 其它→description); events land in category 'other' as algorithm 'objc-hook'."
-                                    : @"record-only; events land in category 'other' as algorithm 'objc-hook'. 传 describe_args:true 可直接记录参数内容。"} mutableCopy];
-    NSDictionary *capEcho = dh_capture_echo(capPtr, capLen, capMax);
-    if (capMulti) { res[@"capture_multi"] = capMulti; }
-    if (capRet) { res[@"capture_ret_multi"] = capRet; }
-
-    if (capEcho) {
-        res[@"capture"] = capEcho;
-        res[@"capture_phase"] = wantAfter ? @"return" : @"entry";
-        res[@"note"] = [res[@"note"] stringByAppendingString:dh_capture_phase_note(wantAfter, capPtr, capLen, capMax)];
-    }
-    return tool_ok(res);
+    NSString *cls = args[@"class"], *selector = args[@"selector"];
+    if (![cls isKindOfClass:NSString.class] || !cls.length) return tool_err(@"class required");
+    if (![selector isKindOfClass:NSString.class] || !selector.length) return tool_err(@"selector required");
+    return dh_install_hook(args, DH_HOOK_METHOD, cls.UTF8String, selector.UTF8String, 0, nil);
 }
 
 // list_hooks — 枚举当前所有动态 hook (含命中次数与启用状态)。
@@ -2125,9 +1956,10 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
         NSDictionary *cap = dh_capture_echo(info[i].capture_ptr_arg, info[i].capture_len_arg,
                                             info[i].capture_max_bytes);
         if (cap) h[@"capture"] = cap;
+        [h addEntriesFromDictionary:dh_thunk_metadata(info[i].slot)];
         [arr addObject:h];
     }
-    return tool_ok(@{@"count": @((NSInteger)arr.count), @"capacity": @(DH_THUNK_COUNT), @"hooks": arr});
+    return tool_ok(@{@"processGeneration": DHProcessGeneration(), @"count": @((NSInteger)arr.count), @"capacity": @(DH_THUNK_COUNT), @"hooks": arr});
 }
 
 // unhook — 卸载一个 hook。默认软停(停止记录, thunk 仍透明转发); hard=true 硬卸载:
@@ -2135,6 +1967,11 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
 static NSDictionary *tool_unhook(NSDictionary *args) {
     NSNumber *slot = args[@"slot"];
     if (![slot isKindOfClass:NSNumber.class]) return tool_err(@"slot (number) required");
+    if (slot.doubleValue != floor(slot.doubleValue) || slot.doubleValue < 0 || slot.doubleValue >= DH_THUNK_COUNT)
+        return tool_err(@"slot must be an integer within the hook bank");
+    id hardValue = args[@"hard"];
+    if (hardValue && (![hardValue isKindOfClass:NSNumber.class] || ([hardValue doubleValue] != 0 && [hardValue doubleValue] != 1)))
+        return tool_err(@"hard must be a boolean");
     BOOL hard = [args[@"hard"] boolValue];
     char errbuf[256] = {0};
     int r = dh_thunk_uninstall(slot.intValue, hard ? 1 : 0, errbuf, sizeof(errbuf));
@@ -2183,6 +2020,16 @@ static BOOL event_passes_extra(DHLogEntry *e,
     return YES;
 }
 
+static BOOL event_passes_context(DHLogEntry *event, NSDictionary *args) {
+    NSDictionary *keys = @{@"process_generation": @"processGeneration", @"call_id": @"callId",
+        @"parent_call_id": @"parentCallId", @"hook_id": @"hookId", @"phase": @"phase"};
+    for (NSString *key in keys) {
+        id value = args[key];
+        if (value && (![value isKindOfClass:NSString.class] || ![value isEqual:event.eventContext[keys[key]]])) return NO;
+    }
+    return YES;
+}
+
 // query_events —— 过滤检索捕获事件 (最新在前), 返回摘要
 static NSDictionary *tool_query_events(NSDictionary *args) {
     NSInteger cat = category_from_string(args[@"category"]);
@@ -2208,6 +2055,7 @@ static NSDictionary *tool_query_events(NSDictionary *args) {
     for (NSInteger i = (NSInteger)src.count - 1; i >= 0; i--) {
         DHLogEntry *e = src[i];
         if (since && e.seq <= since) continue;
+        if (!event_passes_context(e, args)) continue;
         if (!event_passes_extra(e, outHexEq, outHexPre, outLen, tid, sinceMs, untilMs, stackHas)) continue;
         matched++;
         if ((NSInteger)out.count < limit) [out addObject:dh_log_entry_summary(e)];
@@ -2483,6 +2331,73 @@ static NSDictionary *tool_get_event(NSDictionary *args) {
     DHLogEntry *e = [[DHLogStore shared] entryWithSeq:(uint64_t)seqN.unsignedLongLongValue];
     if (!e) return tool_err([NSString stringWithFormat:@"no event with seq %@", seqN]);
     return tool_ok(event_detail_with_frames(e, NSUIntegerMax, YES));
+}
+
+// get_call —— 依据真实 token 关联入口/出口与同步后代，不通过 detail 或 TID 猜测。
+static NSDictionary *tool_get_call(NSDictionary *args) {
+    NSString *callID = args[@"call_id"];
+    if (![callID isKindOfClass:NSString.class] || callID.length > 100) return tool_err(@"call_id required");
+    NSArray *pieces = [callID componentsSeparatedByString:@":"];
+    if (pieces.count != 2 || ![[NSUUID alloc] initWithUUIDString:pieces[0]] || ![pieces[1] length] ||
+        [pieces[1] rangeOfCharacterFromSet:NSCharacterSet.decimalDigitCharacterSet.invertedSet].location != NSNotFound)
+        return tool_err(@"call_id must contain a process generation and a decimal token");
+    NSString *generation = pieces[0];
+    for (NSString *field in @[@"limit", @"max_blob_bytes", @"max_output_bytes"]) {
+        id value = args[field];
+        if (value && (![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID() ||
+            !isfinite([value doubleValue]) || floor([value doubleValue]) != [value doubleValue]))
+            return tool_err(@"get_call budgets must be integer numbers");
+    }
+    id includeChildren = args[@"include_children"];
+    if (includeChildren && (![includeChildren isKindOfClass:NSNumber.class] ||
+        CFGetTypeID((__bridge CFTypeRef)includeChildren) != CFBooleanGetTypeID()))
+        return tool_err(@"include_children must be boolean");
+    NSInteger limit = args[@"limit"] ? [args[@"limit"] integerValue] : 50;
+    NSInteger blob = args[@"max_blob_bytes"] ? [args[@"max_blob_bytes"] integerValue] : 256;
+    NSInteger byteLimit = args[@"max_output_bytes"] ? [args[@"max_output_bytes"] integerValue] : 512 * 1024;
+    if (limit < 1 || limit > 200 || blob < 0 || blob > 8192 || byteLimit < 4096 || byteLimit > 2 * 1024 * 1024)
+        return tool_err(@"get_call budget out of range");
+    BOOL children = args[@"include_children"] ? [args[@"include_children"] boolValue] : YES;
+    NSArray<DHLogEntry *> *snapshot = [[DHLogStore shared] snapshot];
+    NSMutableSet *ids = [NSMutableSet setWithObject:callID];
+    if (children) {
+        for (unsigned depth = 0; depth < DH_CALL_DEPTH_MAX; depth++) {
+            NSUInteger before = ids.count;
+            for (DHLogEntry *e in snapshot) {
+                NSDictionary *c = e.eventContext;
+                if (![c[@"processGeneration"] isEqual:generation]) continue;
+                if ([ids containsObject:c[@"parentCallId"] ?: @""] && [c[@"callId"] length]) [ids addObject:c[@"callId"]];
+            }
+            if (ids.count == before) break;
+        }
+    }
+    DHLogEntry *entry = nil, *leave = nil;
+    NSMutableArray *events = [NSMutableArray array]; NSUInteger matched = 0, bytes = 0;
+    BOOL truncated = NO;
+    for (DHLogEntry *e in snapshot) {
+        NSDictionary *c = e.eventContext;
+        if (![c[@"processGeneration"] isEqual:generation]) continue;
+        BOOL root = [c[@"callId"] isEqual:callID];
+        if (root && [c[@"phase"] isEqual:@"entry"]) entry = e;
+        if (root && [c[@"phase"] isEqual:@"leave"]) leave = e;
+        if (![ids containsObject:c[@"callId"] ?: @""] && !(children && [ids containsObject:c[@"parentCallId"] ?: @""])) continue;
+        matched++;
+        if (events.count >= (NSUInteger)limit || truncated) { truncated = YES; continue; }
+        NSDictionary *detail = event_detail_with_frames(e, (NSUInteger)blob, NO);
+        NSData *json = [NSJSONSerialization dataWithJSONObject:detail options:0 error:nil];
+        if (json.length > (NSUInteger)byteLimit - bytes) { truncated = YES; continue; }
+        bytes += json.length; [events addObject:detail];
+    }
+    if (!matched) return tool_err(@"call events are unknown or no longer retained in the bounded store");
+    NSString *status = entry && leave ? @"paired"
+        : entry && [entry.eventContext[@"pairing"] isEqual:@"entry-only"] ? @"entry-only"
+        : entry ? @"open-or-leave-not-retained" : leave ? @"entry-not-retained" : @"root-not-retained";
+    return tool_ok(@{@"callId": callID, @"processGeneration": generation, @"status": status,
+        @"retainedPair": @(entry && leave), @"resultTruncated": @(truncated), @"matched": @(matched),
+        @"entrySeq": entry ? [NSString stringWithFormat:@"%llu", entry.seq] : (id)[NSNull null],
+        @"leaveSeq": leave ? [NSString stringWithFormat:@"%llu", leave.seq] : (id)[NSNull null],
+        @"parentScope": @"active-paired-synchronous-functions", @"events": events,
+        @"contextLostTotal": [NSString stringWithFormat:@"%llu", dh_call_context_lost()]});
 }
 
 // export_events —— 按 seq 升序分页导出完整 JSON；固定上界避免新事件插入扰动翻页。
@@ -2773,7 +2688,7 @@ static NSDictionary *tool_get_diag(NSDictionary *args) {
 // 工具元数据 (tools/list 用) + 分发
 // ============================================================
 static NSArray *tool_definitions(void) {
-    return @[
+    NSArray *base = @[
         @{
             @"name": @"get_capabilities",
             @"description": @"Handshake — call FIRST. Returns plugin version, packaging variant (dev/trollstore/rootless/roothide), CPU arch, current phase (observe|override), and per-tier hook capability flags (hook_import/hook_method/unpack). Also returns guidance.whenNoCryptoEvents: when standard crypto hooks (CCCrypt/EVP/SecKey) show no events but network traffic is encrypted, enumerate pointer+length imports (mlock/memcpy/read/send/getrandom) and capture at call time with hook_import(capture_memory) instead of attempting unsupported hooks.",
@@ -3454,6 +3369,52 @@ static NSArray *tool_definitions(void) {
             },
         },
     ];
+    NSMutableArray *tools = [NSMutableArray array];
+    NSSet *mutations = [NSSet setWithArray:@[@"hook_method", @"hook_inline", @"hook_import", @"unhook", @"trace_function", @"objc_call", @"run_hook_selftest"]];
+    for (NSDictionary *definition in base) {
+        NSMutableDictionary *d = [definition mutableCopy];
+        NSMutableDictionary *schema = [d[@"inputSchema"] mutableCopy];
+        NSMutableDictionary *properties = [schema[@"properties"] mutableCopy] ?: [NSMutableDictionary dictionary];
+        NSString *name = d[@"name"];
+        if ([mutations containsObject:name]) {
+            properties[@"process_generation"] = @{@"type": @"string", @"description": @"Current processGeneration from get_capabilities; stale/missing generations are rejected before mutation"};
+            NSMutableArray *required = [schema[@"required"] mutableCopy] ?: [NSMutableArray array];
+            [required addObject:@"process_generation"]; schema[@"required"] = required;
+        }
+        if ([name hasPrefix:@"hook_"] && ![name isEqualToString:@"hook_method"]) {
+            properties[@"abi"] = @{@"type": @"object", @"description": @"Required for C post capture: fixed GPR declaration, no variadic/float/aggregate/exception unwinding",
+                @"properties": @{@"arguments": @{@"type": @"array", @"maxItems": @32, @"items": @{@"type": @"string", @"enum": @[@"pointer", @"object", @"u64", @"i64", @"u32", @"i32", @"u16", @"i16", @"u8", @"i8", @"bool"]}},
+                    @"return": @{@"type": @"string", @"enum": @[@"void", @"pointer", @"object", @"u64", @"i64", @"u32", @"i32", @"u16", @"i16", @"u8", @"i8", @"bool"]},
+                    @"variadic": @{@"type": @"boolean"}, @"exception_unwind": @{@"type": @"boolean"}}, @"required": @[@"arguments", @"return"]};
+        }
+        if ([name isEqualToString:@"hook_method"]) {
+            properties[@"post_abi"] = @{@"type": @"string", @"enum": @[@"fixed-nonvariadic"],
+                @"description": @"Required for post capture: caller confirms fixed nonvariadic prototype; Objective-C metadata alone cannot detect ... methods"};
+        }
+        if ([name isEqualToString:@"query_events"]) {
+            for (NSString *key in @[@"process_generation", @"call_id", @"parent_call_id", @"hook_id", @"phase"])
+                properties[key] = @{@"type": @"string", @"description": @"Exact structured event-context filter; legacy records without the field do not match"};
+        }
+        if ([name isEqualToString:@"hook_method"])
+            d[@"description"] = @"Observe an Objective-C method. Runtime-declared fixed GPR/object arguments support bounded packed-stack forwarding for post capture; float/aggregate/variadic/exception ABI is not supported. Configuration is validated before installation and immutable after publication. Events expose phase/callId/parentCallId/payload.";
+        if ([name isEqualToString:@"hook_inline"])
+            d[@"description"] = @"Observe a native function via Dobby at a verified runtime address or module/symbol. Entry-only is the default; post requires an explicit fixed-GPR abi declaration and supports bounded stack forwarding. No variadic, float/aggregate or exception-unwind post. Events expose phase/callId/parentCallId/payload. Hard inline removal is refused without thread quiescence; soft stop retains the patch until target restart. Check actual backend availability.";
+        if ([name isEqualToString:@"hook_import"])
+            d[@"description"] = @"Observe a resolvable executable imported C symbol via fishhook. Registration covers present/future images with a fixed resolved-symbol forwarding target; per-image interposer chains are not preserved and successful GOT coverage must be confirmed by hits and entry/leave events. Post requires an explicit fixed-GPR abi declaration. Configuration is immutable; only soft stop is supported. Missing/data/allocator/runtime symbols are rejected before registration.";
+        if ([name isEqualToString:@"unhook"])
+            d[@"description"] = @"Stop recording. hard=true restores an owned ObjC IMP; inline hard removal refuses without thread quiescence, leaving state unchanged. Import supports soft stop only. Retired slot configuration is never reused.";
+        schema[@"properties"] = properties; d[@"inputSchema"] = schema; [tools addObject:d];
+    }
+    [tools addObject:@{@"name": @"get_call", @"description": @"Read a function invocation by structured call_id, pairing entry/leave and retained synchronous descendants. Reports missing retention and output limits; does not infer asynchronous/full native call graphs.",
+        @"inputSchema": @{@"type": @"object", @"required": @[@"call_id"], @"properties": @{
+            @"call_id": @{@"type": @"string"}, @"include_children": @{@"type": @"boolean"},
+            @"limit": @{@"type": @"number", @"minimum": @1, @"maximum": @200},
+            @"max_blob_bytes": @{@"type": @"number", @"minimum": @0, @"maximum": @8192},
+            @"max_output_bytes": @{@"type": @"number", @"minimum": @4096, @"maximum": @2097152}}}}];
+    [tools addObject:@{@"name": @"run_hook_selftest", @"description": @"Explicit native ABI/structured-event diagnostic on IDH-owned synthetic fixtures only. Optional fixed-C getpid import is soft-stopped and retained until target restart. Does not issue business requests or call a signing oracle.",
+        @"inputSchema": @{@"type": @"object", @"required": @[@"process_generation"], @"properties": @{
+            @"process_generation": @{@"type": @"string"}, @"include_c_import": @{@"type": @"boolean"}}}}];
+    return tools;
 }
 
 // ============================================================
@@ -3556,6 +3517,20 @@ static NSDictionary *tool_set_webkit_probe(NSDictionary *args) {
 }
 
 static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
+    if ([@[@"hook_method", @"hook_inline", @"hook_import", @"unhook", @"trace_function", @"objc_call", @"run_hook_selftest"] containsObject:name]) {
+        NSString *generation = args[@"process_generation"];
+        if (![generation isKindOfClass:NSString.class] || ![generation isEqualToString:DHProcessGeneration()])
+            return tool_err(@"missing or stale process_generation; fetch get_capabilities and re-resolve the target before mutation");
+    }
+    if ([name isEqualToString:@"get_call"]) return tool_get_call(args);
+    if ([name isEqualToString:@"run_hook_selftest"]) {
+        id flag = args[@"include_c_import"];
+        if (flag && (![flag isKindOfClass:NSNumber.class] || ([flag doubleValue] != 0 && [flag doubleValue] != 1)))
+            return tool_err(@"include_c_import must be a boolean");
+        return tool_ok(DHHookSelfTest([flag boolValue]));
+    }
+
+
     if ([name isEqualToString:@"get_capabilities"])      return tool_get_capabilities(args);
     if ([name isEqualToString:@"disassemble"])           return tool_disassemble(args);
     if ([name isEqualToString:@"analyze_function"])      return tool_analyze_function(args);
@@ -3630,7 +3605,7 @@ static BOOL tool_is_heavy(NSString *name) {
                                       @"find_selector_refs", @"find_function_refs",
                                       @"analyze_function", @"disassemble_function",
                                       @"find_objc_methods", @"export_events", @"start_dump",
-                                      @"trace_function"]];
+                                      @"trace_function", @"run_hook_selftest"]];
     });
     return [heavy containsObject:name];
 }

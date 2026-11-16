@@ -5,6 +5,7 @@
 #import "dh_capability.h"
 #import "dh_noise.h"
 #import "dh_log_json.h"
+#import "dh_event.h"
 #import <sys/sysctl.h>
 #import <sys/time.h>
 #import <stdatomic.h>
@@ -95,6 +96,12 @@ static NSData *dh_journal_line(DHLogEntry *e) {
     if (e.timestamp.length) m[@"t"] = e.timestamp;
     m[@"m"] = @(e.timestampMs);
     m[@"h"] = @(e.threadId);
+    if (e.eventContext) m[@"ec"] = e.eventContext;
+    if (e.eventPayload) {
+        NSData *encoded = [NSJSONSerialization dataWithJSONObject:e.eventPayload options:0 error:nil];
+        m[@"ep"] = encoded.length <= 64 * 1024 ? e.eventPayload
+            : @{@"omitted": @YES, @"reason": @"journal-payload-budget", @"originalBytes": @(encoded.length)};
+    }
     if (e.algorithm.length) m[@"a"] = e.algorithm;
     if (e.operation.length) m[@"o"] = e.operation;
     NSData *key    = dh_journal_bounded(e.key,    kMaxBlobLogged);
@@ -120,6 +127,9 @@ static DHLogEntry *dh_entry_from_journal(NSDictionary *m) {
     NSNumber *s = m[@"s"];
     if (![s isKindOfClass:[NSNumber class]]) return nil;
     DHLogEntry *e = [DHLogEntry new];
+    e.restoredFromJournal = YES;
+    e.eventContext = [m[@"ec"] isKindOfClass:NSDictionary.class] ? m[@"ec"] : nil;
+    e.eventPayload = [m[@"ep"] isKindOfClass:NSDictionary.class] ? m[@"ep"] : nil;
     e.seq = s.unsignedLongLongValue;
     NSInteger c = [m[@"c"] isKindOfClass:[NSNumber class]] ? [m[@"c"] integerValue] : DHCategoryOther;
     if (c < 0 || c > DHCategoryOther) c = DHCategoryOther;
@@ -473,6 +483,7 @@ static BOOL dh_noise_entry_matches_board(DHLogEntry *entry, DHNoiseBoard board) 
 
 - (void)append:(DHLogEntry *)entry {
     if (self.paused || entry == nil) return;
+    DHStampEvent(entry);
     // tid/tsMs 必须在调用(被 hook)线程上取, 即 dispatch_async 之前 —— 否则线程号会变成串行队列的。
     if (entry.timestampMs == 0) {
         struct timeval tv; gettimeofday(&tv, NULL);
@@ -530,6 +541,9 @@ static BOOL dh_noise_entry_matches_board(DHLogEntry *entry, DHNoiseBoard board) 
 - (void)replaceNetworkEntry:(DHLogEntry *)oldEntry with:(DHLogEntry *)newEntry {
     if (newEntry == nil) return;
     if (oldEntry == nil) { [self append:newEntry]; return; }
+    newEntry.eventContext = oldEntry.eventContext;
+    newEntry.eventPayload = oldEntry.eventPayload;
+    if (!newEntry.eventContext && !oldEntry.restoredFromJournal) DHStampEvent(newEntry);
     // tid/tsMs 与 append 同理: 必须在调用(被 hook)线程取, 即 dispatch 之前。
     if (newEntry.timestampMs == 0) {
         struct timeval tv; gettimeofday(&tv, NULL);

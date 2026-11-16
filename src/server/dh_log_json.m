@@ -2,6 +2,7 @@
 
 #import <Foundation/Foundation.h>
 #import "dh_log_json.h"
+#import "dh_event.h"
 
 // 分类短名单一真相源 —— 顺序必须与 DHCategory 枚举一致。
 // 加分类只改这里(和 log_store.h 枚举 + dh_capture.h 的 DH_CAP_CAT_COUNT), 其余处(http byCat/
@@ -150,6 +151,9 @@ NSDictionary *dh_log_entry_summary(DHLogEntry *e) {
     } mutableCopy];
     if (statusCode) out[@"statusCode"] = statusCode;
     if (netErr) out[@"netError"] = netErr;
+    out[@"schemaVersion"] = e.eventContext[@"schemaVersion"] ?: @1;
+    out[@"restoredFromJournal"] = @(e.restoredFromJournal);
+    if (e.eventContext) [out addEntriesFromDictionary:e.eventContext];
     return out;
 }
 
@@ -162,6 +166,7 @@ static NSData *bounded_blob(NSData *data, NSUInteger maxBytes, BOOL *truncated) 
 NSDictionary *dh_log_entry_detail_bounded(DHLogEntry *e, NSUInteger maxBlobBytes,
                                            BOOL includeDumps) {
     NSMutableDictionary *m = [dh_log_entry_summary(e) mutableCopy] ?: [NSMutableDictionary dictionary];
+    if (e.eventPayload) m[@"payload"] = DHExportPayload(e.eventPayload, maxBlobBytes);
     if (e.key) {
         BOOL truncated = NO;
         NSData *data = bounded_blob(e.key, maxBlobBytes, &truncated);

@@ -38,6 +38,10 @@ typedef NS_ENUM(NSInteger, DHCategory) {
 @property (nonatomic, assign) uint64_t threadId;           // 调用线程 id (pthread_threadid_np); 0=legacy
 @property (nonatomic, copy)   NSString *callStack;          // 应用层调用栈 (已过滤)
 @property (nonatomic, assign) uint64_t seq;                 // 自增序号
+// v2 关联信封与类型化快照。旧事件保持 nil，不将历史记录冒充当前进程。
+@property (nonatomic, copy, nullable) NSDictionary *eventContext;
+@property (nonatomic, copy, nullable) NSDictionary *eventPayload;
+@property (nonatomic, assign) BOOL restoredFromJournal;
 @end
 
 @interface DHLogStore : NSObject

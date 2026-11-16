@@ -16,6 +16,8 @@
 #import "log_store.h"
 #import "fishhook.h"
 #include "dh_method_arg_type.h"
+#import "dh_event.h"
+#include "dh_call_context.h"
 
 // 内联 hook 后端：Dobby（静态链接）。arm64e 切片在 Makefile 里把 DH_HAVE_INLINE 置 0，
 // 因为 vendor 里的 Dobby/QBDI 静态库只有 arm64 切片；代码仍编译，只拒绝安装并说明原因。
@@ -41,6 +43,7 @@ void *g_dh_thunk_orig[DH_THUNK_COUNT];
 // 需要记录返回值的槽位标记 (1 = 走 post 路径: 先调原函数, 抓到返回值再返回)。
 // 必须是全局符号, 汇编里按 slot 索引读。
 uint8_t g_dh_thunk_post[DH_THUNK_COUNT];
+uint16_t g_dh_thunk_stack_bytes[DH_THUNK_COUNT];
 
 // 槽位注册表 (单调分配; 软停不回收, 硬停后退休)。
 typedef struct {
@@ -54,6 +57,8 @@ typedef struct {
     uint8_t          method_object_gprs; // 允许作为 ObjC 对象反引用的 x2..x7 位
     unsigned int     method_stack_bytes;
     struct { uint16_t offset; uint8_t size, object; } method_stack_args[26]; // arg6..arg31
+    char             argument_types[32][64];
+    char             return_type[64];
     _Atomic int      capture_ptr_arg;   // >=0: 抓该寄存器位置的指针参数
     _Atomic int      capture_len_arg;   // >=0: 从该寄存器取长度; -1: 固定长度
     _Atomic int      capture_max_bytes;
@@ -64,6 +69,7 @@ typedef struct {
     char             capture_ret_multi[96];  // 同上, 但作用于「返回值寄存器」(post 路径)
     _Atomic int      capture_ret_multi_ready;
     dh_hook_kind     kind;
+    char             import_symbol[256]; // fishhook keeps this pointer for future images
     int              used;
     void            *target;          // inline: DobbyHook 的目标地址
     void            *method;          // method: Method 指针 (硬卸载恢复 IMP)
@@ -76,6 +82,148 @@ typedef struct {
 static dh_slot_t g_slots[DH_THUNK_COUNT];
 static _Atomic int g_next_slot = 0;
 static pthread_mutex_t g_install_lock = PTHREAD_MUTEX_INITIALIZER;
+static __thread const dh_hook_options *g_pending_options;
+static dh_hook_options g_slot_options[DH_THUNK_COUNT];
+static NSDictionary *g_slot_targets[DH_THUNK_COUNT];
+static _Atomic int g_slot_published[DH_THUNK_COUNT];
+static _Atomic uint64_t g_slot_inflight[DH_THUNK_COUNT];
+static void dh_prepare_slot_options(int slot);
+static BOOL dh_addr_is_executable(uint64_t addr);
+static int dh_unsafe_runtime_symbol(const char *symbol) {
+    if (!symbol) return 0;
+    if (symbol[0] == '_') symbol++;
+    static const char *names[] = {"malloc", "calloc", "realloc", "free", "valloc", "posix_memalign",
+        "aligned_alloc", "malloc_zone_malloc", "malloc_zone_calloc", "malloc_zone_realloc",
+        "malloc_zone_free", "objc_msgSend", "objc_retain", "objc_release", NULL};
+    for (unsigned i = 0; names[i]; i++) if (!strcmp(symbol, names[i])) return 1;
+    return 0;
+}
+
+void dh_thunk_options_default(dh_hook_options *o) {
+    memset(o, 0, sizeof(*o)); o->ptr_arg = -1; o->len_arg = -1;
+}
+
+int dh_thunk_validate_options(const dh_hook_options *o, char *err, size_t errsz) {
+    const char *failure = NULL;
+    if (!o) failure = "hook options required";
+    else if (o->ptr_arg < -1 || o->ptr_arg > 8 || o->len_arg < -1 || o->len_arg > 8 ||
+             (o->ptr_arg >= 0 && (o->max_bytes < 1 || o->max_bytes > DH_THUNK_CAPTURE_MAX)))
+        failure = "capture_memory register/length/budget invalid";
+    else if (o->capture_after && o->ptr_arg < 0) failure = "capture_after requires capture_memory";
+    else if (dh_thunk_validate_capture_multi(o->capture_multi)) failure = "capture_multi invalid or outside budget";
+    else if (dh_thunk_validate_capture_ret_multi(o->capture_ret_multi)) failure = "capture_ret_multi accepts only x0/x1 within budget";
+    else if (o->argument_count > 32) failure = "ABI supports at most 32 fixed arguments";
+    else if (o->abi_declared) {
+        for (unsigned int i = 0; i < o->argument_count; i++) {
+            char type[2] = {o->argument_types[i], 0};
+            if (!dh_method_arg_type(type)) { failure = "ABI argument must be a fixed GPR scalar/pointer"; break; }
+        }
+        char ret[2] = {o->return_type, 0};
+        if (!failure && o->return_type != 'v' && !dh_method_arg_type(ret)) failure = "ABI return must be void or a GPR scalar/pointer";
+        if (!failure && o->return_type == 'v' && o->capture_ret_multi[0]) failure = "void ABI has no return registers to capture";
+    }
+    if (failure) { if (err && errsz) snprintf(err, errsz, "%s", failure); return -1; }
+    return 0;
+}
+
+int dh_thunk_install_configured(dh_hook_kind kind, const char *owner, const char *name,
+    uint64_t address, int classMethod, const char *label, const dh_hook_options *options,
+    char *err, size_t errsz) {
+    if (err && errsz) err[0] = 0;
+    if (dh_thunk_validate_options(options, err, errsz)) return -6;
+    if (kind != DH_HOOK_METHOD && dh_unsafe_runtime_symbol(name)) {
+        if (err && errsz) snprintf(err, errsz, "allocator/runtime hooks are unsafe because the event handler allocates");
+        return -6;
+    }
+    int post = options->capture_return || options->capture_after || options->capture_ret_multi[0];
+    if (kind == DH_HOOK_METHOD && post && !options->fixed_abi) {
+        if (err && errsz) snprintf(err, errsz, "method post ABI requires post_abi=fixed-nonvariadic; runtime metadata does not identify variadic methods");
+        return -6;
+    }
+    if (kind != DH_HOOK_METHOD && post && !options->abi_declared) {
+        if (err && errsz) snprintf(err, errsz, "C post capture requires an explicit fixed-GPR abi declaration; unknown/variadic ABI is entry-only");
+        return -6;
+    }
+    if (kind == DH_HOOK_METHOD && post) {
+        if (dh_thunk_method_post_supported(owner, name, classMethod) != 1) {
+            if (err && errsz) snprintf(err, errsz, "method post ABI unsupported (floating/aggregate/unknown or argument budget); use entry-only");
+            return -6;
+        }
+        Class cls = objc_getClass(owner);
+        Method m = classMethod ? class_getClassMethod(cls, sel_registerName(name)) : class_getInstanceMethod(cls, sel_registerName(name));
+        char *ret = m ? method_copyReturnType(m) : NULL;
+        int voidWindow = ret && ret[0] == 'v' && options->capture_ret_multi[0];
+        free(ret);
+        if (voidWindow) { if (err && errsz) snprintf(err, errsz, "void method ABI has no return registers to capture"); return -6; }
+    }
+    g_pending_options = options;
+    int slot = kind == DH_HOOK_METHOD ? dh_thunk_install_method(owner, name, classMethod)
+        : kind == DH_HOOK_INLINE ? dh_thunk_install_inline(owner, name, address, label, err, errsz)
+        : dh_thunk_install_import(name, label);
+    g_pending_options = NULL;
+    return slot;
+}
+
+static void dh_prepare_slot_options(int slot) {
+    dh_slot_t *s = &g_slots[slot];
+    dh_hook_options defaults;
+    dh_thunk_options_default(&defaults);
+    const dh_hook_options *o = g_pending_options ?: &defaults;
+    g_slot_options[slot] = *o;
+    if (s->kind != DH_HOOK_METHOD) {
+        s->method_arg_count = o->abi_declared ? o->argument_count : 0;
+        s->method_simple_gpr = o->abi_declared;
+        s->return_type[0] = o->abi_declared ? o->return_type : '?';
+        for (unsigned i = 0; i < s->method_arg_count; i++) s->argument_types[i][0] = o->argument_types[i];
+    }
+    unsigned registers = s->kind == DH_HOOK_METHOD ? 6 : 8;
+    s->method_stack_bytes = 0;
+    memset(s->method_stack_args, 0, sizeof(s->method_stack_args));
+    if (s->method_simple_gpr) {
+        for (unsigned i = registers; i < s->method_arg_count && i < 32; i++) {
+            unsigned size = dh_method_arg_size(s->argument_types[i]);
+            unsigned offset = dh_method_stack_offset(s->method_stack_bytes, size);
+            s->method_stack_args[i - registers].offset = offset;
+            s->method_stack_args[i - registers].size = size;
+            s->method_stack_args[i - registers].object = dh_method_arg_type(s->argument_types[i]) == 2;
+            s->method_stack_bytes = offset + size;
+        }
+    }
+    atomic_store(&s->describe_args, o->describe_args);
+    atomic_store(&s->capture_ptr_arg, o->ptr_arg);
+    atomic_store(&s->capture_len_arg, o->len_arg);
+    atomic_store(&s->capture_max_bytes, o->max_bytes);
+    atomic_store(&s->capture_return, o->capture_return);
+    atomic_store(&s->capture_after, o->capture_after);
+    strlcpy(s->capture_multi, o->capture_multi, sizeof(s->capture_multi));
+    strlcpy(s->capture_ret_multi, o->capture_ret_multi, sizeof(s->capture_ret_multi));
+    atomic_store(&s->capture_multi_ready, o->capture_multi[0] ? 2 : 0);
+    atomic_store(&s->capture_ret_multi_ready, o->capture_ret_multi[0] ? 2 : 0);
+    g_dh_thunk_post[slot] = o->capture_return || o->capture_after || o->capture_ret_multi[0];
+    g_dh_thunk_stack_bytes[slot] = s->method_stack_bytes;
+    g_slot_targets[slot] = DHTargetIdentity(s->target ?: g_dh_thunk_orig[slot]);
+}
+
+NSDictionary *dh_thunk_metadata(int slot) {
+    if (slot < 0 || slot >= DH_THUNK_COUNT || !g_slots[slot].used) return @{};
+    dh_slot_t *s = &g_slots[slot];
+    BOOL known = s->kind == DH_HOOK_METHOD || g_slot_options[slot].abi_declared;
+    BOOL post = known && s->method_simple_gpr && s->method_arg_count <= 32 &&
+        (s->return_type[0] == 'v' || dh_method_arg_type(s->return_type));
+    return @{@"hookId": [NSString stringWithFormat:@"%@:hook:%d", DHProcessGeneration(), slot],
+        @"processGeneration": DHProcessGeneration(), @"targetIdentity": g_slot_targets[slot] ?: @{},
+        @"configurationImmutable": @YES, @"inFlight": [NSString stringWithFormat:@"%llu", atomic_load(&g_slot_inflight[slot])],
+        @"importBindingPolicy": s->kind == DH_HOOK_IMPORT ? @"resolved-symbol; present-and-future-images; interposers-not-preserved; write-coverage-not-guaranteed" : @"not-applicable",
+        @"abi": @{@"source": s->kind == DH_HOOK_METHOD ? @"objc-runtime" : known ? @"client-declaration" : @"unknown",
+            @"argumentCount": known ? @(s->method_arg_count) : (id)[NSNull null],
+            @"argumentMapping": s->method_simple_gpr ? @"fixed-gpr" : @"opaque-registers",
+            @"returnType": @(s->return_type), @"stackBytes": @(s->method_stack_bytes),
+            @"postSupported": @(post), @"stackForwarding": @(post),
+            @"fixedSignatureAsserted": @(s->kind == DH_HOOK_METHOD ? g_slot_options[slot].fixed_abi : known),
+            @"variadicDetection": @NO,
+            @"floatAggregatePost": @NO, @"variadicPost": @NO, @"exceptionUnwind": @NO,
+            @"hardInlineUnhook": @NO}};
+}
 
 #if defined(__arm64__) || defined(__aarch64__)
 
@@ -111,6 +259,7 @@ __asm__(
 "  add  x2, sp, #0x130\n"         //         caller_sp = 当前帧之上的原始 SP
 "  mov  x3, x30\n"                //         lr)
 "  bl   _dh_thunk_handler\n"
+"  str  x0, [sp, #0x128]\n"       // 本次调用 token
 "  ldp  x0, x1, [sp, #0x00]\n"
 "  ldp  x2, x3, [sp, #0x10]\n"
 "  ldp  x4, x5, [sp, #0x20]\n"
@@ -149,7 +298,22 @@ __asm__(
 "  stp  x11, x12, [x9, #0x30]\n"
 "  ldr  x11, [x10, #0x40]\n"
 "  str  x11, [x9, #0x40]\n"
+// 独立的 256B outgoing 区，不覆盖入口快照/调用 token。已知 ABI 才设置 stack_bytes。
+"  sub  sp, sp, #0x100\n"
+"  adrp x9, _g_dh_thunk_stack_bytes@PAGE\n"
+"  add  x9, x9, _g_dh_thunk_stack_bytes@PAGEOFF\n"
+"  ldrh w9, [x9, x17, lsl #1]\n"
+"  add  x10, sp, #0x230\n"      // 原始 caller SP
+"  mov  x11, sp\n"
+"  cbz  x9, 3f\n"
+"2:\n"
+"  ldrb w12, [x10], #1\n"
+"  strb w12, [x11], #1\n"
+"  subs x9, x9, #1\n"
+"  b.ne 2b\n"
+"3:\n"
 "  blr  x16\n"
+"  add  sp, sp, #0x100\n"
 "  str  x0, [sp, #0x00]\n"            // 返回值 x0
 "  str  x1, [sp, #0x08]\n"            // 返回值 x1 (结构体/双整返回)
 "  stp  q0, q1, [sp, #0x50]\n"        // 浮点/向量返回值
@@ -159,6 +323,7 @@ __asm__(
 "  add  x1, sp, #0\n"                 //                    retval regs,
 "  ldp  x2, x3, [sp, #0xD0]\n"        //                    orig, real_lr)
 "  add  x4, sp, #0xE0\n"           //                    entry_regs)
+"  ldr  x5, [sp, #0x128]\n"        //                    call token)
 "  bl   _dh_thunk_post_handler\n"
 "  ldr  x0, [sp, #0x00]\n"
 "  ldr  x1, [sp, #0x08]\n"
@@ -217,120 +382,6 @@ static NSData *dh_capture_at(uint64_t addr, size_t want) {
     return data;
 }
 
-static NSData *dh_capture_arg_memory(dh_slot_t *s, uint64_t *gpr) {
-    int ptrArg = atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire);
-    if (ptrArg < 0 || ptrArg > 8) return nil;
-    int lenArg = atomic_load_explicit(&s->capture_len_arg, memory_order_relaxed);
-    int maxBytes = atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed);
-    if (maxBytes <= 0 || maxBytes > DH_THUNK_CAPTURE_MAX) return nil;
-    uint64_t addr = gpr[ptrArg];
-    if (addr < 0x100000000ULL) return nil;
-    size_t want = (size_t)maxBytes;
-    if (lenArg >= 0 && lenArg <= 8) {
-        uint64_t rawLen = gpr[lenArg];
-        if (rawLen == 0) return nil;
-        if (rawLen < want) want = (size_t)rawLen;
-    }
-    if (want == 0) return nil;
-    NSMutableData *data = [NSMutableData dataWithLength:want];
-    if (!data) return nil;
-    vm_size_t got = 0;
-    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)addr,
-                                         (vm_size_t)want,
-                                         (mach_vm_address_t)data.mutableBytes, &got);
-    if (kr != KERN_SUCCESS || got == 0) return nil;
-    if (got < want) data.length = got;
-    return data;
-}
-
-// 多窗口抓取: 一次 hook 同时看多个寄存器指向的内存。
-// 为什么需要: 一个 inline 目标只能装一个 hook(重复装会被拒绝), 而分析一个函数往往要同时
-// 看「输入 / 密钥 / 输出」三个寄存器。没有这个能力就只能卸了重装, 而 inline 槽位一旦
-// 分配不会回收 —— 每次换寄存器都得重启目标进程, 实测把一轮分析拖成十几分钟。
-// 语法: "x0:64,x3:32,x5:128" 或 "0:64,3:32"; len 用 :N 显式给, 不给就用 max_bytes 上限。
-// 返回 @[{reg, addr, bytes(NSData)}], 由调用方渲染。
-static NSArray *dh_capture_spec(const char *specRaw, uint64_t *gpr, int defaultMax);
-
-// 把多窗口抓取结果渲染成事件 detail。入口路径与返回值路径共用。
-static void dh_render_windows(NSMutableString *d, const char *spec, _Atomic int *ready,
-                              uint64_t *gpr, int defaultMax, NSString *tag) {
-    int sq1 = atomic_load_explicit(ready, memory_order_acquire);
-    // 0 = 从未设置; 奇数 = 写作中; spec 为空 = 已被清空(清空也推进版本号, 所以靠 spec 判断)。
-    if (sq1 == 0 || (sq1 & 1) || !spec[0]) return;
-    NSArray *wins = dh_capture_spec(spec, gpr, defaultMax);
-    static const char hexd[] = "0123456789abcdef";
-    for (NSDictionary *w in wins) {
-        int reg = [w[@"reg"] intValue];
-        NSData *b = w[@"bytes"];
-        uint64_t waddr = [w[@"addr"] unsignedLongLongValue];
-        // 必须自己转完整 hex: NSData.description 会在 16 字节后折叠成 "...", 分析时等于白抓。
-        // 用查表 + stringWithCharacters 一次成串: 逐字节 appendFormat 在热函数上是几万次
-        // 格式化调用, 会把命中耗时拉长到毫秒级, 改变目标 App 的时序。
-        NSUInteger take = b.length;
-        unichar *hbuf = (unichar *)malloc(take * 2 * sizeof(unichar));
-        if (!hbuf) {
-            [d appendFormat:@"\n%@ x%d @0x%llx = %lu bytes (hex alloc failed)", tag, reg, waddr, (unsigned long)b.length];
-            continue;
-        }
-        const uint8_t *p = (const uint8_t *)b.bytes;
-        for (NSUInteger k = 0; k < take; k++) {
-            hbuf[k * 2]     = (unichar)hexd[p[k] >> 4];
-            hbuf[k * 2 + 1] = (unichar)hexd[p[k] & 0xF];
-        }
-        NSString *hex = [NSString stringWithCharacters:hbuf length:take * 2];
-        free(hbuf);
-        [d appendFormat:@"\n%@ x%d @0x%llx = %lu bytes: %@", tag, reg, waddr, (unsigned long)b.length, hex];
-    }
-    if (!wins.count) [d appendFormat:@"\n%@ [%s] unreadable (所有窗口都读不到: 地址<4GB 或 vm_read_overwrite 失败)", tag, spec];
-    if (atomic_load_explicit(ready, memory_order_acquire) != sq1)
-        [d appendFormat:@"\n(注意: 抓取期间 %@ 规格被改写, 本次窗口可能来自旧规格)", tag];
-}
-
-static NSArray *dh_capture_spec(const char *specRaw, uint64_t *gpr, int defaultMax) {
-    if (!specRaw || !specRaw[0]) return nil;
-    NSString *spec = @(specRaw);
-    if (!spec.length) return nil;
-    NSMutableArray *out = [NSMutableArray array];
-    for (NSString *piece in [spec componentsSeparatedByString:@","]) {
-        NSString *tok = [piece stringByTrimmingCharactersInSet:
-                         [NSCharacterSet whitespaceCharacterSet]];
-        if (!tok.length) continue;
-        NSArray *parts = [tok componentsSeparatedByString:@":"];
-        if (parts.count > 2) continue;   // 多余段直接拒绝, 不静默忽略
-        NSString *regPart = parts[0];
-        if (regPart.length && ([regPart characterAtIndex:0] == 'x' || [regPart characterAtIndex:0] == 'X'))
-            regPart = [regPart substringFromIndex:1];
-        // 严格数字校验: 只靠 intValue 会把 "abc" 当成 0 去抓 x0。
-        NSCharacterSet *nonDigits = [[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet];
-        if (!regPart.length || [regPart rangeOfCharacterFromSet:nonDigits].location != NSNotFound) continue;
-        int reg = [regPart intValue];
-        if (reg < 0 || reg > 8) continue;
-        int want = defaultMax;
-        if (parts.count > 1) {
-            NSString *n = parts[1];
-            if (!n.length || [n rangeOfCharacterFromSet:nonDigits].location != NSNotFound) continue;
-            want = [n intValue];
-        }
-        // 未配 capture_memory 时 capture_max_bytes 是 0。此时不能钳到 CAPTURE_MAX(8192):
-        // 省略 :N 的窗口会变成 8KB/个, 4 个窗口就是 32KB 的 vm_read + 64K 字符 hex,
-        // 全在目标 App 的命中线程上跑, 而事件 detail 上限只有 8KB —— 又慢又拿不到数据。
-        if (want <= 0) want = 256;
-        if (want > DH_THUNK_CAPTURE_MAX) want = DH_THUNK_CAPTURE_MAX;
-        uint64_t addr = gpr[reg];
-        if (addr < 0x100000000ULL) continue;
-        void *buf = malloc((size_t)want);
-        if (!buf) continue;
-        mach_vm_size_t got = 0;
-        kern_return_t kr = vm_read_overwrite(mach_task_self(), (mach_vm_address_t)addr,
-                                             (mach_vm_size_t)want, (mach_vm_address_t)buf, &got);
-        NSData *b = (kr == KERN_SUCCESS && got > 0) ? [NSData dataWithBytes:buf length:(NSUInteger)got] : nil;
-        free(buf);
-        if (!b.length) continue;
-        [out addObject:@{@"reg": @(reg), @"addr": @(addr), @"bytes": b}];
-    }
-    return out.count ? out : nil;
-}
-
 static BOOL dh_is_runtime_class(Class c) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -346,7 +397,8 @@ static BOOL dh_is_runtime_class(Class c) {
     return bsearch(&c, gDHKnownClasses, gDHKnownClassCount, sizeof(Class), dh_class_cmp) != NULL;
 }
 
-static NSString *dh_describe_arg(uint64_t v) {
+static NSString *dh_describe_arg(uint64_t v, NSDictionary **snapshot) {
+    if (snapshot) *snapshot = nil;
     if (v < 0x100000000ULL || (v & 0x7)) return nil;    // 判定分两层, 顺序很重要:
     //   1) vm_read_overwrite 确认地址可读(挡野指针);
     //   2) 读出对象头 isa → 剥离 PAC(arm64e/Apple Silicon 上 isa 是签名指针) → 必须命中运行时类表。
@@ -374,6 +426,9 @@ static NSString *dh_describe_arg(uint64_t v) {
     @try {
         if ([obj isKindOfClass:[NSData class]]) {
             NSData *data = (NSData *)obj;
+            NSUInteger take = MIN(data.length, (NSUInteger)256);
+            if (snapshot) *snapshot = @{@"kind": @"NSData", @"length": [NSString stringWithFormat:@"%lu", (unsigned long)data.length],
+                @"capturedLength": @(take), @"hex": DHHexFromData([data subdataWithRange:NSMakeRange(0, take)]), @"truncated": @(take < data.length)};
             NSUInteger n = MIN(data.length, (NSUInteger)64);
             NSData *head = n ? [data subdataWithRange:NSMakeRange(0, n)] : [NSData data];
             return [NSString stringWithFormat:@"NSData(%lu) %@%@", (unsigned long)data.length,
@@ -381,14 +436,19 @@ static NSString *dh_describe_arg(uint64_t v) {
         }
         if ([obj isKindOfClass:[NSString class]]) {
             NSString *s = (NSString *)obj;
+            NSString *bounded = s.length > 1024 ? [s substringToIndex:1024] : s;
+            NSData *utf8 = [bounded dataUsingEncoding:NSUTF8StringEncoding];
+            if (snapshot) *snapshot = @{@"kind": @"NSString", @"length": [NSString stringWithFormat:@"%lu", (unsigned long)s.length],
+                @"text": bounded, @"hex": DHHexFromData(utf8), @"capturedLength": @(utf8.length), @"truncated": @(bounded.length < s.length)};
             // 返回值常常就是整条签名/header (几百到几千字符), 截到 200 会把要看的字段切掉。
             // 这里放宽到 4000 字符, 与事件 detail 的展示上限一致; 再长的才截断。
             NSString *t = s.length > 4000 ? [[s substringToIndex:4000] stringByAppendingString:@"…"] : s;
             return [NSString stringWithFormat:@"NSString(%lu) %@", (unsigned long)s.length, t];
         }
-        NSString *desc = [obj description];
-        if (desc.length > 4000) desc = [[desc substringToIndex:4000] stringByAppendingString:@"…"];
-        return desc;
+        // 不执行任意目标对象的 description：它可能有副作用/递归/高开销。
+        NSString *name = NSStringFromClass(object_getClass(obj));
+        if (snapshot) *snapshot = @{@"kind": @"object", @"class": name ?: @"?", @"address": [NSString stringWithFormat:@"0x%llx", v]};
+        return [NSString stringWithFormat:@"<%@: 0x%llx>", name ?: @"?", v];
     } @catch (__unused NSException *ex) {
         return @"<describe-exception>";
     }
@@ -415,166 +475,175 @@ static NSString *dh_describe_cstr(uint64_t p) {
     return s.length > 200 ? [[s substringToIndex:200] stringByAppendingString:@"…"] : s;
 }
 
-// 汇编蹦床唯一的 C 落点。slot=槽位; gpr[0..8]=x0..x8; caller_sp/lr 供参考。
-void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t lr) {
-    if (slot >= DH_THUNK_COUNT) return;
-    dh_slot_t *s = &g_slots[slot];
-    if (!atomic_load_explicit(&s->enabled, memory_order_relaxed)) return;  // 已 unhook: 静默转发
-    uint64_t n = atomic_fetch_add_explicit(&s->hits, 1, memory_order_relaxed) + 1;
-    if (g_in_thunk) return;             // 重入: 只计数不记录
-    g_in_thunk = 1;
-    @autoreleasepool {
-        DHLogEntry *e = [DHLogEntry new];
-        e.category  = DHCategoryOther;
-        e.algorithm = (s->kind == DH_HOOK_METHOD) ? @"objc-hook"
-                    : (s->kind == DH_HOOK_INLINE) ? @"inline-hook" : @"import-hook";
-        e.operation = [NSString stringWithUTF8String:s->name];
-        NSMutableString *d = [NSMutableString stringWithFormat:@"slot=%llu hits=%llu\n",
-                              (unsigned long long)slot, (unsigned long long)n];
-        [d appendFormat:@"caller_lr=0x%llx caller_sp=0x%llx\n", lr, caller_sp];
-        if (s->kind == DH_HOOK_METHOD) {
-            [d appendFormat:@"self=0x%llx _cmd=%s\n", gpr[0],
-                sel_getName((SEL)gpr[1]) ?: "?"];
-            [d appendFormat:@"declared_args=%u argument_mapping=%s\nraw registers: ",
-                s->method_arg_count, s->method_simple_gpr ? "simple-gpr" : "unsupported-signature"];
-            for (int i = 2; i < 9; i++) [d appendFormat:@"x%d=0x%llx ", i, gpr[i]];
-            if (s->method_simple_gpr) {
-                unsigned int observed = s->method_arg_count < 6 ? s->method_arg_count : 6;
-                for (unsigned int ai = 0; ai < observed; ai++) {
-                    int reg = (int)ai + 2;
-                    [d appendFormat:@"\narg%u(x%d)=0x%llx", ai, reg, gpr[reg]];
-                    if (atomic_load_explicit(&s->describe_args, memory_order_relaxed) &&
-                        (s->method_object_gprs & (1u << reg))) {
-                        NSString *desc = dh_describe_arg(gpr[reg]);
-                        if (desc.length) [d appendFormat:@"\n  arg%u = %@", ai, desc];
-                    }
-                }
-                unsigned int stackObserved = 0;
-                if (s->method_stack_bytes) {
-                    uint8_t snapshot[256];
-                    vm_size_t got = 0;
-                    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)caller_sp,
-                        s->method_stack_bytes, (vm_address_t)snapshot, &got);
-                    for (unsigned int ai = 6; ai < s->method_arg_count && ai < 32; ai++) {
-                        unsigned int offset = s->method_stack_args[ai - 6].offset;
-                        unsigned int size = s->method_stack_args[ai - 6].size;
-                        if (!size || kr != KERN_SUCCESS || offset + size > got) {
-                            [d appendFormat:@"\narg%u = unobserved (stack unreadable or snapshot budget)", ai];
-                            continue;
-                        }
-                        uint64_t value = 0;
-                        memcpy(&value, snapshot + offset, size);
-                        stackObserved++;
-                        [d appendFormat:@"\narg%u(sp+0x%x,size=%u)=0x%llx", ai, offset, size, value];
-                        if (s->method_stack_args[ai - 6].object &&
-                            atomic_load_explicit(&s->describe_args, memory_order_relaxed)) {
-                            NSString *desc = dh_describe_arg(value);
-                            if (desc.length) [d appendFormat:@"\n  arg%u = %@", ai, desc];
-                        }
-                    }
-                }
-                if (s->method_arg_count > observed + stackObserved)
-                    [d appendFormat:@"\nunobserved_args=%u", s->method_arg_count - observed - stackObserved];
-            } else {
-                [d appendString:@"\nargument values not inferred for floating-point/aggregate/unknown signatures"];
-            }
-        } else {
-            for (int i = 0; i < 9; i++) [d appendFormat:@"x%d=0x%llx ", i, gpr[i]];
-            if (atomic_load_explicit(&s->describe_args, memory_order_relaxed)) {
-                for (int i = 0; i <= 3; i++) {
-                    NSString *desc = dh_describe_cstr(gpr[i]);
-                    if (desc.length) [d appendFormat:@"\n  arg%d(cstr) = %@", i, desc];
-                }
-            }
-        }
-        int capPtr = atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire);
-        if (capPtr >= 0 && capPtr <= 8 &&
-            !atomic_load_explicit(&s->capture_after, memory_order_relaxed)) {
-            int capLen = atomic_load_explicit(&s->capture_len_arg, memory_order_relaxed);
-            int capMax = atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed);
-            NSData *captured = dh_capture_arg_memory(s, gpr);
-            if (captured.length) {
-                e.input = captured;
-                [d appendFormat:@"\ncaptured arg%d(x%d) @0x%llx = %lu bytes (ptr_arg=%d len_arg=%d max=%d)",
-                 capPtr, capPtr, gpr[capPtr], (unsigned long)captured.length, capPtr, capLen, capMax];
-            } else {
-                [d appendFormat:@"\ncaptured arg%d(x%d) @0x%llx failed (ptr_arg=%d len_arg=%d max=%d)",
-                 capPtr, capPtr, gpr[capPtr], capPtr, capLen, capMax];
-            }
-        } else if (capPtr >= 0 && capPtr <= 8) {
-            [d appendFormat:@"\noutput arg%d(x%d) capture deferred until return", capPtr, capPtr];
-        }
+static NSString *dh_hex_u64(uint64_t value) {
+    return [NSString stringWithFormat:@"0x%llx", value];
+}
 
-        // 多窗口: 一次 hook 同时记录多个寄存器指向的内存。
-        // 一个 inline 目标只能装一个 hook 且槽位不回收, 换寄存器就得重启进程,
-        // 所以这是分析多参数函数的关键能力。
-        dh_render_windows(d, s->capture_multi, &s->capture_multi_ready, gpr,
-                          atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed), @"win");
-        e.detail    = d;
-        e.callStack = DHCallStackFiltered();
-        e.timestamp = DHTimestampNow();
+static NSDictionary *dh_window(uint64_t pointer, uint64_t requested, int limit,
+                                NSString *phase, NSString *reg, BOOL deferred) {
+    NSUInteger budget = limit > 0 && limit <= DH_THUNK_CAPTURE_MAX ? (NSUInteger)limit : 256;
+    NSUInteger want = (NSUInteger)MIN(requested, (uint64_t)budget);
+    NSData *data = deferred ? nil : dh_capture_at(pointer, want);
+    NSString *status = deferred ? @"deferred" : !requested ? @"empty" : data.length ? @"captured" : @"unreadable";
+    return @{@"phase": phase, @"register": reg, @"address": dh_hex_u64(pointer),
+        @"requestedLength": [NSString stringWithFormat:@"%llu", requested],
+        @"captureLimit": @(budget), @"capturedLength": @(data.length),
+        @"hex": DHHexFromData(data), @"status": status,
+        @"truncated": @(!deferred && data.length < requested)};
+}
+
+static void dh_add_windows(NSMutableArray *windows, const char *spec, uint64_t *regs,
+                           int budget, NSString *phase) {
+    if (!spec || !spec[0]) return;
+    for (NSString *part in [@(spec) componentsSeparatedByString:@","]) {
+        NSString *text = [part stringByTrimmingCharactersInSet:NSCharacterSet.whitespaceCharacterSet];
+        if (!text.length) continue;
+        NSArray *fields = [text componentsSeparatedByString:@":"];
+        NSString *reg = [fields[0] lowercaseString];
+        if ([reg hasPrefix:@"x"]) reg = [reg substringFromIndex:1];
+        int index = reg.intValue;
+        NSUInteger size = fields.count > 1 ? [fields[1] integerValue] : budget > 0 ? budget : 256;
+        [windows addObject:dh_window(regs[index], size, (int)size, phase,
+            [NSString stringWithFormat:@"x%d", index], NO)];
+    }
+}
+
+static NSDictionary *dh_function_context(DHLogEntry *e, int slot, DHCallContext call,
+                                         NSString *phase) {
+    DHStampEvent(e);
+    NSMutableDictionary *c = [e.eventContext mutableCopy];
+    c[@"kind"] = @"function"; c[@"phase"] = phase;
+    c[@"callId"] = DHCallID(call.id); c[@"parentCallId"] = DHCallID(call.parent);
+    c[@"hookId"] = [NSString stringWithFormat:@"%@:hook:%d", DHProcessGeneration(), slot];
+    c[@"slot"] = @(slot); c[@"depth"] = @(call.depth);
+    c[@"mechanism"] = g_slots[slot].kind == DH_HOOK_METHOD ? @"objc" : g_slots[slot].kind == DH_HOOK_INLINE ? @"inline" : @"import";
+    c[@"pairing"] = call.tracked ? @"paired" : g_dh_thunk_post[slot] ? @"context-unavailable" : @"entry-only";
+    c[@"contextComplete"] = @(!g_dh_thunk_post[slot] || call.tracked);
+    c[@"targetIdentity"] = g_slot_targets[slot] ?: @{};
+    if ([phase isEqualToString:@"leave"] && call.started_ns)
+        c[@"durationNs"] = [NSString stringWithFormat:@"%llu", DHMonotonicNS() - call.started_ns];
+    return c;
+}
+
+// token 存在每次汇编帧中。递归、嵌套、同一线程复用均不靠文本/TID 猜配对。
+uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t lr) {
+    if (slot >= DH_THUNK_COUNT) return 0;
+    dh_slot_t *s = &g_slots[slot];
+    if (g_dh_thunk_post[slot]) atomic_fetch_add_explicit(&g_slot_inflight[slot], 1, memory_order_relaxed);
+    if (!atomic_load_explicit(&s->enabled, memory_order_acquire)) return 0;
+    uint64_t hits = atomic_fetch_add_explicit(&s->hits, 1, memory_order_relaxed) + 1;
+    if (g_in_thunk) return 0;
+    g_in_thunk = 1;
+    if ([DHLogStore shared].paused) { g_in_thunk = 0; return 0; }
+    DHCallContext call = dh_call_begin(g_dh_thunk_post[slot], DHMonotonicNS());
+    @autoreleasepool {
+        const dh_hook_options *o = &g_slot_options[slot];
+        DHLogEntry *e = [DHLogEntry new];
+        e.category = DHCategoryOther;
+        e.algorithm = s->kind == DH_HOOK_METHOD ? @"objc-hook" : s->kind == DH_HOOK_INLINE ? @"inline-hook" : @"import-hook";
+        e.operation = @(s->name);
+        e.eventContext = dh_function_context(e, (int)slot, call, @"entry");
+        NSMutableDictionary *regs = [NSMutableDictionary dictionary];
+        for (int i = 0; i < 9; i++) regs[[NSString stringWithFormat:@"x%d", i]] = dh_hex_u64(gpr[i]);
+        NSMutableArray *args = [NSMutableArray array], *memory = [NSMutableArray array];
+        NSMutableString *detail = [NSMutableString stringWithFormat:@"slot=%llu hits=%llu\ncaller_lr=0x%llx caller_sp=0x%llx\n", slot, hits, lr, caller_sp];
+        unsigned registerCount = s->kind == DH_HOOK_METHOD ? 6 : 8;
+        unsigned firstRegister = s->kind == DH_HOOK_METHOD ? 2 : 0;
+        uint8_t stack[256]; vm_size_t got = 0;
+        if (s->method_simple_gpr && s->method_stack_bytes)
+            vm_read_overwrite(mach_task_self(), (vm_address_t)caller_sp, s->method_stack_bytes, (vm_address_t)stack, &got);
+        if (s->method_simple_gpr) {
+            for (unsigned i = 0; i < s->method_arg_count && i < 32; i++) {
+                const char *type = s->argument_types[i];
+                unsigned size = dh_method_arg_size(type); uint64_t value = 0;
+                BOOL readable = YES;
+                NSDictionary *location;
+                if (i < registerCount) {
+                    value = gpr[i + firstRegister];
+                    location = @{@"kind": @"register", @"name": [NSString stringWithFormat:@"x%u", i + firstRegister]};
+                } else {
+                    unsigned offset = s->method_stack_args[i - registerCount].offset;
+                    readable = size && offset + size <= got;
+                    if (readable) memcpy(&value, stack + offset, size);
+                    location = @{@"kind": @"stack", @"offset": @(offset), @"size": @(size)};
+                }
+                if (size && size < 8) value &= (1ULL << (size * 8)) - 1;
+                NSMutableDictionary *arg = [@{@"index": @(i), @"type": @(type), @"location": location,
+                    @"status": readable ? @"captured" : @"unreadable"} mutableCopy];
+                if (readable) {
+                    arg[@"value"] = dh_hex_u64(value);
+                    [detail appendFormat:@"arg%u=%@\n", i, arg[@"value"]];
+                    if (o->describe_args && dh_method_arg_type(type) == 2) {
+                        NSDictionary *object = nil;
+                        NSString *description = dh_describe_arg(value, &object);
+                        if (object) arg[@"object"] = object;
+                        if (description.length) [detail appendFormat:@"  arg%u = %@\n", i, description];
+                    }
+                }
+                [args addObject:arg];
+            }
+        }
+        if (o->ptr_arg >= 0) {
+            uint64_t requested = o->len_arg >= 0 ? gpr[o->len_arg] : (uint64_t)o->max_bytes;
+            NSDictionary *window = dh_window(gpr[o->ptr_arg], requested, o->max_bytes,
+                o->capture_after ? @"leave" : @"entry", [NSString stringWithFormat:@"x%d", o->ptr_arg], o->capture_after);
+            [memory addObject:window];
+            if (!o->capture_after) e.input = DHDataFromHex(window[@"hex"]);
+            else [detail appendString:@"output capture deferred until return\n"];
+        }
+        dh_add_windows(memory, o->capture_multi, gpr, o->max_bytes, @"entry");
+        e.eventPayload = @{@"rawRegisters": regs, @"arguments": args, @"memory": memory,
+            @"caller": @{@"lr": dh_hex_u64(lr), @"sp": dh_hex_u64(caller_sp)},
+            @"abi": dh_thunk_metadata((int)slot)[@"abi"]};
+        e.detail = detail; e.callStack = DHCallStackFiltered(); e.timestamp = DHTimestampNow();
         [[DHLogStore shared] append:e];
     }
     g_in_thunk = 0;
+    return call.id;
 }
 
-// ---- post 路径: 原函数返回后记录返回值 ----
-// 只在 g_dh_thunk_post[slot] 置位时被汇编调用; regs[0]=x0(返回值), regs[1]=x1。
 void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_t real_lr,
-                           uint64_t *entry_regs) {
-    (void)orig; (void)real_lr;
+                           uint64_t *entry_regs, uint64_t token) {
+    (void)orig;
     if (slot >= DH_THUNK_COUNT) return;
+    atomic_fetch_sub_explicit(&g_slot_inflight[slot], 1, memory_order_relaxed);
+    DHCallContext call = dh_call_end(token); // 软停/暂停后也必须弹出，不能污染后续调用。
     dh_slot_t *s = &g_slots[slot];
-    if (!atomic_load_explicit(&s->enabled, memory_order_relaxed)) return;
-    if (g_in_thunk) return;
+    if (!token || !atomic_load_explicit(&s->enabled, memory_order_acquire) || g_in_thunk) return;
     g_in_thunk = 1;
     @autoreleasepool {
-        uint64_t ret = regs[0];
-        DHLogEntry *e = [DHLogEntry new];
-        e.category  = DHCategoryOther;
-        e.algorithm = (s->kind == DH_HOOK_METHOD) ? @"objc-hook" : @"inline-hook";
-        e.operation = [NSString stringWithUTF8String:s->name];
-        NSMutableString *d = [NSMutableString stringWithFormat:
-            @"slot=%llu return\nx0(ret)=0x%llx x1=0x%llx",
-            (unsigned long long)slot, (unsigned long long)ret, (unsigned long long)regs[1]];
-        NSString *desc = dh_describe_arg(ret);   // 对象/NSData/NSString 才反引用
-        if (desc.length) {
-            [d appendFormat:@"\n  ret = %@", desc];
-            e.input = [desc dataUsingEncoding:NSUTF8StringEncoding];
-        }
-        // capture_after: 输出缓冲在原函数返回后才有效 (CCHmac 的 digest 出参、CCCrypt 的密文出参)。
-        // 入口抓只能拿到未初始化内存, 所以这类槽位必须在 post 路径读。
-        if (atomic_load_explicit(&s->capture_after, memory_order_relaxed)) {
-            int ap = atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire);
-            int al = atomic_load_explicit(&s->capture_len_arg, memory_order_relaxed);
-            int am = atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed);
-            if (ap >= 0 && ap <= 8) {
-                // 必须用「进入时」的寄存器: regs[] 是返回后的快照, x0 已被返回值覆盖。
-                // 用 regs 会在 ptr_arg=0 时把返回值当成出参缓冲, 抓到完全无关的内存并当成证据上报。
-                const uint64_t *src = entry_regs ? entry_regs : regs;
-                uint64_t bufPtr = src[ap];
-                size_t want = (am > 0 && am <= DH_THUNK_CAPTURE_MAX) ? (size_t)am : 64;
-                if (al >= 0 && al <= 8) {
-                    uint64_t n = src[al];
-                    if (n < (uint64_t)want) want = (size_t)n;
-                }
-                NSData *outBuf = dh_capture_at(bufPtr, want);
-                if (outBuf.length) {
-                    e.output = outBuf;
-                    [d appendFormat:@"\n  out arg%d(x%d) @0x%llx = %lu bytes: %@",
-                     ap, ap, bufPtr, (unsigned long)outBuf.length, DHHexFromData(outBuf)];
-                } else {
-                    [d appendFormat:@"\n  out arg%d(x%d) @0x%llx unreadable", ap, ap, bufPtr];
+        const dh_hook_options *o = &g_slot_options[slot];
+        DHLogEntry *e = [DHLogEntry new]; e.category = DHCategoryOther;
+        e.algorithm = s->kind == DH_HOOK_METHOD ? @"objc-hook" : s->kind == DH_HOOK_INLINE ? @"inline-hook" : @"import-hook";
+        e.operation = @(s->name);
+        e.eventContext = dh_function_context(e, (int)slot, call, @"leave");
+        NSMutableArray *memory = [NSMutableArray array];
+        NSMutableDictionary *value = [@{@"type": @(s->return_type), @"requested": @(o->capture_return),
+            @"available": @(o->capture_return && s->return_type[0] != 'v')} mutableCopy];
+        NSMutableString *detail = [NSMutableString stringWithFormat:@"slot=%llu return\nx0(ret)=0x%llx x1=0x%llx", slot, regs[0], regs[1]];
+        if (o->capture_return && s->return_type[0] != 'v') {
+            value[@"value"] = dh_hex_u64(regs[0]);
+            if (dh_method_arg_type(s->return_type) == 2) {
+                NSDictionary *object = nil;
+                NSString *description = dh_describe_arg(regs[0], &object);
+                if (object) value[@"object"] = object;
+                if (description.length) {
+                    e.input = [description dataUsingEncoding:NSUTF8StringEncoding];
+                    [detail appendFormat:@"\n  ret = %@", description];
                 }
             }
         }
-        // 返回值多窗口: 有些函数把结果放在 x1 指向的缓冲里 (例如序列化器返回
-        // (status, buffer)), 而那块内存在返回后可能立刻被释放 —— 只能在这里读。
-        dh_render_windows(d, s->capture_ret_multi, &s->capture_ret_multi_ready, regs,
-                          atomic_load_explicit(&s->capture_max_bytes, memory_order_relaxed), @"ret");
-        e.detail    = d;
-        e.callStack = DHCallStackFiltered();
-        e.timestamp = DHTimestampNow();
+        if (o->capture_after) {
+            uint64_t requested = o->len_arg >= 0 ? entry_regs[o->len_arg] : (uint64_t)o->max_bytes;
+            NSDictionary *window = dh_window(entry_regs[o->ptr_arg], requested, o->max_bytes,
+                @"leave", [NSString stringWithFormat:@"x%d", o->ptr_arg], NO);
+            [memory addObject:window]; e.output = DHDataFromHex(window[@"hex"]);
+        }
+        dh_add_windows(memory, o->capture_ret_multi, regs, o->max_bytes, @"leave");
+        e.eventPayload = @{@"rawRegisters": @{@"x0": dh_hex_u64(regs[0]), @"x1": dh_hex_u64(regs[1])},
+            @"returnValue": value, @"memory": memory, @"caller": @{@"lr": dh_hex_u64(real_lr)},
+            @"abi": dh_thunk_metadata((int)slot)[@"abi"]};
+        e.detail = detail; e.callStack = DHCallStackFiltered(); e.timestamp = DHTimestampNow();
         [[DHLogStore shared] append:e];
     }
     g_in_thunk = 0;
@@ -590,6 +659,11 @@ static int dh_alloc_slot(void) {
 
 int dh_thunk_install_import(const char *symbol, const char *label) {
     if (!DH_THUNK_ARM64 || !symbol || !symbol[0]) return -1;
+    if (strlen(symbol) >= sizeof(g_slots[0].import_symbol) || dh_unsafe_runtime_symbol(symbol)) return -6;
+    // Resolve before publishing a persistent fishhook registration. A missing/data symbol
+    // must not leave a future-image callback pointing at a recycled thunk slot.
+    void *resolved = dlsym(RTLD_DEFAULT, symbol);
+    if (!resolved || !dh_addr_is_executable((uint64_t)(uintptr_t)ptrauth_strip(resolved, ptrauth_key_function_pointer))) return -2;
     pthread_mutex_lock(&g_install_lock);
     // fishhook 按符号改 GOT: 同一符号装第二次会把 GOT 指向新槽位, 旧槽位从此 0 命中
     // (它还留在 list_hooks 里, 看起来像「装好了却不生效」)。重复安装直接拒绝, 让调用方复用。
@@ -599,9 +673,7 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
         for (int i = 0; i < n; i++) {
             dh_slot_t *o = &g_slots[i];
             if (!o->used || o->kind != DH_HOOK_IMPORT) continue;
-            if (strncmp(o->name, symbol, strlen(symbol)) != 0) continue;
-            char after = o->name[strlen(symbol)];
-            if (after != '\0' && after != ' ') continue;
+            if (strcmp(o->import_symbol, symbol)) continue;
             pthread_mutex_unlock(&g_install_lock);
             // 返回 -(slot+10): 让调用方拿到准确槽位, 不必再按名字模糊匹配
             // (MCP 层曾用 strncmp 前缀匹配, CCHmac 会误命中 CCHmacInit)。
@@ -614,6 +686,7 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
     snprintf(s->name, sizeof(s->name), "%s%s%s", symbol,
              (label && label[0]) ? " " : "", (label && label[0]) ? label : "");
     s->kind = DH_HOOK_IMPORT;
+    snprintf(s->import_symbol, sizeof(s->import_symbol), "%s", symbol);
     s->used = 1;
     atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_relaxed);
     atomic_store_explicit(&s->capture_return, 0, memory_order_relaxed);
@@ -623,14 +696,16 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
     s->capture_ret_multi[0] = 0;
     atomic_store_explicit(&s->capture_ret_multi_ready, 0, memory_order_release);
     g_dh_thunk_post[slot] = 0;
-    // 必须先清 orig: 同进程里本 dylib 可能被 reload 过, g_dh_thunk_orig 里可能残留上一代的值,
-    // 那样 rebind 失败也会被当成成功, 槽位从此 0 命中(实测踩过)。
-    g_dh_thunk_orig[slot] = NULL;
-    struct rebinding rb = { symbol, dh_slot_addr(slot), &g_dh_thunk_orig[slot] };
-    rebind_symbols(&rb, 1);
-    if (g_dh_thunk_orig[slot] == NULL) {
-        // 任何 image 的 la_symbol_ptr/__got 里都没这个符号 —— fishhook 从未把任何跳转指向 thunk[slot],
-        // 所以回收该槽 100% 安全(没有遗留跳转)。若它正好是最后分配的一个, 直接回退计数复用。
+    // One immutable forwarding target for all present/future imports. Per-image
+    // interposer chaining is not supported; report this policy in hook metadata.
+    g_dh_thunk_orig[slot] = ptrauth_strip(resolved, ptrauth_key_function_pointer);
+    dh_prepare_slot_options(slot);
+    g_slot_targets[slot] = DHTargetIdentity(g_dh_thunk_orig[slot]);
+    atomic_store_explicit(&g_slot_published[slot], 1, memory_order_release);
+    struct rebinding rb = { s->import_symbol, dh_slot_addr(slot), NULL };
+    if (rebind_symbols(&rb, 1) < 0) {
+        // fishhook returns failure only before the registration is published.
+        atomic_store_explicit(&g_slot_published[slot], 0, memory_order_release);
         s->used = 0;
         s->name[0] = '\0';
         s->capture_multi[0] = '\0';
@@ -661,13 +736,17 @@ int dh_thunk_method_post_supported(const char *className, const char *selector, 
     }
     if (!m) return -1;
     unsigned int count = method_getNumberOfArguments(m);
-    if (count > 8) return 0; // self/_cmd + 六个通用寄存器参数
+    if (count > 34) return 0; // self/_cmd + 有界 32 个固定 GPR 参数
     for (unsigned int i = 2; i < count; i++) {
         char *type = method_copyArgumentType(m, i);
         int kind = dh_method_arg_type(type);
         free(type);
         if (!kind) return 0;
     }
+    char *ret = method_copyReturnType(m);
+    int retOK = ret && (ret[0] == 'v' || dh_method_arg_type(ret));
+    free(ret);
+    if (!retOK) return 0;
     return 1;
 }
 
@@ -697,14 +776,7 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
             return -5;   // 同一 Method 已有 active hook
         }
         // hard-unhook 后原 IMP 已恢复且未被别的插件改写: 复用原槽位/原蹦床。
-        if (g_dh_thunk_orig[i] &&
-            method_getImplementation(m) == (IMP)g_dh_thunk_orig[i]) {
-            method_setImplementation(m, (IMP)dh_slot_addr(i));
-            atomic_store_explicit(&old->retired, 0, memory_order_release);
-            atomic_store_explicit(&old->enabled, 1, memory_order_release);
-            pthread_mutex_unlock(&g_install_lock);
-            return i;
-        }
+        // 已退休槽位可能仍有在途调用，不能重写其配置/身份。新安装分配新槽位。
     }
     int slot = dh_alloc_slot();
     if (slot < 0) { pthread_mutex_unlock(&g_install_lock); return -1; }
@@ -718,9 +790,13 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
     s->method_simple_gpr = 1;
     s->method_object_gprs = 0;
     s->method_stack_bytes = 0;
+    char *returnType = method_copyReturnType(m);
+    strlcpy(s->return_type, returnType ?: "?", sizeof(s->return_type));
+    free(returnType);
     memset(s->method_stack_args, 0, sizeof(s->method_stack_args));
     for (unsigned int ai = 0; ai < s->method_arg_count; ai++) {
         char *type = method_copyArgumentType(m, ai + 2);
+        if (ai < 32) strlcpy(s->argument_types[ai], type ?: "?", sizeof(s->argument_types[ai]));
         int kind = dh_method_arg_type(type);
         unsigned int size = dh_method_arg_size(type);
         free(type);
@@ -751,6 +827,8 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
     atomic_store_explicit(&s->capture_ret_multi_ready, 0, memory_order_release);
     g_dh_thunk_post[slot] = 0;
     g_dh_thunk_orig[slot] = (void *)method_getImplementation(m);
+    dh_prepare_slot_options(slot);
+    atomic_store_explicit(&g_slot_published[slot], 1, memory_order_release);
     atomic_store_explicit(&s->enabled, 1, memory_order_release);
     method_setImplementation(m, (IMP)dh_slot_addr(slot));
     pthread_mutex_unlock(&g_install_lock);
@@ -764,14 +842,18 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
 static BOOL dh_addr_is_executable(uint64_t addr) {
     vm_address_t region = (vm_address_t)addr;
     vm_size_t size = 0;
-    vm_region_basic_info_data_64_t info;
-    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
-    mach_port_t object = MACH_PORT_NULL;
-    kern_return_t kr = vm_region_64(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64,
-                                    (vm_region_info_t)&info, &count, &object);
-    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
-    return kr == KERN_SUCCESS && (info.protection & VM_PROT_EXECUTE) &&
-           addr >= (uint64_t)region && addr < (uint64_t)region + size;
+    natural_t depth = 0;
+    // Shared-cache code can live inside a submap. Inspect its leaf protection.
+    for (unsigned attempt = 0; attempt < 16; attempt++) {
+        vm_region_submap_info_data_64_t info = {0};
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        kern_return_t kr = vm_region_recurse_64(mach_task_self(), &region, &size, &depth,
+            (vm_region_recurse_info_t)&info, &count);
+        if (kr != KERN_SUCCESS || addr < region || addr - region >= size) return NO;
+        if (!info.is_submap) return (info.protection & VM_PROT_EXECUTE) != 0;
+        depth++;
+    }
+    return NO;
 }
 
 static void *dh_resolve_inline_target(const char *module, const char *symbol,
@@ -867,6 +949,11 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
 #else
     void *target = dh_resolve_inline_target(module, symbol, addr, err, errsz);
     if (!target) return -2;
+    Dl_info identity = {0};
+    if (dladdr(target, &identity) && dh_unsafe_runtime_symbol(identity.dli_sname)) {
+        if (err && errsz) snprintf(err, errsz, "refusing allocator/runtime hook by resolved address");
+        return -4;
+    }
 
     pthread_mutex_lock(&g_install_lock);
     // 同一目标不允许重复 inline hook: 旧补丁会把入口改成 thunk, 再 DobbyHook 会去 hook thunk 本身。
@@ -906,17 +993,9 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
                 (unsigned long long)(uintptr_t)target);
             return -5;
         }
-        int prc = DobbyCodePatch(target, old->patched, (uint32_t)old->patched_len);
-        if (prc != 0) {
-            pthread_mutex_unlock(&g_install_lock);
-            if (err) snprintf(err, errsz, "DobbyCodePatch re-apply failed: rc=%d", prc);
-            return -4;
-        }
-        if (label && label[0]) snprintf(old->name, sizeof(old->name), "%s", label);
-        atomic_store_explicit(&old->retired, 0, memory_order_release);
-        atomic_store_explicit(&old->enabled, 1, memory_order_release);
         pthread_mutex_unlock(&g_install_lock);
-        return i;
+        if (err) snprintf(err, errsz, "retired inline configurations are immutable; restart the target before installing again");
+        return -5;
     }
     int slot = dh_alloc_slot();
     if (slot < 0) {
@@ -951,6 +1030,8 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
     g_dh_thunk_orig[slot] = NULL;
     atomic_store_explicit(&s->enabled, 0, memory_order_release);
 
+    dh_prepare_slot_options(slot);
+
     int rc = DobbyHook(target, (void *)dh_slot_addr(slot),
                        (void **)&g_dh_thunk_orig[slot]);
     if (rc != 0 || g_dh_thunk_orig[slot] == NULL) {
@@ -970,6 +1051,7 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
         return -4;
     }
     s->patched_len = dh_save_code_bytes(target, s->patched, sizeof(s->patched));
+    atomic_store_explicit(&g_slot_published[slot], 1, memory_order_release);
     atomic_store_explicit(&s->enabled, 1, memory_order_release);
     pthread_mutex_unlock(&g_install_lock);
     return slot;
@@ -987,7 +1069,8 @@ const char *dh_thunk_inline_backend(void) {
 int dh_thunk_set_describe(int slot, int on) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
-    if (!s->used) return -1;   // import hook 走「可打印 C 字符串」判定, method hook 走对象反引用
+    if (!s->used) return -1;
+    if (atomic_load_explicit(&g_slot_published[slot], memory_order_acquire)) return -3;   // import hook 走「可打印 C 字符串」判定, method hook 走对象反引用
     atomic_store_explicit(&s->describe_args, on ? 1 : 0, memory_order_relaxed);
     return 0;
 }
@@ -995,6 +1078,7 @@ int dh_thunk_set_describe(int slot, int on) {
 int dh_thunk_set_capture(int slot, int ptr_arg, int len_arg, int max_bytes) {    if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
+    if (atomic_load_explicit(&g_slot_published[slot], memory_order_acquire)) return -3;
     if (ptr_arg < 0) {   // 关闭捕获
         atomic_store_explicit(&s->capture_ptr_arg, -1, memory_order_release);
         return 0;
@@ -1016,8 +1100,9 @@ int dh_thunk_set_return(int slot, int on) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
+    if (atomic_load_explicit(&g_slot_published[slot], memory_order_acquire)) return -3;
     if (atomic_load_explicit(&s->retired, memory_order_relaxed)) return -1;
-    if (on && s->kind == DH_HOOK_METHOD && (!s->method_simple_gpr || s->method_arg_count > 6)) return -1;
+    if (on && s->kind == DH_HOOK_METHOD && (!s->method_simple_gpr || s->method_arg_count > 32)) return -1;
     // 先写槽位字段再发布汇编可见的标记位 (release), 保证 handler 看到 1 时字段已就绪。
     atomic_store_explicit(&s->capture_return, on ? 1 : 0, memory_order_relaxed);
     dh_thunk_sync_post(slot);
@@ -1030,8 +1115,9 @@ int dh_thunk_set_capture_after(int slot, int on) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
+    if (atomic_load_explicit(&g_slot_published[slot], memory_order_acquire)) return -3;
     if (atomic_load_explicit(&s->retired, memory_order_relaxed)) return -1;
-    if (on && s->kind == DH_HOOK_METHOD && (!s->method_simple_gpr || s->method_arg_count > 6)) return -1;
+    if (on && s->kind == DH_HOOK_METHOD && (!s->method_simple_gpr || s->method_arg_count > 32)) return -1;
     // 只开 after 而不配 capture_memory 是悬空语义(没有 ptr_arg 可读), 直接拒绝而不是让它静默什么都不做。
     if (on && atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire) < 0) return -2;
     atomic_store_explicit(&s->capture_after, on ? 1 : 0, memory_order_relaxed);
@@ -1050,7 +1136,7 @@ int dh_thunk_set_capture_after(int slot, int on) {
 // 返回 0 = 合法; -1 = 语法错; -2 = 超长。
 int dh_thunk_validate_capture_multi(const char *spec) {
     if (!spec || !spec[0]) return 0;
-    if (strlen(spec) >= 96) return -2;
+    if (strnlen(spec, 96) >= 96) return -2;
     const char *p = spec;
     int tokens = 0;          // 必须至少解析出一个窗口。
     // 只含分隔符的规格（","、" "、", ,"）在下面会被全部跳过、循环正常结束，
@@ -1065,10 +1151,17 @@ int dh_thunk_validate_capture_multi(const char *spec) {
         if (*p == ':') {
             p++;
             if (!(*p >= '0' && *p <= '9')) return -1;
-            while (*p >= '0' && *p <= '9') p++;
+            unsigned int size = 0;
+            while (*p >= '0' && *p <= '9') {
+                if (size > DH_THUNK_CAPTURE_MAX / 10) return -1;
+                size = size * 10 + (unsigned int)(*p++ - '0');
+                if (size > DH_THUNK_CAPTURE_MAX) return -1;
+            }
+            if (!size) return -1;
         }
         if (*p && *p != ',' && *p != ' ') return -1;
         tokens++;
+        if (tokens > 9) return -1;
     }
     return tokens > 0 ? 0 : -1;
 }
@@ -1095,6 +1188,7 @@ int dh_thunk_set_capture_multi(int slot, const char *spec) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
+    if (atomic_load_explicit(&g_slot_published[slot], memory_order_acquire)) return -3;
     int v = dh_thunk_validate_capture_multi(spec);
     if (v != 0) return v;
     if (!spec || !spec[0]) {
@@ -1138,12 +1232,18 @@ static int dh_validate_ret_regs(const char *spec) {
     return 0;
 }
 
+int dh_thunk_validate_capture_ret_multi(const char *spec) {
+    int result = dh_thunk_validate_capture_multi(spec);
+    return result ? result : dh_validate_ret_regs(spec);
+}
+
 int dh_thunk_set_capture_ret_multi(int slot, const char *spec) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
+    if (atomic_load_explicit(&g_slot_published[slot], memory_order_acquire)) return -3;
     if (spec && spec[0] && s->kind == DH_HOOK_METHOD &&
-        (!s->method_simple_gpr || s->method_arg_count > 6)) return -1;
+        (!s->method_simple_gpr || s->method_arg_count > 32)) return -1;
     int v = dh_thunk_validate_capture_multi(spec);
     if (v != 0) return v;
     v = dh_validate_ret_regs(spec);
@@ -1179,8 +1279,8 @@ int dh_thunk_uninstall(int slot, int hard, char *err, size_t errsz) {
     }
     pthread_mutex_lock(&g_install_lock);
     dh_slot_t *s = &g_slots[slot];
-    atomic_store_explicit(&s->enabled, 0, memory_order_release);
     if (!hard) {   // 软停: 停止记录, patch 保留
+        atomic_store_explicit(&s->enabled, 0, memory_order_release);
         pthread_mutex_unlock(&g_install_lock);
         return 0;
     }
@@ -1190,29 +1290,9 @@ int dh_thunk_uninstall(int slot, int hard, char *err, size_t errsz) {
         return 0;
     }
     if (s->kind == DH_HOOK_INLINE) {
-#if DH_HAVE_INLINE
-        if (!s->target || s->saved_len <= 0) {
-            pthread_mutex_unlock(&g_install_lock);
-            if (err) snprintf(err, errsz,
-                "slot %d has no saved original bytes; hard unhook unavailable, use soft unhook", slot);
-            return -5;
-        }
-        // 只恢复目标入口的原始字节, 不调用 DobbyDestroy: 后者会释放 Dobby 的原函数蹦床,
-        // 而在途线程可能已经进入 thunk 并即将 br 到该蹦床; 保留蹦床可避免 use-after-free。
-        int rc = DobbyCodePatch(s->target, s->saved, (uint32_t)s->saved_len);
-        if (rc != 0) {
-            pthread_mutex_unlock(&g_install_lock);
-            if (err) snprintf(err, errsz, "DobbyCodePatch restore failed: rc=%d", rc);
-            return -4;
-        }
-        atomic_store_explicit(&s->retired, 1, memory_order_release);
         pthread_mutex_unlock(&g_install_lock);
-        return 0;
-#else
-        pthread_mutex_unlock(&g_install_lock);
-        if (err) snprintf(err, errsz, "Dobby backend is not linked in this slice (arm64e)");
+        if (err) snprintf(err, errsz, "hard inline unhook requires thread quiescence; state unchanged, use soft unhook or restart target");
         return -5;
-#endif
     }
     if (s->kind == DH_HOOK_METHOD) {
         Method m = (Method)s->method;
@@ -1222,6 +1302,12 @@ int dh_thunk_uninstall(int slot, int hard, char *err, size_t errsz) {
             if (err) snprintf(err, errsz, "slot %d has no original IMP", slot);
             return -5;
         }
+        if (method_getImplementation(m) != (IMP)dh_slot_addr(slot)) {
+            pthread_mutex_unlock(&g_install_lock);
+            if (err) snprintf(err, errsz, "method IMP is owned by another patch; refusing to overwrite it");
+            return -5;
+        }
+        atomic_store_explicit(&s->enabled, 0, memory_order_release);
         method_setImplementation(m, orig);
         atomic_store_explicit(&s->retired, 1, memory_order_release);
         pthread_mutex_unlock(&g_install_lock);

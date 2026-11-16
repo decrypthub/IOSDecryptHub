@@ -1,6 +1,7 @@
 """检查不支持的 ObjC post 采集在安装前拒绝，且 Hook 列表不变。
 
-显式指定已授权设备及含栈参数/复杂 ABI 的方法。不调用目标方法。
+显式指定已授权设备及浮点/聚合 ABI 的方法。不调用目标方法。
+固定 GPR 栈参数已受支持，不能用来充当拒绝案例。
 python tests/method_hook_guard_test.py --endpoint http://<device>:8088 --class-name <class> --selector <selector>
 """
 import argparse
@@ -18,12 +19,16 @@ def call(endpoint, name, arguments):
 
 
 def check(endpoint, class_name, selector, class_method=False):
+    cap = call(endpoint, "get_capabilities", {})
+    cap = cap.get("structuredContent") or json.loads(cap["content"][0]["text"])
+    generation = cap["processGeneration"]
     before = call(endpoint, "list_hooks", {})
     for options in ({"capture_return": True},
                     {"capture_after": True, "capture_memory": {"ptr_arg": 2, "max_bytes": 8}},
                     {"capture_ret_multi": "x0:8"}):
         result = call(endpoint, "hook_method", {"class": class_name, "selector": selector,
-                      "classMethod": class_method, **options})
+                      "classMethod": class_method, "process_generation": generation,
+                      "post_abi": "fixed-nonvariadic", **options})
         assert result.get("isError"), result
         text = " ".join(x.get("text", "") for x in result.get("content", []))
         assert "post" in text and "ABI" in text, text
@@ -34,7 +39,7 @@ def check(endpoint, class_name, selector, class_method=False):
                 payload = json.loads(value["content"][0]["text"])
             def clean(item):
                 if isinstance(item, dict):
-                    return {k: clean(v) for k, v in item.items() if k != "hits"}
+                    return {k: clean(v) for k, v in item.items() if k not in {"hits", "inFlight"}}
                 if isinstance(item, list):
                     return [clean(v) for v in item]
                 return item
