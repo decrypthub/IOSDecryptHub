@@ -10,6 +10,7 @@ typedef struct {
 void dh_unwind_capture(const DHCPUContext *entry, uint64_t target, DHRawStack *out);
 int dh_unwind_available(void);
 void dh_unwind_current(DHRawStack *out);
+int dh_unwind_bounds(uint64_t pc, uint64_t *start, uint64_t *end);
 #ifdef __OBJC__
 #import <Foundation/Foundation.h>
 NSDictionary *DHStackDictionary(const DHRawStack *stack);

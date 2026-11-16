@@ -2,6 +2,8 @@
 
 这是现有 `src/` 研发线的实现协议。操作前检查 `get_capabilities` 的当前进程代、`trace_live`、`native_stack_unwind` 和实际后端；两种整包均须匹配设备。它不代表新 daemon / Manager 架构已经全部落地。
 
+1.28.37 补充普通 post 的非局部退出状态保护及有界 GCD 因果关系，见 [状态保护/GCD](FLOW_STATE_AND_GCD.md)。这不放宽本文 QBDI live 的正常返回约束。
+
 ## 真实调用与回放
 
 `trace_live_arm` 等待一个已安装且启用的 Inline 槽位的下一次真实命中。它不主动调用目标，不替换输入指针，也不复制输入后重新执行函数。命中线程只会执行该原调用一次。

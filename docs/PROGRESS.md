@@ -1,5 +1,19 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-16：1.28.37 非局部退出状态保护与有界 GCD（研发包）
+
+- 普通 post 登记有界保护记录，正常返回之外，在后续边界用 owned bridge/CFA 栈证据清理退出的调用、同步父上下文和 inFlight；已有 entry 的调用标 aborted，不伪造 leave。线程结束由独立 pthread-key 快照收尾，避免依赖可能已被清理的编译器 TLS。
+- 缺失/截断展开或尚未越过已知保护位置的提前停止只计 unverified 并抑制关联，不误退仍存活的帧。异步任务终结由实际包装器退出、线程退出或后续包装器入口的充分证据负责，任意业务探针看不到包装帧不直接标任务异常。
+- 新 configure_async_capture/get_async_tasks/get_flow_state/run_flow_selftest。六类公开 GCD async/after/group 的 block 与 _f 导入按显式窗口观测 submit→execute；异步 ID 与同步 parent/native 栈分开。支持有界队列排除，跳过 IDH 自身提交；特殊 dispatch-block 和未知/系统 invoke 原样转发，校验取消/等待语义。导入所有权预留与动态 Hook 互斥。
+- 默认关闭；每进程 1024 条、每窗口最多 256 条/60s、最多 64 pending/running、深度 8，提交栈 32 帧。关闭/超限继续转发，不取消已排队工作；pending 不冒充完成。队列标签有界且安全处理 UTF8 截断。
+- Mac 新原生状态/GCD 测试 12 组通过，既有 hook/unwind/arm64+arm64e 编译、类型/Mach-O、更新策略、两份完整 deb 通过；Python 离线 8 项通过。C/ObjC/ObjC++ 按扩展名编译以支持 C++ fixture，既有验收断言与 workflow 未放宽。
+- 最终研发整包在 rootless iPhone X / iOS 15.6 与 RootHide iPhone 11 / iOS 16.2 通过 12 组新自检与 3 项新 MCP 回归；另通过既有 Agent/native/PAC/P0/复杂 ABI 拒绝回归及 7 组 live 自检和其 MCP 回归。自有 fixture 实测 ObjC/C++ 异常原样传播、longjmp、内部捕获不误退、暂停、展开缺口、线程退出、跨线程嵌套与预算/窗口/关闭语义。
+- 快手 14.10.10 最终整包实测：rootless 两个有界窗口保留 512 任务、346 次跨线程执行、187 个嵌套来源；RootHide 三个窗口 768/526/257，最终导出均实际正常返回。未充分验证的边界分别计 3/33，没有据此伪造任务异常；实际普通调用 aborted/guardOverflow 均 0。
+- 两台各保留一组 15 棵完整签名调用树、225 对调用、15 次核心 15 参数正常入口/返回，15 个 facade 返回均匹配本轮 HTTP sig3；各 15 HMAC/45 白盒块/15 CRC 独立离线一致。最终整包 rootless 另有 3 棵树与 HTTP 在同一/后代真实任务 ID 下连接；RootHide 最终窗口未覆盖签名任务路径，不能把普通 GCD 任务验证外推成其全部 sig3 因果链。前一迭代 v10 在 RootHide 曾离线闭环 3 组，最终 v11 的差异仅为队列 UTF8 元数据处理，仍分别保留证据和覆盖结论。
+- 最终整包的真实 SDK CRC live 再验：两台各 2489 条指令，结果与原 leave 和独立 zlib 相同，栈 rootless 130 / RootHide 129 帧均完整无错。历史 journal 保留旧代身份，任务表只属于本代 RAM。
+
+整包保留原 scope；结束时重启授权目标清临时 Hook/转发并暂停采集。未发布 Release/APT。本轮不提供 QBDI 内异常/longjmp 透明执行，也未覆盖 Swift Task、NSOperation、group notify/source 或私有调度器；有界窗口的命中范围逐样本报告。协议、状态与入口见 [状态保护/GCD](FLOW_STATE_AND_GCD.md)。
+
 ## 2026-11-16：1.28.36 真实调用现场与完整同步 native 栈（研发包）
 
 - 新增 `trace_live_arm/read/cancel`：选择已安装 Inline 的下一次真实调用，在原 App 线程、TLS、SP 和原栈上执行 QBDI，不人工重新调用、不替换输入指针。完整保存 x0–x30、q0–q31、NZCV/FPCR/FPSR、原始 SP/LR、errno 及出口现场；IDH 专用 Dobby context veneer 在使用 IP 寄存器前保存 x16/x17。

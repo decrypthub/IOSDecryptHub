@@ -48,6 +48,7 @@ static DHLiveSession *sessions[8];
 static unsigned sessionCount;
 static _Atomic(DHLiveSession *) armedSession;
 static __thread int inLive;
+int dh_live_current(void) {return inLive;}
 extern void dh_thunk_live_post(unsigned slot, const DHCPUContext *result,
     const DHCPUContext *entry, uint64_t token, uint64_t original);
 
@@ -137,7 +138,7 @@ DHLiveTransfer *dh_live_claim(uint64_t slot,uint64_t original,const DHCPUContext
 #if DH_HAVE_QBDI
     int savedErrno=errno;
     DHLiveSession *s=atomic_load_explicit(&armedSession,memory_order_acquire);
-    if (!s || inLive || !token || s->slot!=slot || original!=s->original) return NULL;
+    if (!s || inLive || !token || (token>>63) || s->slot!=slot || original!=s->original) return NULL;
     uint64_t threadID=0;pthread_threadid_np(NULL,&threadID);
     if (s->threadFilter && s->threadFilter!=threadID) return NULL;
     int expected=LIVE_ARMED;

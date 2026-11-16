@@ -26,6 +26,10 @@
 
 `capture_after` 在入口只标 deferred、不读取输出区，leave 才按入口指针采集。长度寄存器为 0 表示空数据。`capture_multi` 是入口窗口，`capture_ret_multi` 仅允许返回 x0/x1；两者不能混作原始函数参数。
 
+1.28.37 增加 `phase:aborted`，表示已有 entry 的普通 post 在后续边界被充分证据确认为非局部退出；不生成 leave 或可用返回值。`get_call.status:aborted`、abortedSeq 与 retainedPair:false 分别报告终结记录和缺少正常配对。缺失展开证据时不直接标 aborted，parentValidation/contextComplete 说明关联是否可信。
+
+显式开启 GCD 捕获后，事件另带 asyncTaskId/asyncParentTaskId/asyncSubmittedByCallId；query_events 支持 async_task_id 精确过滤。同步 parentCallId/native 栈继续保持原含义，任务来源边用 get_async_tasks 查询。任务表本代 RAM 与历史 journal 事件的保留范围不同，见 [状态保护/GCD](FLOW_STATE_AND_GCD.md)。
+
 旧 `detail`、input/output 和栈字段仍可展示，但新客户端必须按 `phase` 与 `payload` 解析，不再匹配 detail 中的 `return` 或 `win_hex`。旧 journal 没有上下文时导出为 schema 1，不为其补造新进程身份。结构化 journal 负载最多 64KB，超限明确标记省略；恢复项带 `restoredFromJournal:true`。
 
 ## 查询

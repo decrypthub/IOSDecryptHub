@@ -18,33 +18,40 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.36
+VERSION := 1.28.37
 TARGET  := decrypt_helper.dylib
 .DEFAULT_GOAL := all
-.PHONY: test-hook-runtime test-hook-ios-build test-unwind-runtime
+.PHONY: test-hook-runtime test-hook-ios-build test-unwind-runtime test-flow-runtime
 
 HOOK_TEST_SRC := tests/hook_runtime_test.m src/core/dh_thunk.m src/core/dh_call_context.c src/core/dh_event.m \
-    src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m \
+    src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
     src/core/log_store.m src/core/dh_capture.c src/core/dh_noise.m src/core/dh_health.c src/core/dh_capability.c \
     src/core/fishhook.c src/server/dh_log_json.m
+
+# 按扩展名区分 C / ObjC / ObjC++；全局 -ObjC 会把 C++ 异常 fixture 误编为 ObjC。
 
 test-hook-runtime:
 	@mkdir -p build
 	clang -std=gnu11 -Isrc/core tests/hook_context_test.c src/core/dh_call_context.c -lpthread -o build/hook_context_test
 	./build/hook_context_test
-	clang -ObjC -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation $(HOOK_TEST_SRC) -o build/hook_runtime_test
+	clang -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation $(HOOK_TEST_SRC) -lc++ -o build/hook_runtime_test
 	python3 tests/run_hook_runtime_test.py build/hook_runtime_test
 
 test-unwind-runtime:
 	@mkdir -p build
-	clang -ObjC -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation tests/unwind_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) -o build/unwind_runtime_test
+	clang -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation tests/unwind_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) -lc++ -o build/unwind_runtime_test
 	python3 tests/run_unwind_runtime_test.py build/unwind_runtime_test
 
 test-hook-ios-build:
 	@mkdir -p build
 	xcrun --sdk iphoneos clang -arch arm64 -arch arm64e -miphoneos-version-min=14.0 -isysroot $(shell xcrun --sdk iphoneos --show-sdk-path) \
-	    -ObjC -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation $(HOOK_TEST_SRC) -o build/hook_runtime_test_ios
+	    -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation $(HOOK_TEST_SRC) -lc++ -o build/hook_runtime_test_ios
 	ldid -S build/hook_runtime_test_ios
+
+test-flow-runtime:
+	@mkdir -p build
+	clang -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation tests/flow_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) -lc++ -o build/flow_runtime_test
+	python3 tests/run_unwind_runtime_test.py build/flow_runtime_test
 
 # Capstone 反汇编库源文件（仅 ARM/ARM64 架构）
 CAPSTONE_SRC := src/core/capstone/cs.c \
@@ -71,7 +78,7 @@ SRC     := src/core/fishhook.c \
            src/core/dh_thunk.m \
            src/core/dh_call_context.c \
            src/core/dh_event.m \
-           src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m \
+           src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
            src/core/dh_noise.m \
            src/core/dh_spoof.m \
            src/core/dh_symtab.c \
@@ -162,7 +169,7 @@ CFLAGS  := $(ARCH_FLAGS) \
            -miphoneos-version-min=$(MIN_IOS) \
            -dynamiclib \
            -install_name @executable_path/$(TARGET) \
-           -ObjC -fobjc-arc \
+           -fobjc-arc \
            -Wall -Wno-deprecated-declarations -Wno-nullability-completeness \
            -O2 \
            $(INCLUDES) \
@@ -200,7 +207,7 @@ linux:
 	python3 tools/gen_web.py web/wechat-follow.png $(WECHAT_HEADER) kDHWeChatPNG
 	$(CROSS_CC) $(ARCH_FLAGS) -isysroot $(IOS_SDK) -miphoneos-version-min=$(MIN_IOS) \
 		-dynamiclib -install_name @executable_path/$(TARGET) \
-		-ObjC -fobjc-arc -Wall -Wno-deprecated-declarations -Wno-nullability-completeness \
+		-fobjc-arc -Wall -Wno-deprecated-declarations -Wno-nullability-completeness \
 		-O2 $(INCLUDES) $(CAPSTONE_DEF) $(VERSION_DEF) $(VENDOR_DEF) -DDH_VARIANT=$(DH_VARIANT_NUM) $(FRAMEWORKS) \
 		$(SRC) $(VENDOR_LIBS) -o $(TARGET)
 	@echo "✅ $(TARGET) (linux cross)"
@@ -214,7 +221,7 @@ MAC_CFLAGS := -target $(MAC_ARCH)-apple-macos$(MAC_MIN) \
               -isysroot $(MAC_SDK) \
               -dynamiclib \
               -install_name @executable_path/$(MAC_TARGET) \
-              -ObjC -fobjc-arc \
+              -fobjc-arc \
               -Wall -Wno-deprecated-declarations -Wno-nullability-completeness \
               -O0 -g \
               $(INCLUDES) \
@@ -241,7 +248,7 @@ SIM_CFLAGS := -target $(SIM_ARCH)-apple-ios$(SIM_MIN)-simulator \
               -isysroot $(SIM_SDK) \
               -dynamiclib \
               -install_name @executable_path/$(SIM_TARGET) \
-              -ObjC -fobjc-arc \
+              -fobjc-arc \
               -Wall -Wno-deprecated-declarations -Wno-nullability-completeness \
               -O0 -g \
               $(INCLUDES) \

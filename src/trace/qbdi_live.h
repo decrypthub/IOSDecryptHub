@@ -8,6 +8,7 @@ typedef struct {
 } DHLiveTransfer;
 DHLiveTransfer *dh_live_claim(uint64_t slot, uint64_t original, const DHCPUContext *entry, uint64_t token);
 DHCPUContext *dh_live_run(DHLiveTransfer *transfer);
+int dh_live_current(void);
 #ifdef __OBJC__
 #import <Foundation/Foundation.h>
 BOOL DHLiveAvailable(void);

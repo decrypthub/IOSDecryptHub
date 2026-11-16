@@ -28,6 +28,12 @@ __attribute__((constructor)) static void prepare_unwind(void) {
     getProcedure=function("unw_get_proc_info");
 }
 int dh_unwind_available(void) {return captureContext && initializeCursor && setRegister && getRegister && stepCursor && getProcedure;}
+int dh_unwind_bounds(uint64_t pc,uint64_t *start,uint64_t *end) {
+    if (!dh_unwind_available()) return 0;
+    unw_context_t context;unw_cursor_t cursor;unw_proc_info_t info;
+    if (captureContext(&context) || initializeCursor(&cursor,&context) || setRegister(&cursor,UNW_REG_IP,pc) || getProcedure(&cursor,&info)) return 0;
+    *start=info.start_ip;*end=info.end_ip;return *start<=pc && pc<*end;
+}
 
 static uint64_t code(uint64_t value) {
     return (uint64_t)ptrauth_strip((void *)(uintptr_t)value,ptrauth_key_return_address);

@@ -20,6 +20,7 @@
 #import "dh_event.h"
 #include "dh_call_context.h"
 #import "dh_unwind.h"
+#import "dh_flow.h"
 #import "../trace/qbdi_live.h"
 #include <errno.h>
 
@@ -106,11 +107,17 @@ int dh_thunk_is_inline_patched(uint64_t address) {
 static int dh_unsafe_runtime_symbol(const char *symbol) {
     if (!symbol) return 0;
     if (symbol[0] == '_') symbol++;
+    if(DHFlowOwnsImport(symbol))return 1;
     static const char *names[] = {"malloc", "calloc", "realloc", "free", "valloc", "posix_memalign",
         "aligned_alloc", "malloc_zone_malloc", "malloc_zone_calloc", "malloc_zone_realloc",
         "malloc_zone_free", "objc_msgSend", "objc_retain", "objc_release", NULL};
     for (unsigned i = 0; names[i]; i++) if (!strcmp(symbol, names[i])) return 1;
     return 0;
+}
+int dh_thunk_has_import(const char *name) {
+    int found=0;pthread_mutex_lock(&g_install_lock);int n=atomic_load(&g_next_slot);
+    for(int i=0;i<n && i<DH_THUNK_COUNT;i++)if(g_slots[i].used && g_slots[i].kind==DH_HOOK_IMPORT && !strcmp(g_slots[i].import_symbol,name)) {found=1;break;}
+    pthread_mutex_unlock(&g_install_lock);return found;
 }
 
 void dh_thunk_options_default(dh_hook_options *o) {
@@ -146,7 +153,7 @@ int dh_thunk_install_configured(dh_hook_kind kind, const char *owner, const char
     if (err && errsz) err[0] = 0;
     if (dh_thunk_validate_options(options, err, errsz)) return -6;
     if (kind != DH_HOOK_METHOD && dh_unsafe_runtime_symbol(name)) {
-        if (err && errsz) snprintf(err, errsz, "allocator/runtime hooks are unsafe because the event handler allocates");
+        if (err && errsz) snprintf(err, errsz, "%s",DHFlowOwnsImport(name)?"GCD import is owned by bounded async capture; restart before changing ownership":"allocator/runtime hooks are unsafe because the event handler allocates");
         return -6;
     }
     int post = options->capture_return || options->capture_after || options->capture_ret_multi[0];
@@ -503,6 +510,17 @@ static inline void *dh_slot_addr(int i) { (void)i; return NULL; }
 
 // 线程内重入保护: 处理器会调 Foundation(可能再触发被 hook 的底层函数), 用 TLS 标志防无限递归。
 static __thread int g_in_thunk = 0;
+int dh_thunk_in_handler(void) {return g_in_thunk;}
+int dh_thunk_post_frame(uint64_t pc,uint64_t sp,uint64_t callerSP) {
+#if DH_THUNK_ARM64
+    extern void dh_thunk_trampoline(void),dh_live_bridge(void);
+    uint64_t start=(uint64_t)ptrauth_strip((void *)dh_thunk_trampoline,ptrauth_key_function_pointer);
+    uint64_t end=(uint64_t)ptrauth_strip((void *)dh_live_bridge,ptrauth_key_function_pointer);
+    return pc>=start && pc<end && (sp+0x560==callerSP || sp+0x460==callerSP);
+#else
+    return 0;
+#endif
+}
 
 // ---- 参数反引用（可选; method hook 走对象反引用, import hook 走可打印 C 字符串判定）----
 // 目的: 直接看到参数「内容」(明文/密钥/密文/字典), 而不是只有一个指针值。
@@ -672,11 +690,13 @@ static NSDictionary *dh_function_context(DHLogEntry *e, int slot, DHCallContext 
     NSMutableDictionary *c = [e.eventContext mutableCopy];
     c[@"kind"] = @"function"; c[@"phase"] = phase;
     c[@"callId"] = DHCallID(call.id); c[@"parentCallId"] = DHCallID(call.parent);
+    [c addEntriesFromDictionary:DHFlowFields(call.async_task)];
     c[@"hookId"] = [NSString stringWithFormat:@"%@:hook:%d", DHProcessGeneration(), slot];
     c[@"slot"] = @(slot); c[@"depth"] = @(call.depth);
     c[@"mechanism"] = g_slots[slot].kind == DH_HOOK_METHOD ? @"objc" : g_slots[slot].kind == DH_HOOK_INLINE ? @"inline" : @"import";
     c[@"pairing"] = call.tracked ? @"paired" : g_dh_thunk_post[slot] ? @"context-unavailable" : @"entry-only";
-    c[@"contextComplete"] = @(!g_dh_thunk_post[slot] || call.tracked);
+    c[@"contextComplete"] = @(call.context_trusted && (!g_dh_thunk_post[slot] || call.tracked));
+    c[@"parentValidation"]=call.context_trusted?@"verified-or-no-active-scope":@"unverified-unwind; associations suppressed";
     c[@"targetIdentity"] = g_slot_targets[slot] ?: @{};
     if ([phase isEqualToString:@"leave"] && call.started_ns)
         c[@"durationNs"] = [NSString stringWithFormat:@"%llu", DHMonotonicNS() - call.started_ns];
@@ -688,15 +708,18 @@ uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint
     int savedErrno=errno;
     if (slot >= DH_THUNK_COUNT) return 0;
     dh_slot_t *s = &g_slots[slot];
-    if (g_dh_thunk_post[slot]) atomic_fetch_add_explicit(&g_slot_inflight[slot], 1, memory_order_relaxed);
-    if (!atomic_load_explicit(&s->enabled, memory_order_acquire)) return 0;
-    uint64_t hits = atomic_fetch_add_explicit(&s->hits, 1, memory_order_relaxed) + 1;
-    if (g_in_thunk) return 0;
-    g_in_thunk = 1;
-    int savedInternal=dh_in_hook; dh_in_hook=1;
-    if ([DHLogStore shared].paused) { dh_in_hook=savedInternal; g_in_thunk = 0; errno=savedErrno; return 0; }
-    DHCallContext call = dh_call_begin(g_dh_thunk_post[slot], DHMonotonicNS());
+    if (g_in_thunk) {if(g_dh_thunk_post[slot])atomic_fetch_add(&g_slot_inflight[slot],1);return 0;}
+    int savedInternal=dh_in_hook;dh_in_hook=1;
     DHRawStack captureStack;dh_unwind_capture(full,(uint64_t)(s->target ?: g_dh_thunk_orig[slot]),&captureStack);
+    DHFlowCheck(&captureStack);
+    uint64_t guard=0;
+    if (g_dh_thunk_post[slot]) {atomic_fetch_add_explicit(&g_slot_inflight[slot],1,memory_order_relaxed);guard=DHFlowGuardBegin((int)slot,caller_sp);}
+    if (!atomic_load_explicit(&s->enabled,memory_order_acquire)) {dh_in_hook=savedInternal;errno=savedErrno;return guard;}
+    uint64_t hits = atomic_fetch_add_explicit(&s->hits, 1, memory_order_relaxed) + 1;
+    g_in_thunk = 1;
+    if ([DHLogStore shared].paused) { dh_in_hook=savedInternal; g_in_thunk = 0; errno=savedErrno; return guard; }
+    DHCallContext call = dh_call_begin(g_dh_thunk_post[slot], DHMonotonicNS());
+    if(guard)DHFlowGuardBind(guard,&call);
     @autoreleasepool {
         const dh_hook_options *o = &g_slot_options[slot];
         DHLogEntry *e = [DHLogEntry new];
@@ -771,10 +794,11 @@ void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_
     int savedErrno=errno;
     (void)orig;
     if (slot >= DH_THUNK_COUNT) return;
+    DHFlowGuardEnd(token);
     atomic_fetch_sub_explicit(&g_slot_inflight[slot], 1, memory_order_relaxed);
     DHCallContext call = dh_call_end(token); // 软停/暂停后也必须弹出，不能污染后续调用。
     dh_slot_t *s = &g_slots[slot];
-    if (!token || !atomic_load_explicit(&s->enabled, memory_order_acquire) || g_in_thunk) return;
+    if (!token || (token>>63) || !atomic_load_explicit(&s->enabled, memory_order_acquire) || g_in_thunk) {errno=savedErrno;return;}
     g_in_thunk = 1;
     int savedInternal=dh_in_hook; dh_in_hook=1;
     @autoreleasepool {
@@ -817,6 +841,21 @@ void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_
     dh_in_hook=savedInternal; g_in_thunk = 0;errno=savedErrno;
 }
 
+void dh_thunk_abandon(unsigned slot,uint64_t token,const char *reason,const DHCallContext *snapshot) {
+    if(slot>=DH_THUNK_COUNT)return;
+    atomic_fetch_sub(&g_slot_inflight[slot],1);DHCallContext call=dh_call_end(token);
+    if(!call.tracked && snapshot && snapshot->id==token)call=*snapshot;
+    if(!token || (token>>63))return;
+    int saved=dh_in_hook;dh_in_hook=1;
+    @autoreleasepool {
+        DHLogEntry *e=[DHLogEntry new];e.category=DHCategoryOther;e.algorithm=@"hook-state";e.operation=@(g_slots[slot].name);
+        NSMutableDictionary *context=[dh_function_context(e,(int)slot,call,@"aborted") mutableCopy];context[@"pairing"]=@"aborted";e.eventContext=context;
+        e.eventPayload=@{@"reason":@(reason),@"returnValue":@{@"available":@NO},@"detection":!strcmp(reason,"thread-exit")?@"pthread-key exit snapshot":@"complete native stack no longer contains the owned post bridge"};
+        [[DHLogStore shared] append:e];
+    }
+    dh_in_hook=saved;
+}
+
 // ---- 安装 / 关闭 / 枚举 ----
 
 static int dh_alloc_slot(void) {
@@ -833,6 +872,7 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
     void *resolved = dlsym(RTLD_DEFAULT, symbol);
     if (!resolved || !dh_addr_is_executable((uint64_t)(uintptr_t)ptrauth_strip(resolved, ptrauth_key_function_pointer))) return -2;
     pthread_mutex_lock(&g_install_lock);
+    if(DHFlowOwnsImport(symbol)) {pthread_mutex_unlock(&g_install_lock);return -6;}
     // fishhook 按符号改 GOT: 同一符号装第二次会把 GOT 指向新槽位, 旧槽位从此 0 命中
     // (它还留在 list_hooks 里, 看起来像「装好了却不生效」)。重复安装直接拒绝, 让调用方复用。
     {

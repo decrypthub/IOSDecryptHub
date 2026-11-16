@@ -1,0 +1,117 @@
+#import "dh_flow.h"
+#import "dh_thunk.h"
+#import "dh_event.h"
+#import "dh_call_context.h"
+#import "log_store.h"
+#include <setjmp.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+extern void DHFlowThrowCXX(void);
+extern int DHFlowCatchCXX(void (*body)(void *),void *context);
+static __thread jmp_buf *jumpTarget;
+@interface IDHFlowProbe:NSObject
+@property(strong) NSException *marker;
+@property(strong) NSMutableArray *observations;
+@property(strong) dispatch_queue_t queue;
+@property(strong) dispatch_group_t group;
+@property int mode;
+@property(copy) dispatch_block_t special;
+- (uint64_t)normal:(uint64_t)n;
+- (uint64_t)throwOut;
+- (uint64_t)jumpOut;
+- (uint64_t)cppOut;
+- (uint64_t)catchInside;
+- (uint64_t)schedule;
+- (uint64_t)exitOut;
+- (uint64_t)unverified;
+@end
+static void cpp_body(void *p) {[( __bridge IDHFlowProbe *)p cppOut];}
+static void *exit_body(void *p) {[( __bridge IDHFlowProbe *)p exitOut];return NULL;}
+static void function_body(void *p) {IDHFlowProbe *probe=CFBridgingRelease(p);[probe normal:17];dispatch_group_leave(probe.group);}
+@implementation IDHFlowProbe
+- (uint64_t)normal:(uint64_t)n {
+    @synchronized(self) {[self.observations addObject:@{@"asyncTaskId":DHFlowFields(dh_call_async())[@"asyncTaskId"],@"parentCallId":DHCallID(dh_call_parent())}];}
+    return n+1;
+}
+- (uint64_t)throwOut {@throw self.marker;}
+- (uint64_t)jumpOut {longjmp(*jumpTarget,73);}
+- (uint64_t)cppOut {DHFlowThrowCXX();return 0;}
+- (uint64_t)exitOut {pthread_exit(NULL);}
+- (uint64_t)unverified {
+    DHRawStack unknown={0};DHFlowCheck(&unknown);
+    if(dh_call_parent() || dh_call_async())[NSException raise:@"IDHFlowFixture" format:@"unverified boundary retained an association"];
+    unknown.complete=1;unknown.count=1;unknown.pc[0]=1;unknown.sp[0]=1;DHFlowCheck(&unknown);
+    if(dh_call_parent() || dh_call_async())[NSException raise:@"IDHFlowFixture" format:@"premature stop retained an association"];
+    return [self normal:1];
+}
+- (uint64_t)catchInside {@try {@throw self.marker;}@catch(NSException *e) {return [self normal:8];}}
+- (uint64_t)schedule {
+    dispatch_group_t group=self.group;dispatch_queue_t queue=self.queue;
+    if(self.mode==1) {dispatch_group_enter(group);dispatch_after(dispatch_time(DISPATCH_TIME_NOW,50000000),queue,^{[self normal:9];dispatch_group_leave(group);});return 1;}
+    if(self.mode==2) {self.special=dispatch_block_create(DISPATCH_BLOCK_BARRIER,^{[self normal:99];});dispatch_block_cancel(self.special);dispatch_async(queue,self.special);return 0;}
+    dispatch_group_enter(group);dispatch_async(queue,^{
+        [self normal:1];dispatch_group_enter(group);dispatch_async(queue,^{[self normal:2];dispatch_group_leave(group);});dispatch_group_leave(group);
+    });
+    dispatch_group_enter(group);dispatch_after(dispatch_time(DISPATCH_TIME_NOW,1000000),queue,^{[self normal:3];dispatch_group_leave(group);});
+    dispatch_group_async(group,queue,^{[self normal:4];});
+    dispatch_group_enter(group);dispatch_async_f(queue,(__bridge_retained void *)self,function_body);
+    dispatch_group_enter(group);dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW,1000000),queue,(__bridge_retained void *)self,function_body);
+    dispatch_group_enter(group);dispatch_group_async_f(group,queue,(__bridge_retained void *)self,function_body);
+    return 7;
+}
+@end
+static void require(BOOL good,NSString *message) {if(!good)[NSException raise:@"IDHFlowFixture" format:@"%@",message];}
+static void drain(IDHFlowProbe *probe) {
+    require(dispatch_group_wait(probe.group,dispatch_time(DISPATCH_TIME_NOW,5000000000))==0,@"fixture callbacks timed out");
+    for(unsigned i=0;i<100 && [DHFlowState()[@"pendingOrRunning"] unsignedIntValue];i++)usleep(10000);
+    require([DHFlowState()[@"pendingOrRunning"] unsignedIntValue]==0,@"pending task accounting leaked");
+}
+NSDictionary *DHFlowSelfTest(void) {
+    NSMutableArray *passed=[NSMutableArray array],*slots=[NSMutableArray array];NSMutableDictionary *result=[@{@"pass":@NO,@"restartRequired":@YES} mutableCopy];
+    IDHFlowProbe *probe=[IDHFlowProbe new];probe.marker=[NSException exceptionWithName:@"IDH-original-marker" reason:@"fixture" userInfo:nil];probe.observations=[NSMutableArray array];
+    probe.queue=dispatch_queue_create("com.iosdecrypthub.flow.fixture",DISPATCH_QUEUE_SERIAL);probe.group=dispatch_group_create();
+    @try {
+        require(![DHLogStore shared].paused && ![[DHLogStore shared] isPausedForCategory:DHCategoryOther],@"resume all/other before selftest");
+        dh_hook_options options;dh_thunk_options_default(&options);options.fixed_abi=1;options.capture_return=1;char error[512]={0};
+        for(NSString *name in @[@"normal:",@"throwOut",@"jumpOut",@"cppOut",@"catchInside",@"schedule",@"exitOut",@"unverified"]) {
+            int slot=dh_thunk_install_configured(DH_HOOK_METHOD,"IDHFlowProbe",name.UTF8String,0,0,NULL,&options,error,sizeof(error));require(slot>=0,@(error));[slots addObject:@(slot)];
+        }
+        uint64_t initial=[DHFlowState()[@"abandonedCalls"] unsignedLongLongValue];
+        @try {[probe throwOut];require(NO,@"throw did not propagate");}@catch(NSException *e) {require(e==probe.marker,@"original exception object changed");}
+        require([probe normal:6]==7 && dh_call_parent()==0,@"exception left a stale parent");
+        require([DHFlowState()[@"abandonedCalls"] unsignedLongLongValue]==initial+1,@"exception bridge not retired");
+        [passed addObject:@"ObjC-exception-propagates-and-abandoned-post-retires"];
+        jmp_buf env;jumpTarget=&env;int value=setjmp(env);if(!value)[probe jumpOut];require(value==73,@"longjmp result changed");
+        require([probe normal:3]==4 && dh_call_parent()==0,@"longjmp left a stale parent");
+        require([DHFlowState()[@"abandonedCalls"] unsignedLongLongValue]==initial+2,@"longjmp bridge not retired");[passed addObject:@"longjmp-preserves-value-and-cleans-next-boundary"];
+        require(DHFlowCatchCXX(cpp_body,(__bridge void *)probe)==73,@"C++ exception did not propagate unchanged");[probe normal:2];
+        require([DHFlowState()[@"abandonedCalls"] unsignedLongLongValue]==initial+3,@"C++ bridge not retired");[passed addObject:@"CXX-exception-propagates-and-abandoned-post-retires"];
+        require([probe catchInside]==9,@"caught-inside result changed");require([DHFlowState()[@"abandonedCalls"] unsignedLongLongValue]==initial+3,@"caught-inside falsely retired active bridge");[passed addObject:@"caught-inside-keeps-active-parent"];
+        [DHLogStore shared].paused=YES;value=setjmp(env);if(!value)[probe jumpOut];[probe normal:0];[DHLogStore shared].paused=NO;
+        require([DHFlowState()[@"abandonedCalls"] unsignedLongLongValue]==initial+4,@"paused bridge accounting leaked");[passed addObject:@"paused-capture-still-protects-inflight-state"];
+        require([probe unverified]==2,@"incomplete unwind did not suppress uncertain links");[passed addObject:@"incomplete-unwind-suppresses-links-without-false-abort"];
+        pthread_t worker;require(pthread_create(&worker,NULL,exit_body,(__bridge void *)probe)==0,@"thread fixture creation failed");pthread_join(worker,NULL);
+        require([DHFlowState()[@"abandonedCalls"] unsignedLongLongValue]==initial+5,@"thread exit did not retire owned bridge");[passed addObject:@"thread-exit-retires-inflight-state"];
+        NSDictionary *configured=DHFlowConfigure(YES,NO,64,10000,nil);require([configured[@"ok"] boolValue],configured[@"error"]);
+        unsigned first=[DHFlowState()[@"retained"] unsignedIntValue];[probe.observations removeAllObjects];[probe schedule];drain(probe);
+        NSDictionary *read=DHFlowRead(first,64,0);NSArray *tasks=read[@"tasks"];require(tasks.count==7,@"six APIs plus nested async not captured");
+        BOOL nested=NO,cross=NO;for(NSDictionary *t in tasks) {require([t[@"state"] isEqual:@"completed"],@"task not complete");nested|=[t[@"asyncParentTaskId"] length]>0;cross|=![t[@"submissionThreadId"] isEqual:t[@"executionThreadId"]];}
+        require(nested && cross && probe.observations.count==7,@"missing nested/cross-thread/exactly-once observations");
+        for(NSDictionary *o in probe.observations)require([o[@"asyncTaskId"] length]>0,@"worker lost captured context");
+        [passed addObject:@"six-GCD-imports-nested-edges-and-cross-thread-context"];result[@"tasks"]=tasks;
+        unsigned before=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,2,10000,nil);[probe.observations removeAllObjects];[probe schedule];drain(probe);
+        require([DHFlowState()[@"retained"] unsignedIntValue]==before+2 && probe.observations.count==7,@"budget changed original callback execution");[passed addObject:@"task-budget-forwards-all-original-callbacks-once"];
+        before=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,2,1,nil);usleep(3000);[probe schedule];drain(probe);
+        require([DHFlowState()[@"retained"] unsignedIntValue]==before,@"expired window captured a new task");[passed addObject:@"expired-window-forwards-without-new-capture"];
+        DHFlowConfigure(YES,NO,2,10000,nil);probe.mode=1;[probe schedule];DHFlowConfigure(NO,NO,2,10000,nil);drain(probe);
+        require([probe normal:4]==5 && dh_call_async()==0 && dh_call_parent()==0,@"unrelated worker/caller context leaked");[passed addObject:@"disable-keeps-pending-task-and-does-not-leak-context"];
+        before=[DHFlowState()[@"retained"] unsignedIntValue];NSUInteger observed=probe.observations.count;DHFlowConfigure(YES,NO,8,10000,nil);probe.mode=2;[probe schedule];
+        require(dispatch_block_wait(probe.special,dispatch_time(DISPATCH_TIME_NOW,5000000000))==0,@"special block wait/cancel semantics changed");
+        require(probe.observations.count==observed && [DHFlowState()[@"retained"] unsignedIntValue]==before,@"cancelled dispatch block was wrapped or executed");[passed addObject:@"special-dispatch-block-cancel-wait-is-forwarded-unchanged"];
+        for(NSNumber *slot in slots)require([dh_thunk_metadata(slot.intValue)[@"inFlight"] longLongValue]==0,@"owned inflight counter leaked");
+        require([DHFlowState()[@"threadGuardCount"] intValue]==0,@"thread guard stack leaked");result[@"pass"]=@YES;
+    }@catch(NSException *e) {result[@"error"]=e.reason?:@"flow fixture failed";}
+    @finally {jumpTarget=NULL;[DHLogStore shared].paused=NO;DHFlowConfigure(NO,NO,1,1,nil);for(NSNumber *slot in slots)dh_thunk_disable(slot.intValue);}
+    result[@"passed"]=passed;result[@"slots"]=slots;result[@"state"]=DHFlowState();return result;
+}

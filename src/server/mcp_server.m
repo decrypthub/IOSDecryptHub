@@ -23,6 +23,7 @@
 #include "dh_hook_selftest.h"
 #include "dh_health.h"
 #include "dh_unwind.h"
+#include "dh_flow.h"
 #include "dh_noise.h"
 #include "dh_spoof.h"
 #include "dh_files.h"
@@ -1683,6 +1684,7 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
     return tool_ok(@{
         @"pluginVersion":  @MCP_SERVER_VERSION,
         @"processGeneration": DHProcessGeneration(), @"eventSchemaVersion": @2,
+        @"flowProtection":@{@"backend":@"owned-bridge stack reconciliation",@"boundaryDetection":@YES,@"transparentVMExceptions":@NO,@"maxGuardsPerThread":@64,@"state":DHFlowState()},
         @"hookABI": @{@"fixedGPRStackForwarding": @YES, @"maxStackBytes": @256, @"maxArguments": @32,
             @"CPostRequiresDeclaration": @YES, @"floatAggregatePost": @NO, @"exceptionUnwind": @NO},
         @"stackUnwind":@{@"backend":dh_unwind_available()?@"system-libunwind":@"unavailable",@"maxFrames":@(DH_STACK_MAX),@"thunkCFI":@YES,@"symbolication":@"deferred",@"scope":@"synchronous-native-thread; metadata gaps and budgets reported"},
@@ -2028,7 +2030,7 @@ static BOOL event_passes_extra(DHLogEntry *e,
 
 static BOOL event_passes_context(DHLogEntry *event, NSDictionary *args) {
     NSDictionary *keys = @{@"process_generation": @"processGeneration", @"call_id": @"callId",
-        @"parent_call_id": @"parentCallId", @"hook_id": @"hookId", @"phase": @"phase"};
+        @"parent_call_id": @"parentCallId", @"hook_id": @"hookId", @"phase": @"phase",@"async_task_id":@"asyncTaskId"};
     for (NSString *key in keys) {
         id value = args[key];
         if (value && (![value isKindOfClass:NSString.class] || ![value isEqual:event.eventContext[keys[key]]])) return NO;
@@ -2377,7 +2379,7 @@ static NSDictionary *tool_get_call(NSDictionary *args) {
             if (ids.count == before) break;
         }
     }
-    DHLogEntry *entry = nil, *leave = nil;
+    DHLogEntry *entry = nil, *leave = nil, *aborted = nil;
     NSMutableArray *events = [NSMutableArray array]; NSUInteger matched = 0, bytes = 0;
     BOOL truncated = NO;
     for (DHLogEntry *e in snapshot) {
@@ -2386,6 +2388,7 @@ static NSDictionary *tool_get_call(NSDictionary *args) {
         BOOL root = [c[@"callId"] isEqual:callID];
         if (root && [c[@"phase"] isEqual:@"entry"]) entry = e;
         if (root && [c[@"phase"] isEqual:@"leave"]) leave = e;
+        if (root && [c[@"phase"] isEqual:@"aborted"]) aborted = e;
         if (![ids containsObject:c[@"callId"] ?: @""] && !(children && [ids containsObject:c[@"parentCallId"] ?: @""])) continue;
         matched++;
         if (events.count >= (NSUInteger)limit || truncated) { truncated = YES; continue; }
@@ -2395,11 +2398,12 @@ static NSDictionary *tool_get_call(NSDictionary *args) {
         bytes += json.length; [events addObject:detail];
     }
     if (!matched) return tool_err(@"call events are unknown or no longer retained in the bounded store");
-    NSString *status = entry && leave ? @"paired"
+    NSString *status = aborted ? @"aborted" : entry && leave ? @"paired"
         : entry && [entry.eventContext[@"pairing"] isEqual:@"entry-only"] ? @"entry-only"
         : entry ? @"open-or-leave-not-retained" : leave ? @"entry-not-retained" : @"root-not-retained";
     return tool_ok(@{@"callId": callID, @"processGeneration": generation, @"status": status,
         @"retainedPair": @(entry && leave), @"resultTruncated": @(truncated), @"matched": @(matched),
+        @"abortedSeq":aborted?[NSString stringWithFormat:@"%llu",aborted.seq]:(id)NSNull.null,
         @"entrySeq": entry ? [NSString stringWithFormat:@"%llu", entry.seq] : (id)[NSNull null],
         @"leaveSeq": leave ? [NSString stringWithFormat:@"%llu", leave.seq] : (id)[NSNull null],
         @"parentScope": @"active-paired-synchronous-functions", @"events": events,
@@ -3398,7 +3402,7 @@ static NSArray *tool_definitions(void) {
                 @"description": @"Required for post capture: caller confirms fixed nonvariadic prototype; Objective-C metadata alone cannot detect ... methods"};
         }
         if ([name isEqualToString:@"query_events"]) {
-            for (NSString *key in @[@"process_generation", @"call_id", @"parent_call_id", @"hook_id", @"phase"])
+            for (NSString *key in @[@"process_generation", @"call_id", @"parent_call_id", @"hook_id", @"phase",@"async_task_id"])
                 properties[key] = @{@"type": @"string", @"description": @"Exact structured event-context filter; legacy records without the field do not match"};
         }
         if ([name isEqualToString:@"trace_function"])
@@ -3444,6 +3448,12 @@ static NSArray *tool_definitions(void) {
           @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"trace_id"],@"properties":@{@"process_generation":@{@"type":@"string"},@"trace_id":@{@"type":@"string"}}}},
         @{@"name":@"run_live_selftest",@"description":@"Explicit IDH-owned live-call, exactly-once side effect, packed stack, SIMD, scratch registers, recording budget and unwind fixture tests. No business signing oracle. Restart target afterward.",
           @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
+    ]];
+    [tools addObjectsFromArray:@[
+      @{@"name":@"configure_async_capture",@"description":@"Opt-in bounded GCD submit/execute correlation. Six public async/after/group block and function imports; existing pending work keeps its identity after capture is disabled. Calibrated dispatch-block and unknown/system-invoke blocks are forwarded unchanged; only plain App blocks are wrapped. No Swift/NSOperation/private scheduler coverage. Restart clears retained forwarding patches.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"enabled"],@"properties":@{@"process_generation":@{@"type":@"string"},@"enabled":@{@"type":@"boolean"},@"capture_roots":@{@"type":@"boolean"},@"queue_exclude":@{@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"max_tasks":@{@"type":@"integer",@"minimum":@1,@"maximum":@256},@"max_ms":@{@"type":@"integer",@"minimum":@1,@"maximum":@60000}}}},
+      @{@"name":@"get_async_tasks",@"description":@"Read bounded observed GCD causal edges, submitter call/task and execution TID. Async edges are separate from native stacks and synchronous parentCallId. Pending is not completion; no guessed edges.",@"inputSchema":@{@"type":@"object",@"properties":@{@"task_id":@{@"type":@"string"},@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@1024},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@128}}}},
+      @{@"name":@"get_flow_state",@"description":@"Read bounded async and nonlocal-exit protection counters. Thread-local counters refer to the handling thread; no arbitrary thread state mutation.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
+      @{@"name":@"run_flow_selftest",@"description":@"Explicit IDH-owned exception/longjmp cleanup, caught exception, GCD context propagation, bounded budget and worker-reuse fixtures. Does not run business signing functions; restart target after testing.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
     ]];
     return tools;
 }
@@ -3548,6 +3558,28 @@ static NSDictionary *tool_set_webkit_probe(NSDictionary *args) {
 }
 
 static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
+    if([@[@"configure_async_capture",@"run_flow_selftest"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
+    if([name isEqual:@"get_flow_state"])return tool_ok(DHFlowState());
+    if([name isEqual:@"run_flow_selftest"])return tool_ok(DHFlowSelfTest());
+    if([name isEqual:@"configure_async_capture"] || [name isEqual:@"get_async_tasks"]) {
+        for(NSString *key in @[@"enabled",@"capture_roots"])if(args[key] && (![args[key] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)args[key])!=CFBooleanGetTypeID()))return tool_err(@"flow switches must be booleans");
+        for(NSString *key in @[@"offset",@"limit",@"max_tasks",@"max_ms"])if(args[key] && (![args[key] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)args[key])==CFBooleanGetTypeID() || !isfinite([args[key] doubleValue]) || [args[key] doubleValue]!=floor([args[key] doubleValue]) || [args[key] doubleValue]<0 || [args[key] doubleValue]>60000))return tool_err(@"flow bounds must be finite nonnegative integers");
+        if([name isEqual:@"configure_async_capture"]) {
+            if(!args[@"enabled"])return tool_err(@"enabled is required");
+            unsigned budget=args[@"max_tasks"]?[args[@"max_tasks"] unsignedIntValue]:128,ms=args[@"max_ms"]?[args[@"max_ms"] unsignedIntValue]:30000;
+            if(!budget || budget>256 || !ms || ms>60000)return tool_err(@"async window out of range");
+            NSDictionary *r=DHFlowConfigure([args[@"enabled"] boolValue],[args[@"capture_roots"] boolValue],budget,ms,args[@"queue_exclude"]);return [r[@"ok"] boolValue]?tool_ok(r):tool_err(r[@"error"]);
+        }
+        unsigned offset=[args[@"offset"] unsignedIntValue],limit=args[@"limit"]?[args[@"limit"] unsignedIntValue]:32;uint64_t task=0;
+        if(offset>1024 || !limit || limit>128)return tool_err(@"async page out of range");
+        if(args[@"task_id"]) {
+            NSString *prefix=[DHProcessGeneration() stringByAppendingString:@":async:"];id value=args[@"task_id"];
+            if(![value isKindOfClass:NSString.class] || ![value hasPrefix:prefix])return tool_err(@"unknown task generation");
+            const char *number=[[value substringFromIndex:prefix.length] UTF8String];char *end=NULL;task=strtoull(number,&end,10);
+            if(!number[0] || *end || task<1 || task>1024)return tool_err(@"invalid task id");
+        }
+        return tool_ok(DHFlowRead(offset,limit,task));
+    }
     if ([@[@"hook_method", @"hook_inline", @"hook_import", @"unhook", @"trace_function", @"objc_call", @"run_hook_selftest", @"trace_live_arm", @"trace_live_cancel", @"run_live_selftest"] containsObject:name]) {
         NSString *generation = args[@"process_generation"];
         if (![generation isKindOfClass:NSString.class] || ![generation isEqualToString:DHProcessGeneration()])
@@ -3670,7 +3702,7 @@ static BOOL tool_is_heavy(NSString *name) {
                                       @"find_selector_refs", @"find_function_refs",
                                       @"analyze_function", @"disassemble_function",
                                       @"find_objc_methods", @"export_events", @"start_dump",
-                                      @"trace_function", @"run_hook_selftest", @"run_live_selftest", @"trace_live_arm", @"trace_live_cancel"]];
+                                      @"trace_function", @"run_hook_selftest", @"run_live_selftest", @"trace_live_arm", @"trace_live_cancel",@"configure_async_capture",@"run_flow_selftest"]];
     });
     return [heavy containsObject:name];
 }

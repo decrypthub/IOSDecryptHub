@@ -1,5 +1,6 @@
 #import "dh_event.h"
 #import "dh_call_context.h"
+#import "dh_flow.h"
 #import "log_store.h"
 #include <dlfcn.h>
 #include <mach/mach_time.h>
@@ -29,12 +30,14 @@ uint64_t DHMonotonicNS(void) {
 }
 void DHStampEvent(DHLogEntry *event) {
     if (event.eventContext) return;
+    DHFlowBoundary();
     NSString *kind = event.category <= DHCategoryAsymmetric ? @"crypto"
         : event.category == DHCategoryNetwork ? @"network" : @"observation";
-    event.eventContext = @{@"schemaVersion": @2, @"kind": kind, @"phase": @"complete",
+    NSMutableDictionary *context=[@{@"schemaVersion": @2, @"kind": kind, @"phase": @"complete",
         @"processGeneration": DHProcessGeneration(), @"pid": @(getpid()),
         @"agentBuild": @DH_VERSION_STR, @"monotonicNs": [NSString stringWithFormat:@"%llu", DHMonotonicNS()],
-        @"parentCallId": DHCallID(dh_call_parent()), @"parentScope": @"active-paired-synchronous-functions"};
+        @"parentCallId": DHCallID(dh_call_parent()), @"parentScope": @"active-paired-synchronous-functions"} mutableCopy];
+    [context addEntriesFromDictionary:DHFlowFields(dh_call_async())];event.eventContext=context;
 }
 
 NSDictionary *DHTargetIdentity(const void *address) {
