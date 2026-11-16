@@ -18,6 +18,7 @@
 #import "log_store.h"
 #import "dh_capture.h"
 #import "dh_spoof.h"
+#include "dh_health.h"
 #import "dh_dlsym_redirect.h"
 
 // 命中隐藏 image 时对外统一伪装成的良性系统库名。
@@ -61,6 +62,7 @@ static const char *hooked_dyld_get_image_name(uint32_t index) {
 static int (*orig_dladdr)(const void *, Dl_info *);
 static int hooked_dladdr(const void *addr, Dl_info *info) {
     int r = orig_dladdr(addr, info);
+    if (dh_in_hook) return r; // IDH identity capture must retain the actual image path.
     if (r != 0 && info && info->dli_fname && dh_spoof_should_hide_image(info->dli_fname)) {
         dyld_log_hidden_once(info->dli_fname);
         info->dli_fname = kBenignImageName;   // 抹掉命中 image 的真实路径, 保持调用成功

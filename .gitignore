@@ -5,6 +5,8 @@ build/
 *.dSYM/
 *.o
 *.a
+vendor/dobby/lib/
+vendor/qbdi/lib/
 *.profraw
 tests/exercise_runner
 

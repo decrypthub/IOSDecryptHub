@@ -10,8 +10,12 @@
 #include <dlfcn.h>
 #include <time.h>
 #include <string.h>
+#include <ptrauth.h>
+#include <mach/mach.h>
+#include <math.h>
 
 #import "qbdi_trace.h"
+#import "dh_thunk.h"
 
 #ifndef DH_HAVE_QBDI
 #define DH_HAVE_QBDI 0
@@ -61,6 +65,7 @@ static VMAction dh_trace_cb(VMInstanceRef vm, GPRState *gpr, FPRState *fpr, void
     }
     c->count++;
     if (dh_trace_now_ns() > c->deadline) {
+        c->truncated = YES;
         c->stop = "time-limit";
         return QBDI_STOP;
     }
@@ -101,6 +106,20 @@ static void *dh_trace_resolve(NSString *module, NSString *symbol, uint64_t addr,
     return target;
 }
 
+static BOOL dh_trace_executable(uint64_t address) {
+    vm_address_t region = address; vm_size_t size = 0; natural_t depth = 0;
+    for (unsigned i = 0; i < 16; i++) {
+        vm_region_submap_info_data_64_t info = {0};
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &region, &size, &depth,
+            (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS ||
+            address < region || address - region >= size) return NO;
+        if (!info.is_submap) return (info.protection & VM_PROT_EXECUTE) != 0;
+        depth++;
+    }
+    return NO;
+}
+
 static BOOL dh_trace_call(VMInstanceRef vm, rword target, const uint64_t *a, int argc, rword *ret) {
     switch (argc) {
         case 0: return qbdi_call(vm, ret, target, 0);
@@ -129,14 +148,50 @@ BOOL DHQBDIAvailable(void) {
 NSDictionary *DHQBDITraceFunction(NSString *module, NSString *symbol, uint64_t addr,
                                   const uint64_t *args, int argc,
                                   int maxInsns, int maxMs) {
+    return DHQBDITraceFunctionWithBuffers(module,symbol,addr,args,argc,maxInsns,maxMs,nil);
+}
+
+NSDictionary *DHQBDITraceFunctionWithBuffers(NSString *module, NSString *symbol, uint64_t addr,
+    const uint64_t *args, int argc, int maxInsns, int maxMs, NSArray *buffers) {
 #if !DH_HAVE_QBDI
-    (void)module; (void)symbol; (void)addr; (void)args; (void)argc; (void)maxInsns; (void)maxMs;
+    (void)module; (void)symbol; (void)addr; (void)args; (void)argc; (void)maxInsns; (void)maxMs; (void)buffers;
     return @{@"ok": @NO,
-             @"error": @"QBDI is not linked in this slice (vendor QBDI is arm64-only; arm64e builds refuse instead of silently falling back)",
+             @"error": @"QBDI is not linked in this build",
              @"backend": @"unavailable"};
 #else
-    if (argc < 0) argc = 0;
-    if (argc > 8) argc = 8;
+    if (argc < 0 || argc > 8 || (argc && !args))
+        return @{@"ok": @NO, @"error": @"trace supports at most eight fixed GPR arguments"};
+    if (buffers && (![buffers isKindOfClass:NSArray.class] || buffers.count > 8))
+        return @{@"ok": @NO, @"error": @"buffers must be an array of at most eight entries"};
+    uint64_t ownedArgs[8]={0}; if (argc) memcpy(ownedArgs,args,argc*sizeof(uint64_t));
+    NSMutableArray<NSMutableData *> *ownedBuffers=[NSMutableArray array];
+    NSMutableArray<NSNumber *> *bufferArgs=[NSMutableArray array],*bufferSizes=[NSMutableArray array];
+    NSMutableSet *seen=[NSMutableSet set]; NSUInteger total=0;
+    for (id spec in buffers) {
+        if (![spec isKindOfClass:NSDictionary.class]) return @{@"ok": @NO, @"error": @"invalid buffer descriptor"};
+        id index=spec[@"arg"],hex=spec[@"hex"];
+        if (![index isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)index)==CFBooleanGetTypeID() ||
+            !isfinite([index doubleValue]) || [index doubleValue]!=floor([index doubleValue]) ||
+            [index integerValue]<0 || [index integerValue]>=argc || [seen containsObject:index] ||
+            ![hex isKindOfClass:NSString.class] || [hex length]>16384 || [hex length]%2)
+            return @{@"ok": @NO, @"error": @"buffers require unique argument indices, even hex and at most 8192 bytes each"};
+        const char *text=[hex UTF8String]; NSUInteger length=[hex length]/2;
+        if (!text || strlen(text)!=[hex length]) return @{@"ok": @NO, @"error": @"buffer hex must be ASCII"};
+        total+=length;
+        if (total>32768) return @{@"ok": @NO, @"error": @"buffer total exceeds 32768 bytes"};
+        NSMutableData *data=[NSMutableData dataWithLength:MAX(length,1)]; uint8_t *bytes=data.mutableBytes;
+        for (NSUInteger i=0;i<length;i++) {
+            unsigned value=0;
+            for (unsigned j=0;j<2;j++) {
+                char c=text[2*i+j]; unsigned digit=c>='0'&&c<='9'?c-'0':c>='a'&&c<='f'?c-'a'+10:c>='A'&&c<='F'?c-'A'+10:16;
+                if (digit>15) return @{@"ok": @NO, @"error": @"invalid buffer hex digit"};
+                value=(value<<4)|digit;
+            }
+            bytes[i]=(uint8_t)value;
+        }
+        ownedArgs[[index integerValue]]=(uint64_t)(uintptr_t)data.mutableBytes;
+        [seen addObject:index];[ownedBuffers addObject:data];[bufferArgs addObject:index];[bufferSizes addObject:@(length)];
+    }
     if (maxInsns < 1) maxInsns = 1;
     if (maxInsns > 8192) maxInsns = 8192;
     if (maxMs < 50) maxMs = 50;
@@ -144,10 +199,15 @@ NSDictionary *DHQBDITraceFunction(NSString *module, NSString *symbol, uint64_t a
 
     NSString *err = nil;
     void *target = dh_trace_resolve(module, symbol, addr, &err);
+    target = ptrauth_strip(target, ptrauth_key_function_pointer);
     if (!target) {
         return @{@"ok": @NO, @"error": err ?: @"target not resolved",
                  @"backend": @"qbdi-ios"};
     }
+    if (!dh_trace_executable((uint64_t)(uintptr_t)target))
+        return @{@"ok": @NO, @"error": @"trace target is not an executable mapping", @"backend": @"qbdi-ios"};
+    if (dh_thunk_is_inline_patched((uint64_t)(uintptr_t)target))
+        return @{@"ok": @NO, @"error": @"trace target has a retained Inline patch; restart the target and re-resolve its original code first", @"backend": @"qbdi-ios"};
 
     VMInstanceRef vm = NULL;
     Options opts;
@@ -178,12 +238,22 @@ NSDictionary *DHQBDITraceFunction(NSString *module, NSString *symbol, uint64_t a
     BOOL callOk = NO;
     uint64_t started = dh_trace_now_ns();
     if (instrumented && cbId != QBDI_INVALID_EVENTID) {
-        callOk = dh_trace_call(vm, (rword)(uintptr_t)target, args, argc, &retval);
+        callOk = dh_trace_call(vm, (rword)(uintptr_t)target, ownedArgs, argc, &retval);
     }
     uint64_t elapsedMs = (dh_trace_now_ns() - started) / 1000000ULL;
 
     qbdi_terminateVM(vm);
     qbdi_alignedFree(stack);
+    NSMutableArray *bufferResults=[NSMutableArray array];
+    static const char digits[]="0123456789abcdef";
+    for (NSUInteger i=0;i<ownedBuffers.count;i++) {
+        NSUInteger length=bufferSizes[i].unsignedIntegerValue;
+        NSMutableData *encoded=[NSMutableData dataWithLength:length*2];char *text=encoded.mutableBytes;
+        const uint8_t *bytes=ownedBuffers[i].bytes;
+        for (NSUInteger j=0;j<length;j++) { text[2*j]=digits[bytes[j]>>4];text[2*j+1]=digits[bytes[j]&15]; }
+        NSString *hex=[[NSString alloc] initWithData:encoded encoding:NSASCIIStringEncoding] ?: @"";
+        [bufferResults addObject:@{@"arg":bufferArgs[i],@"length":@(length),@"afterHex":hex}];
+    }
 
     if (!instrumented) {
         return @{@"ok": @NO,
@@ -212,8 +282,17 @@ NSDictionary *DHQBDITraceFunction(NSString *module, NSString *symbol, uint64_t a
     return @{
         @"ok": @YES,
         @"backend": @"qbdi-ios",
+        @"executionMode": @"replay", @"contextComplete": @NO,
+        @"pointerAuthentication": @(
+#if defined(QBDI_PTRAUTH)
+            YES
+#else
+            NO
+#endif
+        ),
         @"target": targetInfo,
         @"call_ok": callOk ? @YES : @NO,
+        @"retval_valid": @(callOk && ctx.count>0 && ctx.stop && strcmp(ctx.stop,"completed")==0),
         @"retval": [NSString stringWithFormat:@"0x%llx", (unsigned long long)retval],
         @"retval_dec": @(retval),
         @"count": @(ctx.count),
@@ -221,6 +300,7 @@ NSDictionary *DHQBDITraceFunction(NSString *module, NSString *symbol, uint64_t a
         @"stop_reason": ctx.stop ? @(ctx.stop) : @"completed",
         @"duration_ms": @(elapsedMs),
         @"instructions": insns,
+        @"buffers": bufferResults,
         @"warnings": warnings,
     };
 #endif

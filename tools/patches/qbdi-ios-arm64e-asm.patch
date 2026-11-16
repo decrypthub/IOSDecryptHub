@@ -1,0 +1,20 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -269,7 +269,15 @@ else()
+   enable_language(ASM)
+   if(QBDI_PLATFORM_IOS)
+     if(QBDI_ARCH_AARCH64)
+-      set(CMAKE_ASM_FLAGS "-arch arm64")
++      # CMake already emits -arch for each requested OSX architecture. An
++      # additional hard-coded arm64 makes arm64e PAC assembly build for both.
++      if(CMAKE_OSX_ARCHITECTURES)
++        set(CMAKE_ASM_FLAGS "")
++      elseif(QBDI_PTRAUTH)
++        set(CMAKE_ASM_FLAGS "-arch arm64e")
++      else()
++        set(CMAKE_ASM_FLAGS "-arch arm64")
++      endif()
+     else()
+       set(CMAKE_ASM_FLAGS "-arch armv7")
+     endif()

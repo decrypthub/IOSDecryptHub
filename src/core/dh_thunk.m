@@ -14,13 +14,13 @@
 #include <ptrauth.h>
 #import "dh_thunk.h"
 #import "log_store.h"
+#import "dh_health.h"
 #import "fishhook.h"
 #include "dh_method_arg_type.h"
 #import "dh_event.h"
 #include "dh_call_context.h"
 
-// 内联 hook 后端：Dobby（静态链接）。arm64e 切片在 Makefile 里把 DH_HAVE_INLINE 置 0，
-// 因为 vendor 里的 Dobby/QBDI 静态库只有 arm64 切片；代码仍编译，只拒绝安装并说明原因。
+// 内联后端按实际链接切片决定；arm64e Dobby 输出已签名函数指针，而 thunk 使用原始 br/blr。
 #ifndef DH_HAVE_INLINE
 #define DH_HAVE_INLINE 1
 #endif
@@ -89,6 +89,16 @@ static _Atomic int g_slot_published[DH_THUNK_COUNT];
 static _Atomic uint64_t g_slot_inflight[DH_THUNK_COUNT];
 static void dh_prepare_slot_options(int slot);
 static BOOL dh_addr_is_executable(uint64_t addr);
+int dh_thunk_is_inline_patched(uint64_t address) {
+    int found=0;
+    pthread_mutex_lock(&g_install_lock);
+    int count=atomic_load(&g_next_slot); if (count>DH_THUNK_COUNT) count=DH_THUNK_COUNT;
+    for (int i=0;i<count;i++)
+        if (g_slots[i].used && g_slots[i].kind==DH_HOOK_INLINE &&
+            (uint64_t)(uintptr_t)g_slots[i].target==address) { found=1;break; }
+    pthread_mutex_unlock(&g_install_lock);
+    return found;
+}
 static int dh_unsafe_runtime_symbol(const char *symbol) {
     if (!symbol) return 0;
     if (symbol[0] == '_') symbol++;
@@ -212,7 +222,8 @@ NSDictionary *dh_thunk_metadata(int slot) {
         (s->return_type[0] == 'v' || dh_method_arg_type(s->return_type));
     return @{@"hookId": [NSString stringWithFormat:@"%@:hook:%d", DHProcessGeneration(), slot],
         @"processGeneration": DHProcessGeneration(), @"targetIdentity": g_slot_targets[slot] ?: @{},
-        @"configurationImmutable": @YES, @"inFlight": [NSString stringWithFormat:@"%llu", atomic_load(&g_slot_inflight[slot])],
+        @"configurationImmutable": @YES, @"callStackMode": @"direct-caller-only",
+        @"inFlight": [NSString stringWithFormat:@"%llu", atomic_load(&g_slot_inflight[slot])],
         @"importBindingPolicy": s->kind == DH_HOOK_IMPORT ? @"resolved-symbol; present-and-future-images; interposers-not-preserved; write-coverage-not-guaranteed" : @"not-applicable",
         @"abi": @{@"source": s->kind == DH_HOOK_METHOD ? @"objc-runtime" : known ? @"client-declaration" : @"unknown",
             @"argumentCount": known ? @(s->method_arg_count) : (id)[NSNull null],
@@ -254,6 +265,14 @@ __asm__(
 "  stp  q4, q5, [sp, #0x90]\n"
 "  stp  q6, q7, [sp, #0xB0]\n"
 "  str  x30, [sp, #0xD0]\n"        // 原始 lr
+"  adrp x16, _g_dh_thunk_orig@PAGE\n"
+"  add  x16, x16, _g_dh_thunk_orig@PAGEOFF\n"
+"  add  x16, x16, x17, lsl #3\n"
+"  ldar x16, [x16]\n"              // 与后端补丁前发布 original 的 release store 配对
+#if defined(__arm64e__)
+"  xpaci x16\n"                    // 同时接受刚发布的签名 original 和已归一的原始地址
+#endif
+"  str  x16, [sp, #0xD8]\n"
 "  mov  x0, x17\n"                 // handler(slot,
 "  add  x1, sp, #0\n"             //         gpr* -> x0..x8,
 "  add  x2, sp, #0x130\n"         //         caller_sp = 当前帧之上的原始 SP
@@ -270,9 +289,7 @@ __asm__(
 "  ldp  q4, q5, [sp, #0x90]\n"
 "  ldp  q6, q7, [sp, #0xB0]\n"
 "  ldr  x30, [sp, #0xD0]\n"
-"  adrp x16, _g_dh_thunk_orig@PAGE\n"
-"  add  x16, x16, _g_dh_thunk_orig@PAGEOFF\n"
-"  ldr  x16, [x16, x17, lsl #3]\n"  // 原函数 = g_dh_thunk_orig[slot]
+"  ldr  x16, [sp, #0xD8]\n"
 "  adrp x15, _g_dh_thunk_post@PAGE\n"
 "  add  x15, x15, _g_dh_thunk_post@PAGEOFF\n"
 "  ldrb w15, [x15, x17]\n"           // post 标记
@@ -534,7 +551,8 @@ uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint
     uint64_t hits = atomic_fetch_add_explicit(&s->hits, 1, memory_order_relaxed) + 1;
     if (g_in_thunk) return 0;
     g_in_thunk = 1;
-    if ([DHLogStore shared].paused) { g_in_thunk = 0; return 0; }
+    int savedInternal=dh_in_hook; dh_in_hook=1;
+    if ([DHLogStore shared].paused) { dh_in_hook=savedInternal; g_in_thunk = 0; return 0; }
     DHCallContext call = dh_call_begin(g_dh_thunk_post[slot], DHMonotonicNS());
     @autoreleasepool {
         const dh_hook_options *o = &g_slot_options[slot];
@@ -595,10 +613,12 @@ uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint
         e.eventPayload = @{@"rawRegisters": regs, @"arguments": args, @"memory": memory,
             @"caller": @{@"lr": dh_hex_u64(lr), @"sp": dh_hex_u64(caller_sp)},
             @"abi": dh_thunk_metadata((int)slot)[@"abi"]};
-        e.detail = detail; e.callStack = DHCallStackFiltered(); e.timestamp = DHTimestampNow();
+        e.detail = detail;
+        e.callStack = [NSString stringWithFormat:@"Direct caller (unsymbolicated): %@",dh_hex_u64(lr)];
+        e.timestamp = DHTimestampNow();
         [[DHLogStore shared] append:e];
     }
-    g_in_thunk = 0;
+    dh_in_hook=savedInternal; g_in_thunk = 0;
     return call.id;
 }
 
@@ -611,6 +631,7 @@ void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_
     dh_slot_t *s = &g_slots[slot];
     if (!token || !atomic_load_explicit(&s->enabled, memory_order_acquire) || g_in_thunk) return;
     g_in_thunk = 1;
+    int savedInternal=dh_in_hook; dh_in_hook=1;
     @autoreleasepool {
         const dh_hook_options *o = &g_slot_options[slot];
         DHLogEntry *e = [DHLogEntry new]; e.category = DHCategoryOther;
@@ -643,10 +664,12 @@ void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_
         e.eventPayload = @{@"rawRegisters": @{@"x0": dh_hex_u64(regs[0]), @"x1": dh_hex_u64(regs[1])},
             @"returnValue": value, @"memory": memory, @"caller": @{@"lr": dh_hex_u64(real_lr)},
             @"abi": dh_thunk_metadata((int)slot)[@"abi"]};
-        e.detail = detail; e.callStack = DHCallStackFiltered(); e.timestamp = DHTimestampNow();
+        e.detail = detail;
+        e.callStack = [NSString stringWithFormat:@"Direct caller (unsymbolicated): %@",dh_hex_u64(real_lr)];
+        e.timestamp = DHTimestampNow();
         [[DHLogStore shared] append:e];
     }
-    g_in_thunk = 0;
+    dh_in_hook=savedInternal; g_in_thunk = 0;
 }
 
 // ---- 安装 / 关闭 / 枚举 ----
@@ -949,6 +972,11 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
 #else
     void *target = dh_resolve_inline_target(module, symbol, addr, err, errsz);
     if (!target) return -2;
+    target = ptrauth_strip(target, ptrauth_key_function_pointer);
+    if (!dh_addr_is_executable((uint64_t)(uintptr_t)target)) {
+        if (err && errsz) snprintf(err, errsz, "resolved target is not executable code");
+        return -2;
+    }
     Dl_info identity = {0};
     if (dladdr(target, &identity) && dh_unsafe_runtime_symbol(identity.dli_sname)) {
         if (err && errsz) snprintf(err, errsz, "refusing allocator/runtime hook by resolved address");
@@ -1034,7 +1062,16 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
 
     int rc = DobbyHook(target, (void *)dh_slot_addr(slot),
                        (void **)&g_dh_thunk_orig[slot]);
+    if (g_dh_thunk_orig[slot])
+        __atomic_store_n(&g_dh_thunk_orig[slot], ptrauth_strip(g_dh_thunk_orig[slot], ptrauth_key_function_pointer), __ATOMIC_RELEASE);
     if (rc != 0 || g_dh_thunk_orig[slot] == NULL) {
+        if (g_dh_thunk_orig[slot]) {
+            // 后端已发布 original，不能证明没有在途跳转；失败槽位也不能复用。
+            atomic_store(&g_slot_published[slot],1);
+            pthread_mutex_unlock(&g_install_lock);
+            if (err && errsz) snprintf(err,errsz,"Dobby activation failed after original publication; disabled slot %d retained, restart target",slot);
+            return -4;
+        }
         s->used = 0;
         s->name[0] = '\0';
         s->capture_multi[0] = '\0';
@@ -1062,7 +1099,7 @@ const char *dh_thunk_inline_backend(void) {
 #if DH_HAVE_INLINE
     return "dobby";
 #else
-    return "unavailable(arm64e-slice)";
+    return "unavailable(not-linked)";
 #endif
 }
 

@@ -25,6 +25,8 @@ extern "C" {
 
 // 当前切片实际链接了 Inline 后端；不能仅凭工具名或 CPU 型号推断可用性。
 int dh_thunk_inline_available(void);
+// 软停仍保留 Inline 补丁；Trace 原始目标前必须重启清除。
+int dh_thunk_is_inline_patched(uint64_t address);
 
 #define DH_THUNK_COUNT 256   // thunk 槽位总数 (单调分配; 软停不回收, 硬停后退休)
 

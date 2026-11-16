@@ -39,7 +39,9 @@
 
 /* #undef QBDI_EXPORT_SYM */
 
-/* #undef QBDI_PTRAUTH */
+#if defined(__arm64e__)
+#define QBDI_PTRAUTH 1
+#endif
 
 #ifdef __cplusplus
 namespace QBDI {

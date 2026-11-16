@@ -18,7 +18,7 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.34
+VERSION := 1.28.35
 TARGET  := decrypt_helper.dylib
 .DEFAULT_GOAL := all
 .PHONY: test-hook-runtime test-hook-ios-build
@@ -145,15 +145,9 @@ ARCH_FLAGS := $(foreach A,$(ARCHS),-arch $(A))
 INCLUDES := -Isrc/core -Isrc/core/capstone/include -Isrc/hooks/crypto -Isrc/hooks/behavior -Isrc/server -Isrc/ui \
             -Ivendor/dobby/include -Ivendor/qbdi/include
 
-# vendor 的 Dobby/QBDI 静态库目前只构建了 arm64 切片。含 arm64e 的胖构建（roothide）先不链接，
-# 让 inline_hook/trace_function 明确报 backend unavailable，而不是链接失败或静默降级。
-ifeq ($(filter arm64e,$(ARCHS)),)
-  VENDOR_DEF  := -DDH_HAVE_INLINE=1 -DDH_HAVE_QBDI=1
-  VENDOR_LIBS := vendor/dobby/lib/libdobby.a vendor/qbdi/lib/libQBDI.a -lc++
-else
-  VENDOR_DEF  := -DDH_HAVE_INLINE=0 -DDH_HAVE_QBDI=0
-  VENDOR_LIBS :=
-endif
+# 依赖脚本分别编译真实 ABI 切片并 lipo 合并；缺任一请求切片在链接前失败。
+VENDOR_DEF  := -DDH_HAVE_INLINE=1 -DDH_HAVE_QBDI=1
+VENDOR_LIBS := vendor/dobby/lib/libdobby.a vendor/qbdi/lib/libQBDI.a -lc++
 WEB_HEADER := src/server/web_index_html.h
 WECHAT_HEADER := src/server/web_wechat_png.h
 WEB_ASSETS := $(WEB_HEADER) $(WECHAT_HEADER)
@@ -183,6 +177,8 @@ $(WECHAT_HEADER): web/wechat-follow.png tools/gen_web.py
 
 $(TARGET): $(WEB_ASSETS) $(SRC) Makefile
 	@if [ -z "$(SDK)" ]; then echo "❌ 没找到 iPhoneOS SDK (xcrun --sdk iphoneos)"; exit 1; fi
+	@for lib in vendor/dobby/lib/libdobby.a vendor/qbdi/lib/libQBDI.a; do \
+		xcrun lipo "$$lib" -verify_arch $(ARCHS) || exit 1; done
 	@echo "[*] 编译 iOS dylib (VARIANT=$(VARIANT), archs=$(ARCHS), min=$(MIN_IOS))..."
 	$(CC) $(CFLAGS) $(SRC) $(VENDOR_LIBS) -o $(TARGET)
 	@echo "✅ $(TARGET)"

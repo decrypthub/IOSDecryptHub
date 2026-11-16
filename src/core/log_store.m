@@ -6,6 +6,7 @@
 #import "dh_noise.h"
 #import "dh_log_json.h"
 #import "dh_event.h"
+#include "dh_call_context.h"
 #import <sys/sysctl.h>
 #import <sys/time.h>
 #import <stdatomic.h>
@@ -1020,6 +1021,8 @@ NSString *DHUTF8FromData(NSData *d) {
 }
 
 NSString *DHCallStackFiltered(void) {
+    // 通用 post thunk 尚无完整 unwind 契约。嵌套的内置采集不穿过它强行回溯/符号化。
+    if (dh_call_parent()) return @"Full unwind omitted inside dynamic post frame; use parentCallId and payload.caller";
     NSArray *symbols = [NSThread callStackSymbols];
     NSMutableString *cs = [NSMutableString string];
     NSArray *filterOut = @[

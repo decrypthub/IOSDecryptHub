@@ -20,8 +20,11 @@ extern "C" {
 NSDictionary *DHQBDITraceFunction(NSString *module, NSString *symbol, uint64_t addr,
                                   const uint64_t *args, int argc,
                                   int maxInsns, int maxMs);
+// buffers=[{arg:0..7,hex:"..."}]：本次调用拥有的可写副本，退出后释放；无需沿用 App 临时指针。
+NSDictionary *DHQBDITraceFunctionWithBuffers(NSString *module, NSString *symbol, uint64_t addr,
+    const uint64_t *args, int argc, int maxInsns, int maxMs, NSArray *buffers);
 
-// 当前切片是否链接了 QBDI（arm64 为 YES；arm64e 切片为 NO）。
+// 当前切片是否实际链接 QBDI；arm64e 链接启用 QBDI_PTRAUTH 的独立构建。
 BOOL DHQBDIAvailable(void);
 
 #ifdef __cplusplus

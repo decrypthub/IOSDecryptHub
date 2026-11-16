@@ -25,7 +25,7 @@ v1.27.6 将版本检查切换到规范 APT 源，按安装包架构选择版本�
 ```bash
 brew install dpkg ldid cmake ninja  # 已安装的工具可跳过
 bash tools/build_dobby_ios.sh      # 首次构建准备 arm64 Inline Hook 静态库
-bash tools/build_qbdi_ios.sh       # 首次构建准备 arm64 QBDI/LLVM，需网络且耗时较长
+bash tools/build_qbdi_ios.sh       # arm64 + arm64e/PAC QBDI/LLVM，需网络且耗时较长
 make test-updater  # 无需网络或手机的版本选择/旧更新请求边界回归
 make deb           # 一次构建 rootless 和 RootHide 完整包
 ```

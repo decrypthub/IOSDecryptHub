@@ -1,0 +1,210 @@
+diff --git a/source/Backend/UserMode/ExecMemory/code-patch-tool-darwin.cc b/source/Backend/UserMode/ExecMemory/code-patch-tool-darwin.cc
+index 36292b6..9a7e853 100644
+--- a/source/Backend/UserMode/ExecMemory/code-patch-tool-darwin.cc
++++ b/source/Backend/UserMode/ExecMemory/code-patch-tool-darwin.cc
+@@ -5,6 +5,7 @@
+ #include <unistd.h>
+
+ #include <mach/mach.h>
++#include <mach/arm/thread_status.h>
+ #include "UnifiedInterface/platform-darwin/mach_vm.h"
+
+ #if defined(__APPLE__)
+@@ -37,135 +38,58 @@ int mprotect_impl(void *addr, size_t len, int prot) {
+ }
+ #endif
+
++// Freeze competing threads only around the permission/write/cache critical section.
++// Replacing a signed executable mapping is not portable across jailbreaks.
+ PUBLIC int DobbyCodePatch(void *address, uint8_t *buffer, uint32_t buffer_size) {
+-  if (address == nullptr || buffer == nullptr || buffer_size == 0) {
+-    ERROR_LOG("invalid argument");
+-    return -1;
++  if (!address || !buffer || !buffer_size) return -1;
++  const size_t page_size = (size_t)getpagesize();
++  const addr_t page = ALIGN_FLOOR(address, page_size);
++  const size_t offset = (addr_t)address - page;
++  if (buffer_size > page_size - offset ||
++      page == ALIGN_FLOOR((void *)DobbyCodePatch, page_size)) return -1;
++  // Resolve/sign before suspension; no logging, allocation or runtime locks while frozen.
++  auto protect = (__typeof(vm_protect) *)DobbySymbolResolver("dyld", "vm_protect");
++  if (!protect) protect = (__typeof(vm_protect) *)DobbySymbolResolver("libsystem_kernel.dylib", "_vm_protect");
++  if (!protect) return -1;
++  pac_sign(protect);
++  for (unsigned attempt = 0; attempt < 4; ++attempt) {
++  thread_act_array_t threads = nullptr;
++  mach_msg_type_number_t count = 0;
++  task_t task = mach_task_self();
++  thread_t current = mach_thread_self();
++  if (task_threads(task, &threads, &count) != KERN_SUCCESS) {
++    mach_port_deallocate(task, current); return -1;
+   }
+-
+-  size_t page_size = PAGE_SIZE;
+-  addr_t patch_page = ALIGN_FLOOR(address, page_size);
+-
+-  // cross over page
+-  if ((addr_t)address + buffer_size > patch_page + page_size) {
+-    void *address_a = address;
+-    uint8_t *buffer_a = buffer;
+-    uint32_t buffer_size_a = (patch_page + page_size - (addr_t)address);
+-    auto ret = DobbyCodePatch(address_a, buffer_a, buffer_size_a);
+-    if (ret == -1) {
+-      return ret;
++  // The port list is stable; successful suspends are a prefix, each balanced below.
++  unsigned stopped = 0;
++  bool safe = count <= 4096;
++  for (; safe && stopped < count; ++stopped) {
++    if (threads[stopped] == current) continue;
++    if (thread_suspend(threads[stopped]) != KERN_SUCCESS) { safe = false; break; }
++    arm_thread_state64_t state = {};
++    mach_msg_type_number_t words = ARM_THREAD_STATE64_COUNT;
++    if (thread_get_state(threads[stopped], ARM_THREAD_STATE64,
++        (thread_state_t)&state, &words) != KERN_SUCCESS) { ++stopped; safe = false; break; }
++    uintptr_t pc = (uintptr_t)arm_thread_state64_get_pc(state);
++    // An old prologue in progress cannot resume into newly replaced instructions.
++    if (pc >= (uintptr_t)address && pc < (uintptr_t)address + buffer_size) {
++      ++stopped; safe = false; break;
+     }
+-
+-    void *address_b = (void *)((addr_t)address + buffer_size_a);
+-    uint8_t *buffer_b = buffer + buffer_size_a;
+-    uint32_t buffer_size_b = buffer_size - buffer_size_a;
+-    ret = DobbyCodePatch(address_b, buffer_b, buffer_size_b);
+-    return ret;
+   }
+-
+-  addr_t remap_dest_page = patch_page;
+-  mach_vm_address_t remap_dummy_page = 0;
+-
+-  auto self_task = mach_task_self();
+-  kern_return_t kr;
+-
+-  int orig_prot = 0;
+-  int orig_max_prot = 0;
+-  int share_mode = 0;
+-  int is_enable_remap = -1;
+-  if (0 && is_enable_remap == -1) {
+-    auto get_region_info = [&](addr_t region_start) -> void {
+-      vm_region_submap_info_64 region_submap_info;
+-      mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+-      mach_vm_address_t addr = region_start;
+-      mach_vm_size_t size = 0;
+-      natural_t depth = 0;
+-      while (1) {
+-        kr = mach_vm_region_recurse(mach_task_self(), (mach_vm_address_t *)&addr, (mach_vm_size_t *)&size, &depth,
+-                                    (vm_region_recurse_info_t)&region_submap_info, &count);
+-        if (region_submap_info.is_submap) {
+-          depth++;
+-        } else {
+-          orig_prot = region_submap_info.protection;
+-          orig_max_prot = region_submap_info.max_protection;
+-          share_mode = region_submap_info.share_mode;
+-          return;
+-        }
+-      }
+-    };
+-    get_region_info(remap_dest_page);
+-    if (orig_max_prot != 5 && share_mode != 2) {
+-      is_enable_remap = 1;
+-    } else {
+-      is_enable_remap = 0;
+-      DEBUG_LOG("code patch %p won't use remap", address);
+-    }
++  int result = -1;
++  if (safe && protect(task, page, page_size, false,
++      VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY) == KERN_SUCCESS) {
++    memcpy(address, buffer, buffer_size);
++    result = protect(task, page, page_size, false, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS ? 0 : -1;
++    ClearCache(address, (void *)((addr_t)address + buffer_size));
+   }
+-  if (0 && is_enable_remap == 1) {
+-    addr_t remap_dummy_page = 0;
+-    {
+-      kr = mach_vm_allocate(self_task, (mach_vm_address_t *)&remap_dummy_page, page_size, VM_FLAGS_ANYWHERE);
+-      KERN_RETURN_ERROR(kr, -1);
+-
+-      memcpy((void *)remap_dummy_page, (void *)patch_page, page_size);
+-
+-      int offset = (int)((addr_t)address - patch_page);
+-      memcpy((void *)(remap_dummy_page + offset), buffer, buffer_size);
+-
+-      kr = mach_vm_protect(self_task, remap_dummy_page, page_size, false, VM_PROT_READ | VM_PROT_EXECUTE);
+-      KERN_RETURN_ERROR(kr, -1);
+-    }
+-
+-    vm_prot_t prot, max_prot;
+-    kr = mach_vm_remap(self_task, (mach_vm_address_t *)&remap_dest_page, page_size, 0,
+-                       VM_FLAGS_OVERWRITE | VM_FLAGS_FIXED, self_task, remap_dummy_page, true, &prot, &max_prot,
+-                       VM_INHERIT_COPY);
+-    KERN_RETURN_ERROR(kr, -1);
+-
+-    kr = mach_vm_deallocate(self_task, remap_dummy_page, page_size);
+-    KERN_RETURN_ERROR(kr, -1);
+-  } else {
+-    if (0) {
+-      {
+-        auto kr = mach_vm_allocate(self_task, &remap_dummy_page, page_size, VM_FLAGS_ANYWHERE);
+-        KERN_RETURN_ERROR(kr, -1);
+-
+-        kr = mach_vm_deallocate(self_task, remap_dummy_page, page_size);
+-        KERN_RETURN_ERROR(kr, -1);
+-      }
+-
+-      vm_prot_t prot, max_prot;
+-      kr = mach_vm_remap(self_task, &remap_dummy_page, page_size, 0, VM_FLAGS_ANYWHERE, self_task, remap_dest_page,
+-                         false, &prot, &max_prot, VM_INHERIT_SHARE);
+-      KERN_RETURN_ERROR(kr, -1);
+-
+-      kr = mach_vm_protect(self_task, remap_dummy_page, page_size, false, VM_PROT_READ | VM_PROT_WRITE);
+-      // the kr always return KERN_PROTECTION_FAILURE
+-      kr = KERN_PROTECTION_FAILURE;
+-
+-      memcpy((void *)(remap_dummy_page + ((uint64_t)address - remap_dest_page)), buffer, buffer_size);
+-    }
+-
+-    static __typeof(vm_protect) *vm_protect_fn = nullptr;
+-    if (vm_protect_fn == nullptr) {
+-      vm_protect_fn = (__typeof(vm_protect) *)DobbySymbolResolver("dyld", "vm_protect");
+-      if (vm_protect_fn == nullptr) {
+-        vm_protect_fn = (__typeof(vm_protect) *)DobbySymbolResolver("libsystem_kernel.dylib", "_vm_protect");
+-      }
+-      pac_sign(vm_protect_fn);
+-    }
+-    {
+-      kr = vm_protect_fn(self_task, remap_dest_page, page_size, false, VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+-      KERN_RETURN_ERROR(kr, -1);
+-
+-      memcpy((void *)(patch_page + ((uint64_t)address - remap_dest_page)), buffer, buffer_size);
+-
+-      kr = vm_protect_fn(self_task, remap_dest_page, page_size, false, VM_PROT_READ | VM_PROT_EXECUTE);
+-      KERN_RETURN_ERROR(kr, -1);
+-    }
++  for (unsigned i = 0; i < stopped; ++i)
++    if (threads[i] != current) thread_resume(threads[i]);
++  for (unsigned i = 0; i < count; ++i) mach_port_deallocate(task, threads[i]);
++  vm_deallocate(task, (vm_address_t)threads, count * sizeof(thread_t));
++  mach_port_deallocate(task, current);
++  if (safe) return result;
++  usleep(100); // Retry only before mutation, after every suspension/port is balanced.
+   }
+-
+-  ClearCache(address, (void *)((addr_t)address + buffer_size));
+-
+-  return 0;
++  return -1;
+ }
+diff --git a/source/MemoryAllocator/AssemblerCodeBuilder.h b/source/MemoryAllocator/AssemblerCodeBuilder.h
+index 2623371..38cab32 100644
+--- a/source/MemoryAllocator/AssemblerCodeBuilder.h
++++ b/source/MemoryAllocator/AssemblerCodeBuilder.h
+@@ -33,7 +33,8 @@ struct AssemblerCodeBuilder {
+       assembler->set_fixed_addr(fixed_addr);
+     }
+
+-    DobbyCodePatch((void *)fixed_addr, code_buffer->data(), code_buffer->size());
++    if (DobbyCodePatch((void *)fixed_addr, code_buffer->data(), code_buffer->size()) != 0)
++      return MemBlock{};
+
+     return MemBlock(fixed_addr, code_buffer->size());
+   }

@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <uuid/uuid.h>
+#include "dh_health.h"
 #ifndef DH_VERSION_STR
 #define DH_VERSION_STR "dev"
 #endif
@@ -39,7 +40,10 @@ void DHStampEvent(DHLogEntry *event) {
 NSDictionary *DHTargetIdentity(const void *address) {
     Dl_info info = {0};
     NSMutableDictionary *out = [@{@"address": [NSString stringWithFormat:@"0x%llx", (uint64_t)address]} mutableCopy];
-    if (!address || !dladdr(address, &info) || !info.dli_fbase) return out;
+    int savedInternal=dh_in_hook; dh_in_hook=1;
+    int resolved=address ? dladdr(address,&info) : 0;
+    dh_in_hook=savedInternal;
+    if (!resolved || !info.dli_fbase) return out;
     out[@"image"] = info.dli_fname ? @(info.dli_fname) : @"";
     out[@"imageBase"] = [NSString stringWithFormat:@"0x%llx", (uint64_t)info.dli_fbase];
     // rva 相对运行时镜像基址，不是 Mach-O vmaddr；可随 UUID 跨 ASLR 复用。

@@ -1,5 +1,18 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-16：1.28.35 RootHide Inline / QBDI（研发包）
+
+- RootHide 完整包链接真正的 arm64 / arm64e Dobby 与 QBDI，移除胖包禁用后端的分支；链接前校验请求切片。Dobby/QBDI 固定源码提交、分架构编译，arm64e 开启 QBDI PAC；修正上游 iOS 汇编硬编码 arm64 和静态 Config.h 的架构选择。
+- Inline original 在入口补丁激活前 release 发布，thunk acquire 读取并去 PAC；失败后已发布槽位保留。Darwin 写补丁增加有界线程暂停、PC 检查、恢复与写入前重试，拒绝跨页或补丁器自身页；代码生成必须传播写入失败。此机制覆盖枚举快照，不能保证外部新线程或第三方补丁全部静止，仍拒绝硬卸载。
+- 跳板不具备完整 unwind 契约，动态命中仅记录直接 LR/SP，报告 direct-caller-only；同步层级使用 callId/parentCallId。内部镜像身份读取保留真实路径，避免自身隐藏策略污染 UUID/RVA 的说明。
+- `trace_function` 新增有界 call-owned buffers，复制输入和参数区后回放、返回 afterHex；最多 8 个固定 GPR 参数。明确 replay/contextComplete:false、PAC、retval_valid，超预算结果不当作函数返回值；拒绝已保留 Inline 补丁的入口，软停后也须重启并重新解析。
+- Mac 实际汇编/上下文/ABI/journal、纯 C 类型与 Mach-O、更新策略及两种完整包验证通过；Python 离线 8 项通过。原有完整包 CI 门禁保持不变，仍从固定源码构建两份依赖。
+- 最终整包在 rootless iPhone X / iOS 15.6 与 RootHide iPhone 11 / iOS 16.2 的快手 14.10.10 分别通过 3 个独立进程代验证：既有 8 组 Agent 自检，加并发 Inline 安装、15 参数 packed stack、软停转发、QBDI 完整/4 指令预算和保留补丁拒绝；每轮 MCP 边界/关联/复杂 ABI 拒绝回归通过。RootHide 自有 fixture 真实覆盖 PACIBSP/PACIZA/BLRAAZ/RETAB。
+- 真实 UI 产生的请求：两台各 15 棵完整同步调用树、225 个配对调用、15 次核心 15 参数正常入口/返回；各 15 个 facade 返回逐字匹配本轮 HTTP `__NS_sig3`。两台各独立离线验证 15 HMAC、45 白盒块、15 CRC，一致；按 schema v2 ID/phase/parent 配对，不按时间猜测。
+- 清除 Inline 补丁并重新解析地址后，两台从真实 CRC 输入复制 48B 数据及参数区，各完整回放 2487 条 SDK 指令；返回值与已观察结果和独立 zlib CRC 一致，输入区未改变。RootHide 报 pointerAuthentication:true。该结果是受控纯函数 replay，不是原请求 live 指令跟踪或完整签名现场重建。
+
+研发整包已刷入两台，原 scope 保留；最后重启快手清除所有临时补丁，两台 Hook 数 0、全局采集暂停。未发布 Release / APT。细节与协议边界见 [RootHide 后端](ROOTHIDE_NATIVE_BACKENDS.md)。以下旧版本的“RootHide 无后端”仅为当时状态。
+
 ## 2026-11-16：1.28.34 P0 结构化事件、调用关联与 ABI 安全（研发包）
 
 - 增加 schema v2、进程代、Hook/调用 ID、entry/leave、同步父调用和单调时间。参数位置、对象、返回值、内存窗口及采集状态放入 `payload`，镜像 UUID/RVA 随 Hook 身份保存；不再依赖 detail 文本配对。

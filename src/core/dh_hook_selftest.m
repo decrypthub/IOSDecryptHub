@@ -5,6 +5,9 @@
 #import "log_store.h"
 #include <unistd.h>
 #include <string.h>
+#include <ptrauth.h>
+#include "dh_health.h"
+#import "../trace/qbdi_trace.h"
 
 typedef struct { uint64_t x, y, z; } IDHABIAggregate;
 static dispatch_semaphore_t probeEntered, probeResume, probeDone;
@@ -35,8 +38,10 @@ static NSString *const probeObject = @"abi-probe";
 - (double)floating:(double)value { return value*2.0; }
 - (IDHABIAggregate)aggregate:(uint64_t)value { return (IDHABIAggregate){value,value+1,value+2}; }
 - (uint64_t)waitValue:(uint64_t)value {
+    dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest worker wait entered");
     dispatch_semaphore_signal(probeEntered);
-    dispatch_semaphore_wait(probeResume,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC)); return value+5;
+    dispatch_semaphore_wait(probeResume,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC));
+    dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest worker wait resumed"); return value+5;
 }
 @end
 
@@ -50,6 +55,7 @@ static void require(BOOL condition, NSString *reason) {
 static uint64_t probe_replacement(id self, SEL selector, uint64_t value) { (void)self; (void)selector; return value+99; }
 
 NSDictionary *DHHookSelfTest(BOOL includeCImport) {
+    dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest base start");
     DHLogStore *store = [DHLogStore shared];
     if (store.paused || [store isPausedForCategory:DHCategoryOther])
         return @{@"pass": @NO, @"error": @"resume global/other capture before explicit self-test; no state changed"};
@@ -139,13 +145,21 @@ NSDictionary *DHHookSelfTest(BOOL includeCImport) {
         method_setImplementation(ownershipMethod,displaced); displaced=NULL;
         [passed addObject:@"ownership-check"];
         probeEntered=dispatch_semaphore_create(0); probeResume=dispatch_semaphore_create(0); probeDone=dispatch_semaphore_create(0);
+        dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest inflight start");
         int wait=install(@"waitValue:",&opts); __block uint64_t result=0;
-        dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT,0),^{ result=[p waitValue:37]; dispatch_semaphore_signal(probeDone); });
+        NSThread *inFlightWorker=[[NSThread alloc] initWithBlock:^{ @autoreleasepool {
+            result=[p waitValue:37]; dispatch_semaphore_signal(probeDone);
+        }}];
+        inFlightWorker.name=@"IDH-inflight-probe";
+        [inFlightWorker start];
         require(dispatch_semaphore_wait(probeEntered,dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC))==0,@"in-flight call did not enter");
+        dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest inflight observed");
         require([dh_thunk_metadata(wait)[@"inFlight"] intValue]==1,@"in-flight count missing");
         require(dh_thunk_uninstall(wait,1,error,sizeof(error))==0,@"owned method retirement failed");
+        dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest inflight retired");
         dispatch_semaphore_signal(probeResume);
         require(dispatch_semaphore_wait(probeDone,dispatch_time(DISPATCH_TIME_NOW,3*NSEC_PER_SEC))==0 && result==42,@"in-flight return changed");
+        dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest inflight completed");
         require([dh_thunk_metadata(wait)[@"inFlight"] intValue]==0,@"in-flight count leaked");
         [passed addObject:@"in-flight-retirement"];
         if (includeCImport) {
@@ -175,4 +189,105 @@ NSDictionary *DHHookSelfTest(BOOL includeCImport) {
         @"processGeneration": DHProcessGeneration(), @"rootCallIds": roots,
         @"fixtureSlots": slots, @"CImportSlot": @(importSlot), @"restartRemovesRetainedImport": @(importSlot>=0),
         @"scope": @"IDH-owned synthetic methods; optional getpid only; no business requests/signing oracle"};
+}
+
+#if DH_HAVE_INLINE && DH_HAVE_QBDI
+// noinline/optnone 保留真实调用与 arm64e PAC 序言；不触碰业务或外部内存。
+__attribute__((noinline,optnone)) static uint64_t dh_probe_pac_leaf(uint64_t x) { return (x ^ 0x13579bdfULL) + 17; }
+__attribute__((noinline,optnone)) static uint64_t dh_probe_trace(uint64_t a, uint64_t b) {
+    uint64_t (*volatile leaf)(uint64_t) = dh_probe_pac_leaf;
+    uint64_t result = leaf(a);
+    for (unsigned i = 0; i < 8; i++) result = (result ^ b) + i;
+    return result;
+}
+__attribute__((noinline,optnone)) static uint64_t dh_probe_native(
+    uint64_t a,uint64_t b,uint64_t c,uint64_t d,uint64_t e,uint64_t f,uint64_t g,uint64_t h,
+    uint8_t i,BOOL j,void *k,int32_t l,uint16_t m,int8_t n,uint64_t o) {
+    uint64_t (*volatile leaf)(uint64_t) = dh_probe_pac_leaf;
+    return leaf(a)+b+c+d+e+f+g+h+i+j+(uint64_t)(uintptr_t)k+(uint64_t)l+m+(uint64_t)n+o;
+}
+static uint64_t dh_probe_native_call(void) {
+    return dh_probe_native(1,2,3,4,5,6,7,8,0xab,YES,(void *)0x12340000,-123,0x9876,-7,0x1122334455667788ULL);
+}
+#endif
+
+NSDictionary *DHNativeBackendSelfTest(void) {
+#if !(DH_HAVE_INLINE && DH_HAVE_QBDI)
+    return @{@"pass": @NO, @"error": @"native backends are not linked"};
+#else
+    dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest native start");
+    if ([DHLogStore shared].paused || [[DHLogStore shared] isPausedForCategory:DHCategoryOther])
+        return @{@"pass": @NO, @"error": @"resume all/other capture before native self-test"};
+    NSMutableDictionary *report = [@{@"pass": @NO, @"processGeneration": DHProcessGeneration(),
+        @"scope": @"IDH-owned pure native fixtures only", @"restartRequired": @YES} mutableCopy];
+    uint64_t traceArgs[2] = {123,456}, expectedTrace = dh_probe_trace(traceArgs[0],traceArgs[1]);
+    uint64_t traceAddress = (uint64_t)(uintptr_t)ptrauth_strip((void *)dh_probe_trace,ptrauth_key_function_pointer);
+    NSDictionary *trace = DHQBDITraceFunction(nil,nil,traceAddress,traceArgs,2,4096,5000);
+    dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest native trace returned");
+    report[@"trace"] = trace;
+    if (![trace[@"call_ok"] boolValue] || ![trace[@"stop_reason"] isEqual:@"completed"] ||
+        [trace[@"count"] intValue] < 2 || strtoull([trace[@"retval"] UTF8String],NULL,16) != expectedTrace) {
+        report[@"error"] = @"QBDI fixture did not complete with its native reference result"; return report;
+    }
+    NSDictionary *bounded = DHQBDITraceFunction(nil,nil,traceAddress,traceArgs,2,4,5000);
+    report[@"boundedTrace"] = bounded;
+    if (![bounded[@"stop_reason"] isEqual:@"instruction-limit"] || ![bounded[@"truncated"] boolValue]) {
+        report[@"error"] = @"QBDI instruction budget did not stop the fixture"; return report;
+    }
+    uint64_t reference = dh_probe_native_call();
+    dh_hook_options options; dh_thunk_options_default(&options);
+    options.capture_return=1; options.abi_declared=1; options.argument_count=15; options.return_type='Q';
+    memcpy(options.argument_types,"QQQQQQQQCB^iScQ",15);
+    char error[512]={0};
+    uint64_t address=(uint64_t)(uintptr_t)ptrauth_strip((void *)dh_probe_native,ptrauth_key_function_pointer);
+    dispatch_semaphore_t workerReady=dispatch_semaphore_create(0),workerDone=dispatch_semaphore_create(0);
+    __block int stopWorker=0,workerCorrect=1; __block uint64_t workerCalls=0;
+    NSThread *worker=[[NSThread alloc] initWithBlock:^{ @autoreleasepool {
+        while (!__atomic_load_n(&stopWorker,__ATOMIC_ACQUIRE)) {
+            if (dh_probe_native_call()!=reference) __atomic_store_n(&workerCorrect,0,__ATOMIC_RELEASE);
+            uint64_t calls=__atomic_add_fetch(&workerCalls,1,__ATOMIC_RELAXED);
+            if (calls==1) dispatch_semaphore_signal(workerReady);
+            usleep(50);
+        }
+        dispatch_semaphore_signal(workerDone);
+    }}];
+    worker.name=@"IDH-native-install-probe";
+    [worker start];
+    if (dispatch_semaphore_wait(workerReady,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC))) {
+        __atomic_store_n(&stopWorker,1,__ATOMIC_RELEASE);
+        report[@"error"]=@"concurrent fixture worker did not start";return report;
+    }
+    int slot=dh_thunk_install_configured(DH_HOOK_INLINE,NULL,NULL,address,0,"IDH-native-ABI-probe",&options,error,sizeof(error));
+    dh_diag_append(DH_DIAG_GENERAL,"INFO","hook-selftest native install returned");
+    __atomic_store_n(&stopWorker,1,__ATOMIC_RELEASE);
+    BOOL joined=dispatch_semaphore_wait(workerDone,dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC))==0;
+    BOOL concurrent=joined && __atomic_load_n(&workerCorrect,__ATOMIC_ACQUIRE) && __atomic_load_n(&workerCalls,__ATOMIC_RELAXED)>0;
+    report[@"concurrentInstallPassed"]=@(concurrent);
+    report[@"concurrentCalls"]=[NSString stringWithFormat:@"%llu",__atomic_load_n(&workerCalls,__ATOMIC_RELAXED)];
+    if (slot<0) { report[@"error"]=@(error); return report; }
+    report[@"inlineHook"] = dh_thunk_metadata(slot); report[@"inlineSlot"]=@(slot);
+    NSDictionary *refused=DHQBDITraceFunction(nil,nil,address,NULL,0,64,1000);
+    BOOL patchedRefused=![refused[@"ok"] boolValue] && [refused[@"error"] containsString:@"Inline patch"];
+    report[@"patchedTargetRejected"]=@(patchedRefused);
+    BOOL unchanged=dh_probe_native_call()==reference;
+    dh_thunk_disable(slot); // Dobby patch/原函数保留到目标重启，不冒险硬卸载。
+    BOOL forwarded=dh_probe_native_call()==reference;
+    DHLogEntry *entry=nil,*leave=nil;
+    for (DHLogEntry *event in [DHLogStore shared].snapshot) {
+        if (![event.eventContext[@"hookId"] isEqual:report[@"inlineHook"][@"hookId"]]) continue;
+        if ([event.eventContext[@"phase"] isEqual:@"entry"]) entry=event;
+        if ([event.eventContext[@"phase"] isEqual:@"leave"]) leave=event;
+    }
+    NSArray *arguments=entry.eventPayload[@"arguments"];
+    BOOL paired=entry && leave && [entry.eventContext[@"callId"] isEqual:leave.eventContext[@"callId"]];
+    BOOL stack=arguments.count==15 && [arguments[8][@"location"][@"offset"] intValue]==0 &&
+        [arguments[9][@"location"][@"offset"] intValue]==1 && [arguments[10][@"location"][@"offset"] intValue]==8;
+    NSString *returnValue=leave.eventPayload[@"returnValue"][@"value"];
+    BOOL returned=[returnValue isKindOfClass:NSString.class] && strtoull(returnValue.UTF8String,NULL,16)==reference;
+    report[@"pass"]=@(unchanged && forwarded && paired && stack && returned && patchedRefused && concurrent);
+    report[@"pairedCallId"]=entry.eventContext[@"callId"] ?: @"";
+    report[@"stackBytes"] = dh_thunk_metadata(slot)[@"abi"][@"stackBytes"];
+    report[@"error"]=[report[@"pass"] boolValue] ? @"" : @"native Inline forwarding/pairing/stack evidence mismatch";
+    return report;
+#endif
 }

@@ -1898,7 +1898,8 @@ static NSDictionary *tool_trace_function(NSDictionary *args) {
     if (rawArgs) {
         if (![rawArgs isKindOfClass:NSArray.class]) return tool_err(@"args 必须是数组");
         NSArray *a = rawArgs;
-        argc = (int)MIN((NSUInteger)8, a.count);
+        if (a.count>8) return tool_err(@"trace supports at most eight fixed GPR arguments");
+        argc = (int)a.count;
         for (int i = 0; i < argc; i++) {
             if (!dh_parse_addr_arg(a[i], &argv[i])) {
                 return tool_err([NSString stringWithFormat:
@@ -1913,7 +1914,7 @@ static NSDictionary *tool_trace_function(NSDictionary *args) {
     if (maxMs < 50) maxMs = 50;
     if (maxMs > 10000) maxMs = 10000;
 
-    NSDictionary *res = DHQBDITraceFunction(module, symbol, addr, argv, argc, maxInsns, maxMs);
+    NSDictionary *res = DHQBDITraceFunctionWithBuffers(module, symbol, addr, argv, argc, maxInsns, maxMs, args[@"buffers"]);
     if (![res[@"ok"] boolValue]) {
         return tool_err(res[@"error"] ?: @"QBDI trace failed");
     }
@@ -3395,6 +3396,17 @@ static NSArray *tool_definitions(void) {
             for (NSString *key in @[@"process_generation", @"call_id", @"parent_call_id", @"hook_id", @"phase"])
                 properties[key] = @{@"type": @"string", @"description": @"Exact structured event-context filter; legacy records without the field do not match"};
         }
+        if ([name isEqualToString:@"trace_function"])
+            properties[@"buffers"] = @{@"type":@"array",@"maxItems":@8,
+                @"description":@"Optional call-owned mutable copies for pointer arguments; released after replay. At most 8192 bytes each / 32768 total. Supply matching args/lengths and a known fixed GPR prototype.",
+                @"items":@{@"type":@"object",@"required":@[@"arg",@"hex"],@"properties":@{
+                    @"arg":@{@"type":@"integer",@"minimum":@0,@"maximum":@7},@"hex":@{@"type":@"string",@"maxLength":@16384}}}};
+        if ([name isEqualToString:@"trace_function"]) {
+            d[@"description"] = @"QBDI one-shot replay of a known fixed-GPR function (up to eight arguments, no stack/float/aggregate reconstruction). Supports linked arm64 and PAC-enabled arm64e builds. Optional buffers create call-owned mutable copies for pointer arguments, returned as bounded afterHex. Side effects are real. Check call_ok, retval_valid, stop_reason and instruction coverage; an early stop is not a valid function result. Instruction/time limits are cooperative, not a hard cancellation of uninstrumented native calls.";
+            properties[@"args"] = @{@"type":@"array",@"maxItems":@8,
+                @"items":@{@"oneOf":@[@{@"type":@"number"},@{@"type":@"string"}]},
+                @"description":@"Known fixed-GPR arguments x0-x7, integer numbers or hex strings. A buffer descriptor replaces its matching pointer argument."};
+        }
         if ([name isEqualToString:@"hook_method"])
             d[@"description"] = @"Observe an Objective-C method. Runtime-declared fixed GPR/object arguments support bounded packed-stack forwarding for post capture; float/aggregate/variadic/exception ABI is not supported. Configuration is validated before installation and immutable after publication. Events expose phase/callId/parentCallId/payload.";
         if ([name isEqualToString:@"hook_inline"])
@@ -3413,7 +3425,8 @@ static NSArray *tool_definitions(void) {
             @"max_output_bytes": @{@"type": @"number", @"minimum": @4096, @"maximum": @2097152}}}}];
     [tools addObject:@{@"name": @"run_hook_selftest", @"description": @"Explicit native ABI/structured-event diagnostic on IDH-owned synthetic fixtures only. Optional fixed-C getpid import is soft-stopped and retained until target restart. Does not issue business requests or call a signing oracle.",
         @"inputSchema": @{@"type": @"object", @"required": @[@"process_generation"], @"properties": @{
-            @"process_generation": @{@"type": @"string"}, @"include_c_import": @{@"type": @"boolean"}}}}];
+            @"process_generation": @{@"type": @"string"}, @"include_c_import": @{@"type": @"boolean"},
+            @"include_native_backends": @{@"type": @"boolean", @"description": @"Test linked Inline/QBDI using IDH-owned pure fixtures, including packed stack/PAC calls and QBDI instruction budget. Leaves a soft-stopped native patch until target restart."}}}}];
     return tools;
 }
 
@@ -3527,7 +3540,16 @@ static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
         id flag = args[@"include_c_import"];
         if (flag && (![flag isKindOfClass:NSNumber.class] || ([flag doubleValue] != 0 && [flag doubleValue] != 1)))
             return tool_err(@"include_c_import must be a boolean");
-        return tool_ok(DHHookSelfTest([flag boolValue]));
+        id native = args[@"include_native_backends"];
+        if (native && (![native isKindOfClass:NSNumber.class] || ([native doubleValue] != 0 && [native doubleValue] != 1)))
+            return tool_err(@"include_native_backends must be a boolean");
+        NSMutableDictionary *result = [DHHookSelfTest([flag boolValue]) mutableCopy];
+        if ([native boolValue] && [result[@"pass"] boolValue]) {
+            result[@"nativeBackends"] = DHNativeBackendSelfTest();
+            result[@"pass"] = result[@"nativeBackends"][@"pass"];
+            if (![result[@"pass"] boolValue]) result[@"error"] = result[@"nativeBackends"][@"error"] ?: @"native backend self-test failed";
+        }
+        return tool_ok(result);
     }
 
 

@@ -1,0 +1,31 @@
+diff --git a/source/InterceptRouting/InlineHookRouting.h b/source/InterceptRouting/InlineHookRouting.h
+index 55cd20a..9725b2c 100644
+--- a/source/InterceptRouting/InlineHookRouting.h
++++ b/source/InterceptRouting/InlineHookRouting.h
+@@ -52,7 +52,4 @@ PUBLIC inline int DobbyHook(void *address, void *fake_func, void **out_origin_fu
+   auto routing = new InlineHookRouting(entry, (addr_t)fake_func);
+   routing->BuildRouting();
+-  routing->Active();
+-  entry->routing = routing;
+-
+   if (routing->error) {
+     ERROR_LOG("build routing error.");
+@@ -60,8 +57,16 @@ PUBLIC inline int DobbyHook(void *address, void *fake_func, void **out_origin_fu
+   }
+
++  // Publish a callable original before any concurrent thread can enter the patch.
+   if (out_origin_func) {
+-    *out_origin_func = (void *)entry->relocated.addr();
++    void *origin = (void *)entry->relocated.addr();
++    features::apple::arm64e_pac_strip_and_sign(origin);
++    __atomic_store_n(out_origin_func, origin, __ATOMIC_RELEASE);
++  }
++  routing->Active();
++  entry->routing = routing;
++  if (routing->error) {
++    ERROR_LOG("activate routing error.");
++    return -1;
+   }
+-  features::apple::arm64e_pac_strip_and_sign(*out_origin_func);
+
+   gInterceptor.add(entry);
