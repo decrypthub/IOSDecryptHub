@@ -2001,6 +2001,10 @@ static NSDictionary *tool_hook_method(NSDictionary *args) {
     if (![cls isKindOfClass:NSString.class] || cls.length == 0) return tool_err(@"class required");
     if (![sel isKindOfClass:NSString.class] || sel.length == 0) return tool_err(@"selector required");
     BOOL classMethod = [args[@"classMethod"] boolValue];
+    BOOL needsPost = [args[@"capture_return"] boolValue] || [args[@"capture_after"] boolValue] ||
+        ([args[@"capture_ret_multi"] isKindOfClass:NSString.class] && [args[@"capture_ret_multi"] length] > 0);
+    if (needsPost && dh_thunk_method_post_supported(cls.UTF8String, sel.UTF8String, classMethod) == 0)
+        return tool_err(@"此方法含栈参数或复杂 ABI，当前 post 路径不能透明转发；请使用入口采集（不启用 capture_return/capture_after/capture_ret_multi）");
     int capPtr = -1, capLen = -1, capMax = 0;
     NSString *capErr = nil;
     if (!dh_parse_capture_memory(args, &capPtr, &capLen, &capMax, &capErr)) return tool_err(capErr);
@@ -2093,6 +2097,7 @@ static NSDictionary *tool_list_hooks(NSDictionary *args) {
         if (info[i].kind == DH_HOOK_METHOD) {
             h[@"declared_args"] = @(info[i].method_arg_count);
             h[@"argument_mapping"] = info[i].method_simple_gpr ? @"simple-gpr" : @"unsupported-signature";
+            h[@"stack_snapshot_bytes"] = @(info[i].method_stack_bytes);
         }
         NSDictionary *cap = dh_capture_echo(info[i].capture_ptr_arg, info[i].capture_len_arg,
                                             info[i].capture_max_bytes);

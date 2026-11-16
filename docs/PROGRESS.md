@@ -1,5 +1,17 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-16：1.28.32 栈参数与直接调用者验证（研发包）
+
+两台同一授权测试设备已安装整包并现场核对 1.28.32；保留原注入名单。尚未发布 Release / APT。
+
+- 修正 thunk 报给处理器的原始 SP：304B 栈帧应加 `0x130`，旧值 `0xE0` 指向自己的快照。新增命中时 `caller_lr/caller_sp`，可直接定位被回溯栈漏掉的 SDK 调用点。
+- 对已知单 GPR 类型方法，按 Darwin ARM64 的自然大小/对齐采集有界栈快照。两台均观察到 15 参数方法的后 9 参：两个 bool 在 SP+0/+1，下一对象在 +8；不把每个 bool 错当成 8B。
+- 现有 post 路径不转发调用者栈参数。现在含栈参数或复杂输入 ABI 的 ObjC 方法若请求 `capture_return/capture_after/capture_ret_multi`，安装前明确拒绝；核心 setter 也拒绝启用。未知 C 签名不具有自动 ABI 安全保证，尤其不能对变参函数盲目开 post。
+- Mac 24 个类型判定 + 10 个 Darwin 大小/对齐场景、10 个 Mach-O 场景、updater 策略与两份完整 deb 构建通过；两台各通过既有 5 项 MCP 回归及 3 种 post 拒绝/Hook 列表不变检查。首次 selector 测试误用了没有直接引用的 fixture，改用已确认存在的 `setOutput:`；没有放宽断言。
+- 1.28.31 提交 `6ec2138` 的 [完整包 CI](https://github.com/decrypthub/IOSDecryptHub/actions/runs/43817252098) 已通过，含重新构建 Dobby/QBDI。
+
+分析验证：rootless 对真实命中捕获的 HMAC-SHA256 输入/输出完成 7 组离线逐字节复算；提取有界查表数据后，21 个白盒块离线一致；7 组分块输出→CRC→24B 签名封装一致。该结果限于当前版本观察到的常规 48 hex 路径；64 hex 资源预热变体、上游请求规范化以及部分环境字段的独立取值验证仍在继续。白盒表驱动复现不等于恢复了原始 AES 密钥。原始数据、表和复算脚本只保存在本机任务目录，不提交公开仓。
+
 ## 2026-11-16：1.28.31 双设备协议分析验证（研发包）
 
 按用户授权，在 rootless iPhone X / iOS 15.6 与 RootHide iPhone 11 / iOS 16.2 的快手 14.10.10 上测试；只重启该目标，保留原注入名单。两台运行中 Agent 均已核对为 1.28.31。未发布 Release / APT。

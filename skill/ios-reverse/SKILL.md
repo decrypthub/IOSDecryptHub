@@ -10,6 +10,7 @@ description: 用 IDH（IOSDecryptHub 越狱版）对 iOS 目标 App 做协议/�
 - 遇到方法 IMP 明明可读、但函数边界/xref 报找不到时，先核对完整镜像的 `executable_ranges` 与实际 section；代码和字符串不保证位于标准 `__TEXT`。1.28.31 已按权限/节名支持自定义段。
 - `list_hooks.declared_args` 与 `argument_mapping` 是方法参数解释边界。原始寄存器中可读的对象可能只是调用者残留；x8 也不是第七个 ObjC 参数。只以真实声明和 ABI 能力确认的 arg 字段作输入证据。
 - 浮点/聚合签名不按参数序号猜 x 寄存器；超过寄存器窗口的栈参数没有被观察到时，应明确写缺口。
+- 已知单 GPR 方法的栈快照按 Darwin 自然大小/对齐解释，bool 可占相邻单字节；`caller_lr` 是命中时直接调用者，可补回溯栈的缺口。现有 post 不转发调用者栈参数：超过 6 个显式方法参数/复杂 ABI 会拒绝 post；未知 C/变参函数须先看实际签名和调用点，不能盲开返回后采集。
 - 同名/近似名的 SDK 方法必须逐轮用 hits 与实际返回→请求字节匹配确认，静态存在的旧入口可能是未使用分支。不要为了命中而调用签名 facade，把 oracle 输出当成内部算法已经还原。
 - `symbolicate` 的函数起点置信度与 `disassemble_function` 的函数尾部置信度分开解释；LC_FUNCTION_STARTS 的下一入口是末尾近似，工具当前标 medium。
 

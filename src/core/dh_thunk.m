@@ -52,6 +52,8 @@ typedef struct {
     unsigned int     method_arg_count; // 不含 self/_cmd 的真实声明参数数
     int              method_simple_gpr; // 只对单 GPR 标量/指针签名解释参数位置
     uint8_t          method_object_gprs; // 允许作为 ObjC 对象反引用的 x2..x7 位
+    unsigned int     method_stack_bytes;
+    struct { uint16_t offset; uint8_t size, object; } method_stack_args[26]; // arg6..arg31
     _Atomic int      capture_ptr_arg;   // >=0: 抓该寄存器位置的指针参数
     _Atomic int      capture_len_arg;   // >=0: 从该寄存器取长度; -1: 固定长度
     _Atomic int      capture_max_bytes;
@@ -106,7 +108,7 @@ __asm__(
 "  str  x30, [sp, #0xD0]\n"        // 原始 lr
 "  mov  x0, x17\n"                 // handler(slot,
 "  add  x1, sp, #0\n"             //         gpr* -> x0..x8,
-"  add  x2, sp, #0xE0\n"          //         caller_sp,
+"  add  x2, sp, #0x130\n"         //         caller_sp = 当前帧之上的原始 SP
 "  mov  x3, x30\n"                //         lr)
 "  bl   _dh_thunk_handler\n"
 "  ldp  x0, x1, [sp, #0x00]\n"
@@ -429,6 +431,7 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
         e.operation = [NSString stringWithUTF8String:s->name];
         NSMutableString *d = [NSMutableString stringWithFormat:@"slot=%llu hits=%llu\n",
                               (unsigned long long)slot, (unsigned long long)n];
+        [d appendFormat:@"caller_lr=0x%llx caller_sp=0x%llx\n", lr, caller_sp];
         if (s->kind == DH_HOOK_METHOD) {
             [d appendFormat:@"self=0x%llx _cmd=%s\n", gpr[0],
                 sel_getName((SEL)gpr[1]) ?: "?"];
@@ -446,8 +449,32 @@ void dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t
                         if (desc.length) [d appendFormat:@"\n  arg%u = %@", ai, desc];
                     }
                 }
-                if (s->method_arg_count > observed)
-                    [d appendFormat:@"\nunobserved_args=%u (stack arguments are not captured)", s->method_arg_count - observed];
+                unsigned int stackObserved = 0;
+                if (s->method_stack_bytes) {
+                    uint8_t snapshot[256];
+                    vm_size_t got = 0;
+                    kern_return_t kr = vm_read_overwrite(mach_task_self(), (vm_address_t)caller_sp,
+                        s->method_stack_bytes, (vm_address_t)snapshot, &got);
+                    for (unsigned int ai = 6; ai < s->method_arg_count && ai < 32; ai++) {
+                        unsigned int offset = s->method_stack_args[ai - 6].offset;
+                        unsigned int size = s->method_stack_args[ai - 6].size;
+                        if (!size || kr != KERN_SUCCESS || offset + size > got) {
+                            [d appendFormat:@"\narg%u = unobserved (stack unreadable or snapshot budget)", ai];
+                            continue;
+                        }
+                        uint64_t value = 0;
+                        memcpy(&value, snapshot + offset, size);
+                        stackObserved++;
+                        [d appendFormat:@"\narg%u(sp+0x%x,size=%u)=0x%llx", ai, offset, size, value];
+                        if (s->method_stack_args[ai - 6].object &&
+                            atomic_load_explicit(&s->describe_args, memory_order_relaxed)) {
+                            NSString *desc = dh_describe_arg(value);
+                            if (desc.length) [d appendFormat:@"\n  arg%u = %@", ai, desc];
+                        }
+                    }
+                }
+                if (s->method_arg_count > observed + stackObserved)
+                    [d appendFormat:@"\nunobserved_args=%u", s->method_arg_count - observed - stackObserved];
             } else {
                 [d appendString:@"\nargument values not inferred for floating-point/aggregate/unknown signatures"];
             }
@@ -616,6 +643,31 @@ int dh_thunk_install_import(const char *symbol, const char *label) {
     return slot;
 }
 
+int dh_thunk_method_post_supported(const char *className, const char *selector, int classMethod) {
+    if (!className || !selector) return -1;
+    Class cls = objc_getClass(className);
+    if (!cls) return -1;
+    SEL sel = sel_registerName(selector);
+    Method m = nil;
+    if (classMethod) {
+        Class meta = object_getClass((id)cls);
+        if (meta) m = class_getInstanceMethod(meta, sel);
+        if (!m) m = class_getClassMethod(cls, sel);
+    } else {
+        m = class_getInstanceMethod(cls, sel);
+    }
+    if (!m) return -1;
+    unsigned int count = method_getNumberOfArguments(m);
+    if (count > 8) return 0; // self/_cmd + 六个通用寄存器参数
+    for (unsigned int i = 2; i < count; i++) {
+        char *type = method_copyArgumentType(m, i);
+        int kind = dh_method_arg_type(type);
+        free(type);
+        if (!kind) return 0;
+    }
+    return 1;
+}
+
 int dh_thunk_install_method(const char *className, const char *selector, int classMethod) {
     if (!DH_THUNK_ARM64 || !className || !selector) return -1;
     Class cls = objc_getClass(className);
@@ -662,12 +714,24 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
     s->method_arg_count = numberOfArgs >= 2 ? numberOfArgs - 2 : 0;
     s->method_simple_gpr = 1;
     s->method_object_gprs = 0;
+    s->method_stack_bytes = 0;
+    memset(s->method_stack_args, 0, sizeof(s->method_stack_args));
     for (unsigned int ai = 0; ai < s->method_arg_count; ai++) {
         char *type = method_copyArgumentType(m, ai + 2);
         int kind = dh_method_arg_type(type);
+        unsigned int size = dh_method_arg_size(type);
         free(type);
         if (!kind) s->method_simple_gpr = 0;
         if (kind == 2 && ai < 6) s->method_object_gprs |= (uint8_t)(1u << (ai + 2));
+        if (ai >= 6 && ai < 32 && size) {
+            unsigned int offset = dh_method_stack_offset(s->method_stack_bytes, size);
+            if (offset <= 256 - size) {
+                s->method_stack_args[ai - 6].offset = (uint16_t)offset;
+                s->method_stack_args[ai - 6].size = (uint8_t)size;
+                s->method_stack_args[ai - 6].object = kind == 2;
+                s->method_stack_bytes = offset + size;
+            }
+        }
     }
     s->target = NULL;
     s->saved_len = 0;
@@ -950,6 +1014,7 @@ int dh_thunk_set_return(int slot, int on) {
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
     if (atomic_load_explicit(&s->retired, memory_order_relaxed)) return -1;
+    if (on && s->kind == DH_HOOK_METHOD && (!s->method_simple_gpr || s->method_arg_count > 6)) return -1;
     // 先写槽位字段再发布汇编可见的标记位 (release), 保证 handler 看到 1 时字段已就绪。
     atomic_store_explicit(&s->capture_return, on ? 1 : 0, memory_order_relaxed);
     dh_thunk_sync_post(slot);
@@ -963,6 +1028,7 @@ int dh_thunk_set_capture_after(int slot, int on) {
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
     if (atomic_load_explicit(&s->retired, memory_order_relaxed)) return -1;
+    if (on && s->kind == DH_HOOK_METHOD && (!s->method_simple_gpr || s->method_arg_count > 6)) return -1;
     // 只开 after 而不配 capture_memory 是悬空语义(没有 ptr_arg 可读), 直接拒绝而不是让它静默什么都不做。
     if (on && atomic_load_explicit(&s->capture_ptr_arg, memory_order_acquire) < 0) return -2;
     atomic_store_explicit(&s->capture_after, on ? 1 : 0, memory_order_relaxed);
@@ -1073,6 +1139,8 @@ int dh_thunk_set_capture_ret_multi(int slot, const char *spec) {
     if (slot < 0 || slot >= DH_THUNK_COUNT) return -1;
     dh_slot_t *s = &g_slots[slot];
     if (!s->used) return -1;
+    if (spec && spec[0] && s->kind == DH_HOOK_METHOD &&
+        (!s->method_simple_gpr || s->method_arg_count > 6)) return -1;
     int v = dh_thunk_validate_capture_multi(spec);
     if (v != 0) return v;
     v = dh_validate_ret_regs(spec);
@@ -1193,6 +1261,7 @@ int dh_thunk_list(dh_hook_info *out, int max) {
         out[n].capture_after    = atomic_load_explicit(&g_slots[i].capture_after, memory_order_relaxed);
         out[n].method_arg_count = g_slots[i].method_arg_count;
         out[n].method_simple_gpr = g_slots[i].method_simple_gpr;
+        out[n].method_stack_bytes = g_slots[i].method_stack_bytes;
         n++;
     }
     return n;   // 实际写入条数 (跳过被作废的槽)

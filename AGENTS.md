@@ -50,6 +50,8 @@ Always respond in Chinese-simplified.
 
 ## 当前验证状态（2026-11-16）
 
+同日 1.28.32 后续：两台已验证按 Darwin ABI 读取方法栈参数和命中时直接调用者；不支持透明转发的 ObjC post 请求在安装前拒绝。当前研发包与离线算法验证的具体范围继续以 `docs/PROGRESS.md` 顶部为准。
+
 同日后续验证更新：1.28.31 研发包已按用户授权安装并核对两台测试手机，完成自定义 Mach-O 段识别、分支目标、方法参数证据和能力报告修复；验证范围与未完成的密码原语分析见 `docs/PROGRESS.md` 顶部。未发布到 Release / APT。下段 1.28.28 说明保留为迁仓时点快照。
 
 main 为 1.28.28 开发代码，包含 Inline Hook、QBDI Trace 与后续运行时操作；实现范围、架构限制和真机证据按 docs/PROGRESS.md 核对，不把规划中的常驻分析服务或新 Manager 视为已完成。旧 IOSDecryptHubJB GitHub 仓已按用户明确授权删除，本机旧目录已从工作区根移入迁移备份区。

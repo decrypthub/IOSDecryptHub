@@ -44,6 +44,7 @@ typedef struct {
     int          capture_after;    // 1 = capture_ptr_arg 指向调用后才写好的输出缓冲
     unsigned int method_arg_count; // ObjC 声明参数数，不含 self/_cmd
     int          method_simple_gpr; // 0=只保留原始寄存器，不推断参数位置
+    unsigned int method_stack_bytes; // 入口栈快照上限（最多 256B）
     dh_hook_kind kind;
     uint64_t     hits;
     const char  *name;    // 符号名 / "-[Class sel]"
@@ -61,6 +62,8 @@ int  dh_thunk_install_import(const char *symbol, const char *label);
 
 // 装 ObjC 方法 hook。classMethod!=0 走类方法。返回 slot(>=0); -1 槽位耗尽; -3 类/方法不存在。
 int  dh_thunk_install_method(const char *className, const char *selector, int classMethod);
+// post 路径尚未转发调用者栈参数：已知复杂/栈参数签名必须在安装前拒绝。
+int dh_thunk_method_post_supported(const char *className, const char *selector, int classMethod);
 
 // 装内联 hook (Dobby)。module 可为 NULL/"" (退化为 RTLD_DEFAULT)，symbol 或 addr 二选一：
 //   - module+symbol: dlopen(module) + dlsym(symbol)，module 也尝试 /var/jb/usr/lib、/usr/lib 下同名库
