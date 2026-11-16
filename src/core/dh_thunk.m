@@ -19,6 +19,9 @@
 #include "dh_method_arg_type.h"
 #import "dh_event.h"
 #include "dh_call_context.h"
+#import "dh_unwind.h"
+#import "../trace/qbdi_live.h"
+#include <errno.h>
 
 // 内联后端按实际链接切片决定；arm64e Dobby 输出已签名函数指针，而 thunk 使用原始 br/blr。
 #ifndef DH_HAVE_INLINE
@@ -27,6 +30,7 @@
 
 #if DH_HAVE_INLINE
 #include "dobby.h"
+extern int DobbyHookWithContext(void *,void *,void **);
 #endif
 
 int dh_thunk_inline_available(void) {
@@ -222,7 +226,7 @@ NSDictionary *dh_thunk_metadata(int slot) {
         (s->return_type[0] == 'v' || dh_method_arg_type(s->return_type));
     return @{@"hookId": [NSString stringWithFormat:@"%@:hook:%d", DHProcessGeneration(), slot],
         @"processGeneration": DHProcessGeneration(), @"targetIdentity": g_slot_targets[slot] ?: @{},
-        @"configurationImmutable": @YES, @"callStackMode": @"direct-caller-only",
+        @"configurationImmutable": @YES, @"callStackMode": @"libunwind-context-CFI; deferred-symbolication",
         @"inFlight": [NSString stringWithFormat:@"%llu", atomic_load(&g_slot_inflight[slot])],
         @"importBindingPolicy": s->kind == DH_HOOK_IMPORT ? @"resolved-symbol; present-and-future-images; interposers-not-preserved; write-coverage-not-guaranteed" : @"not-applicable",
         @"abi": @{@"source": s->kind == DH_HOOK_METHOD ? @"objc-runtime" : known ? @"client-declaration" : @"unknown",
@@ -239,46 +243,123 @@ NSDictionary *dh_thunk_metadata(int slot) {
 #if defined(__arm64__) || defined(__aarch64__)
 
 // ---- thunk 表 + 蹦床 (arm64) ----
-// 每个 thunk = [ movz x17,#slot ; b _dh_thunk_trampoline ] 固定 8 字节。
-// x17(IP1) 是 ABI 允许在调用边界随意破坏的临时寄存器, 不会承载参数, 拿来传 slot 最合适。
+// 每个槽位固定 32B，先保存原 x16/x17，再用 x17 传 slot 并进入公共桥。
+// Inline context veneer 已完成同一次压栈，从槽位 +4 进入；方法/导入从 +0 进入。
 __asm__(
 ".section __TEXT,__text\n"
-".p2align 2\n"
+".p2align 5\n"
 ".globl _dh_thunk_table\n"
 "_dh_thunk_table:\n"
+".cfi_startproc\n"
 ".set _dht_idx, 0\n"
-".rept 256\n"                       // 必须与 DH_THUNK_COUNT 一致
+".rept 256\n"
+".cfi_def_cfa sp, 0\n"
+"  stp x16, x17, [sp, #-16]!\n"
+".cfi_def_cfa_offset 16\n"
 "  movz x17, #_dht_idx\n"
-"  b    _dh_thunk_trampoline\n"
+"  b _dh_thunk_trampoline\n"
+"  .space 20\n"
 "  .set _dht_idx, _dht_idx + 1\n"
 ".endr\n"
-"\n"
+".cfi_endproc\n"
 ".globl _dh_thunk_trampoline\n"
-"_dh_thunk_trampoline:\n""  sub  sp, sp, #0x130\n"           // 304B 帧: x0-8 + slot + q0-7 + lr + 入口快照
+"_dh_thunk_trampoline:\n"
+".cfi_startproc\n"
+".cfi_def_cfa sp, 16\n"
+"  sub  sp, sp, #0x450\n"
+".cfi_def_cfa_offset 0x460\n"
 "  stp  x0, x1, [sp, #0x00]\n"
 "  stp  x2, x3, [sp, #0x10]\n"
 "  stp  x4, x5, [sp, #0x20]\n"
 "  stp  x6, x7, [sp, #0x30]\n"
-"  stp  x8, x17, [sp, #0x40]\n"    // x8(间接返回) + slot; x0..x8 至此在 [sp..sp+0x48] 连续
-"  stp  q0, q1, [sp, #0x50]\n"     // 保住 FP/向量参数, 否则 double/struct 传参会被处理器破坏
+"  stp  x8, x17, [sp, #0x40]\n"
+"  stp  q0, q1, [sp, #0x50]\n"
 "  stp  q2, q3, [sp, #0x70]\n"
 "  stp  q4, q5, [sp, #0x90]\n"
 "  stp  q6, q7, [sp, #0xB0]\n"
-"  str  x30, [sp, #0xD0]\n"        // 原始 lr
+"  str  x30, [sp, #0xD0]\n"
+
+"  str x9, [sp, #0x178]\n"
+"  str x10, [sp, #0x180]\n"
+"  add x9, sp, #0x130\n"
+"  stp x0, x1, [x9, #0]\n"
+"  stp x2, x3, [x9, #16]\n"
+"  stp x4, x5, [x9, #32]\n"
+"  stp x6, x7, [x9, #48]\n"
+"  str x8, [x9, #64]\n"
+"  str x11, [x9, #88]\n"
+"  stp x12, x13, [x9, #96]\n"
+"  stp x14, x15, [x9, #112]\n"
+"  stp x16, x17, [x9, #128]\n"
+"  stp x18, x19, [x9, #144]\n"
+"  stp x20, x21, [x9, #160]\n"
+"  stp x22, x23, [x9, #176]\n"
+"  stp x24, x25, [x9, #192]\n"
+"  stp x26, x27, [x9, #208]\n"
+"  stp x28, x29, [x9, #224]\n"
+"  str x30, [x9, #240]\n"
+"  ldr x10, [sp, #0x450]\n"
+"  ldr x11, [sp, #0x458]\n"
+"  stp x10, x11, [x9, #128]\n"
+"  add x10, sp, #0x460\n"
+"  str x10, [x9, #248]\n"
+"  ldr x10, [sp, #0xD0]\n"
+"  add x11, sp, #0x460\n"
+#if defined(__arm64e__)
+"  pacib x10, x11\n"
+#endif
+"  str x10, [x9, #256]\n"
+".cfi_offset 30, -0x230\n"
+"  mrs x10, nzcv\n"
+"  str x10, [x9, #264]\n"
+"  mrs x10, fpcr\n"
+"  str x10, [x9, #272]\n"
+"  mrs x10, fpsr\n"
+"  str x10, [x9, #280]\n"
+"  stp q0, q1, [x9, #288]\n"
+"  stp q2, q3, [x9, #320]\n"
+"  stp q4, q5, [x9, #352]\n"
+"  stp q6, q7, [x9, #384]\n"
+"  stp q8, q9, [x9, #416]\n"
+"  stp q10, q11, [x9, #448]\n"
+"  stp q12, q13, [x9, #480]\n"
+"  stp q14, q15, [x9, #512]\n"
+"  stp q16, q17, [x9, #544]\n"
+"  stp q18, q19, [x9, #576]\n"
+"  stp q20, q21, [x9, #608]\n"
+"  stp q22, q23, [x9, #640]\n"
+"  stp q24, q25, [x9, #672]\n"
+"  stp q26, q27, [x9, #704]\n"
+"  stp q28, q29, [x9, #736]\n"
+"  stp q30, q31, [x9, #768]\n"
 "  adrp x16, _g_dh_thunk_orig@PAGE\n"
 "  add  x16, x16, _g_dh_thunk_orig@PAGEOFF\n"
 "  add  x16, x16, x17, lsl #3\n"
-"  ldar x16, [x16]\n"              // 与后端补丁前发布 original 的 release store 配对
+"  ldar x16, [x16]\n"
 #if defined(__arm64e__)
-"  xpaci x16\n"                    // 同时接受刚发布的签名 original 和已归一的原始地址
+"  xpaci x16\n"
 #endif
 "  str  x16, [sp, #0xD8]\n"
-"  mov  x0, x17\n"                 // handler(slot,
-"  add  x1, sp, #0\n"             //         gpr* -> x0..x8,
-"  add  x2, sp, #0x130\n"         //         caller_sp = 当前帧之上的原始 SP
-"  mov  x3, x30\n"                //         lr)
+"  mov  x0, x17\n"
+"  add  x1, sp, #0\n"
+"  add  x2, sp, #0x460\n"
+"  mov  x3, x30\n"
+"  add x4, sp, #0x130\n"
 "  bl   _dh_thunk_handler\n"
-"  str  x0, [sp, #0x128]\n"       // 本次调用 token
+"  str  x0, [sp, #0x128]\n"
+"  ldr x0, [sp, #0x48]\n"
+"  ldr x1, [sp, #0xD8]\n"
+"  add x2, sp, #0x130\n"
+"  ldr x3, [sp, #0x128]\n"
+"  bl _dh_live_claim\n"
+"  cbz x0, Ldh_thunk_normal_restore\n"
+".cfi_remember_state\n"
+"  ldr x1, [x0]\n"
+"  mov sp, x1\n"
+".cfi_undefined 30\n"
+"  b _dh_live_bridge\n"
+".cfi_restore_state\n"
+"Ldh_thunk_normal_restore:\n"
 "  ldp  x0, x1, [sp, #0x00]\n"
 "  ldp  x2, x3, [sp, #0x10]\n"
 "  ldp  x4, x5, [sp, #0x20]\n"
@@ -292,17 +373,18 @@ __asm__(
 "  ldr  x16, [sp, #0xD8]\n"
 "  adrp x15, _g_dh_thunk_post@PAGE\n"
 "  add  x15, x15, _g_dh_thunk_post@PAGEOFF\n"
-"  ldrb w15, [x15, x17]\n"           // post 标记
+"  ldrb w15, [x15, x17]\n"
 "  cbnz w15, 1f\n"
-"  add  sp, sp, #0x130\n"
-"  br   x16\n"                       // 尾调用: lr 已复原, 原函数直接返回真正的调用者
-"\n"
-"// post 路径: 需要返回值的槽位。先调原函数, 保存 x0/x1/q0/q1, 让 C 记录一次, 再原样返回。\n"
-"// 代价是这层栈帧要一直留到原函数返回 (而不是尾调用), 因此只对付费槽位启用。\n"
+".cfi_remember_state\n"
+"  add  sp, sp, #0x460\n"
+".cfi_def_cfa_offset 0\n"
+"  br   x16\n"
+"// post \u8def\u5f84: \u9700\u8981\u8fd4\u56de\u503c\u7684\u69fd\u4f4d\u3002\u5148\u8c03\u539f\u51fd\u6570, \u4fdd\u5b58 x0/x1/q0/q1, \u8ba9 C \u8bb0\u5f55\u4e00\u6b21, \u518d\u539f\u6837\u8fd4\u56de\u3002\n"
+"// \u4ee3\u4ef7\u662f\u8fd9\u5c42\u6808\u5e27\u8981\u4e00\u76f4\u7559\u5230\u539f\u51fd\u6570\u8fd4\u56de (\u800c\u4e0d\u662f\u5c3e\u8c03\u7528), \u56e0\u6b64\u53ea\u5bf9\u4ed8\u8d39\u69fd\u4f4d\u542f\u7528\u3002\n"
+".cfi_restore_state\n"
 "1:\n"
-"  stp  x16, x30, [sp, #0xD0]\n"      // [0xD0]=原函数, [0xD8]=返回地址
-// 调用前把入口寄存器另存一份: capture_after 要用「进入时」的 ptr_arg/len_arg,
-// 而 blr 之后 [sp,#0x00] 会被返回值覆盖 —— ptr_arg=0 时会读到返回值, 抓出完全无关的内存。
+"  stp  x16, x30, [sp, #0xD0]\n"
+
 "  add  x9, sp, #0xE0\n"
 "  add  x10, sp, #0x00\n"
 "  ldp  x11, x12, [x10]\n"
@@ -315,12 +397,12 @@ __asm__(
 "  stp  x11, x12, [x9, #0x30]\n"
 "  ldr  x11, [x10, #0x40]\n"
 "  str  x11, [x9, #0x40]\n"
-// 独立的 256B outgoing 区，不覆盖入口快照/调用 token。已知 ABI 才设置 stack_bytes。
 "  sub  sp, sp, #0x100\n"
+".cfi_def_cfa_offset 0x560\n"
 "  adrp x9, _g_dh_thunk_stack_bytes@PAGE\n"
 "  add  x9, x9, _g_dh_thunk_stack_bytes@PAGEOFF\n"
 "  ldrh w9, [x9, x17, lsl #1]\n"
-"  add  x10, sp, #0x230\n"      // 原始 caller SP
+"  add  x10, sp, #0x560\n"
 "  mov  x11, sp\n"
 "  cbz  x9, 3f\n"
 "2:\n"
@@ -331,28 +413,87 @@ __asm__(
 "3:\n"
 "  blr  x16\n"
 "  add  sp, sp, #0x100\n"
-"  str  x0, [sp, #0x00]\n"            // 返回值 x0
-"  str  x1, [sp, #0x08]\n"            // 返回值 x1 (结构体/双整返回)
-"  stp  q0, q1, [sp, #0x50]\n"        // 浮点/向量返回值
-"  stp  q2, q3, [sp, #0x70]\n"        // HFA 结构体返回可能用到 q2/q3
-"  ldp  x8, x17, [sp, #0x40]\n"       // x8 = 间接返回缓冲, x17 = slot
-"  mov  x0, x17\n"                    // dh_thunk_post_handler(slot,
-"  add  x1, sp, #0\n"                 //                    retval regs,
-"  ldp  x2, x3, [sp, #0xD0]\n"        //                    orig, real_lr)
-"  add  x4, sp, #0xE0\n"           //                    entry_regs)
-"  ldr  x5, [sp, #0x128]\n"        //                    call token)
+".cfi_def_cfa_offset 0x460\n"
+"  str  x0, [sp, #0x00]\n"
+"  str  x1, [sp, #0x08]\n"
+"  stp  q0, q1, [sp, #0x50]\n"
+"  stp  q2, q3, [sp, #0x70]\n"
+"  ldp  x8, x17, [sp, #0x40]\n"
+"  mov  x0, x17\n"
+"  add  x1, sp, #0\n"
+"  ldp  x2, x3, [sp, #0xD0]\n"
+"  add  x4, sp, #0xE0\n"
+"  ldr  x5, [sp, #0x128]\n"
 "  bl   _dh_thunk_post_handler\n"
 "  ldr  x0, [sp, #0x00]\n"
 "  ldr  x1, [sp, #0x08]\n"
 "  ldp  q0, q1, [sp, #0x50]\n"
 "  ldp  q2, q3, [sp, #0x70]\n"
 "  ldr  x30, [sp, #0xD8]\n"
-"  add  sp, sp, #0x130\n"
+"  add  sp, sp, #0x460\n"
+".cfi_def_cfa_offset 0\n"
 "  ret\n"
+".cfi_endproc\n"
+".globl _dh_live_bridge\n"
+"_dh_live_bridge:\n"
+".cfi_startproc\n"
+".cfi_undefined 30\n"
+"  mov x19, x0\n"
+"  bl _dh_live_run\n"
+"  cbnz x0, 8f\n"
+"  ldr x16, [x19, #8]\n"
+"  mov sp, x16\n"
+"  ldr x19, [x19, #168]\n"
+"  b Ldh_thunk_normal_restore\n"
+"8:\n"
+"  mov x17, x0\n"
+"  ldr x16, [x17, #248]\n"
+"  mov sp, x16\n"
+".cfi_def_cfa sp, 0\n"
+"  ldp q0, q1, [x17, #288]\n"
+"  ldp q2, q3, [x17, #320]\n"
+"  ldp q4, q5, [x17, #352]\n"
+"  ldp q6, q7, [x17, #384]\n"
+"  ldp q8, q9, [x17, #416]\n"
+"  ldp q10, q11, [x17, #448]\n"
+"  ldp q12, q13, [x17, #480]\n"
+"  ldp q14, q15, [x17, #512]\n"
+"  ldp q16, q17, [x17, #544]\n"
+"  ldp q18, q19, [x17, #576]\n"
+"  ldp q20, q21, [x17, #608]\n"
+"  ldp q22, q23, [x17, #640]\n"
+"  ldp q24, q25, [x17, #672]\n"
+"  ldp q26, q27, [x17, #704]\n"
+"  ldp q28, q29, [x17, #736]\n"
+"  ldp q30, q31, [x17, #768]\n"
+"  ldr x16, [x17, #272]\n"
+"  msr fpcr, x16\n"
+"  ldr x16, [x17, #280]\n"
+"  msr fpsr, x16\n"
+"  ldr x16, [x17, #264]\n"
+"  msr nzcv, x16\n"
+"  ldr x30, [x17, #256]\n"
+"  ldp x0, x1, [x17, #0]\n"
+"  ldp x2, x3, [x17, #16]\n"
+"  ldp x4, x5, [x17, #32]\n"
+"  ldp x6, x7, [x17, #48]\n"
+"  ldp x8, x9, [x17, #64]\n"
+"  ldp x10, x11, [x17, #80]\n"
+"  ldp x12, x13, [x17, #96]\n"
+"  ldp x14, x15, [x17, #112]\n"
+"  ldp x18, x19, [x17, #144]\n"
+"  ldp x20, x21, [x17, #160]\n"
+"  ldp x22, x23, [x17, #176]\n"
+"  ldp x24, x25, [x17, #192]\n"
+"  ldp x26, x27, [x17, #208]\n"
+"  ldp x28, x29, [x17, #224]\n"
+"  ldp x16, x17, [x17, #128]\n"
+"  ret\n"
+".cfi_endproc\n"
 );
 
 extern void dh_thunk_table(void);   // asm label; 取地址即表基址
-static inline void *dh_slot_addr(int i) { return (uint8_t *)dh_thunk_table + (size_t)i * 8; }
+static inline void *dh_slot_addr(int i) { return (uint8_t *)dh_thunk_table + (size_t)i * 32; }
 
 #define DH_THUNK_ARM64 1
 #else
@@ -543,7 +684,8 @@ static NSDictionary *dh_function_context(DHLogEntry *e, int slot, DHCallContext 
 }
 
 // token 存在每次汇编帧中。递归、嵌套、同一线程复用均不靠文本/TID 猜配对。
-uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t lr) {
+uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint64_t lr, const DHCPUContext *full) {
+    int savedErrno=errno;
     if (slot >= DH_THUNK_COUNT) return 0;
     dh_slot_t *s = &g_slots[slot];
     if (g_dh_thunk_post[slot]) atomic_fetch_add_explicit(&g_slot_inflight[slot], 1, memory_order_relaxed);
@@ -552,8 +694,9 @@ uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint
     if (g_in_thunk) return 0;
     g_in_thunk = 1;
     int savedInternal=dh_in_hook; dh_in_hook=1;
-    if ([DHLogStore shared].paused) { dh_in_hook=savedInternal; g_in_thunk = 0; return 0; }
+    if ([DHLogStore shared].paused) { dh_in_hook=savedInternal; g_in_thunk = 0; errno=savedErrno; return 0; }
     DHCallContext call = dh_call_begin(g_dh_thunk_post[slot], DHMonotonicNS());
+    DHRawStack captureStack;dh_unwind_capture(full,(uint64_t)(s->target ?: g_dh_thunk_orig[slot]),&captureStack);
     @autoreleasepool {
         const dh_hook_options *o = &g_slot_options[slot];
         DHLogEntry *e = [DHLogEntry new];
@@ -612,6 +755,7 @@ uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint
         dh_add_windows(memory, o->capture_multi, gpr, o->max_bytes, @"entry");
         e.eventPayload = @{@"rawRegisters": regs, @"arguments": args, @"memory": memory,
             @"caller": @{@"lr": dh_hex_u64(lr), @"sp": dh_hex_u64(caller_sp)},
+            @"stack":DHStackDictionary(&captureStack),
             @"abi": dh_thunk_metadata((int)slot)[@"abi"]};
         e.detail = detail;
         e.callStack = [NSString stringWithFormat:@"Direct caller (unsymbolicated): %@",dh_hex_u64(lr)];
@@ -619,11 +763,12 @@ uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint
         [[DHLogStore shared] append:e];
     }
     dh_in_hook=savedInternal; g_in_thunk = 0;
-    return call.id;
+    errno=savedErrno;return call.id;
 }
 
 void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_t real_lr,
                            uint64_t *entry_regs, uint64_t token) {
+    int savedErrno=errno;
     (void)orig;
     if (slot >= DH_THUNK_COUNT) return;
     atomic_fetch_sub_explicit(&g_slot_inflight[slot], 1, memory_order_relaxed);
@@ -669,7 +814,7 @@ void dh_thunk_post_handler(uint64_t slot, uint64_t *regs, uint64_t orig, uint64_
         e.timestamp = DHTimestampNow();
         [[DHLogStore shared] append:e];
     }
-    dh_in_hook=savedInternal; g_in_thunk = 0;
+    dh_in_hook=savedInternal; g_in_thunk = 0;errno=savedErrno;
 }
 
 // ---- 安装 / 关闭 / 枚举 ----
@@ -1060,7 +1205,7 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
 
     dh_prepare_slot_options(slot);
 
-    int rc = DobbyHook(target, (void *)dh_slot_addr(slot),
+    int rc = DobbyHookWithContext(target, (uint8_t *)dh_slot_addr(slot)+4,
                        (void **)&g_dh_thunk_orig[slot]);
     if (g_dh_thunk_orig[slot])
         __atomic_store_n(&g_dh_thunk_orig[slot], ptrauth_strip(g_dh_thunk_orig[slot], ptrauth_key_function_pointer), __ATOMIC_RELEASE);
@@ -1391,4 +1536,17 @@ int dh_thunk_list(dh_hook_info *out, int max) {
         n++;
     }
     return n;   // 实际写入条数 (跳过被作废的槽)
+}
+
+int dh_thunk_live_target(int slot,uint64_t *target,uint64_t *original) {
+    int ok=0;pthread_mutex_lock(&g_install_lock);
+    if (slot>=0 && slot<DH_THUNK_COUNT && g_slots[slot].used &&
+        g_slots[slot].kind==DH_HOOK_INLINE && atomic_load(&g_slots[slot].enabled) && atomic_load(&g_slot_published[slot])) {
+        *target=(uint64_t)g_slots[slot].target;*original=(uint64_t)g_dh_thunk_orig[slot];ok=1;
+    }
+    pthread_mutex_unlock(&g_install_lock);return ok;
+}
+void dh_thunk_live_post(unsigned slot,const DHCPUContext *result,const DHCPUContext *entry,uint64_t token,uint64_t original) {
+    if (slot<DH_THUNK_COUNT && g_dh_thunk_post[slot])
+        dh_thunk_post_handler(slot,(uint64_t *)result->x,original,entry->x[30],(uint64_t *)entry->x,token);
 }

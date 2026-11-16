@@ -50,6 +50,8 @@ Always respond in Chinese-simplified.
 
 ## 当前验证状态（2026-11-16）
 
+同日 1.28.36 后续：补齐原 App 线程/栈/寄存器的 QBDI live-next-call、Dobby context 入口和公共桥 CFI，系统 libunwind 同步 native 栈在命中时只采 PC/SP、读取时符号化。两台真实快手 CRC/HMAC/白盒调用已通过，同步栈逐条报告完整/截断/错误；不能把正常返回约束、256 帧上限与模块内覆盖推广为任意异常/异步控制流支持。当前操作协议见 `docs/LIVE_CONTEXT_TRACE.md`，原有 post ABI 和 Inline 硬卸载限制继续生效。
+
 同日 1.28.35 后续：RootHide 胖包已链接真实 arm64 / arm64e Inline 与 QBDI，双机 3 个独立进程代与快手真实原语采集/离线复算、复制输入的 SDK 指令回放通过。动态跳板仅保留直接 caller 与结构化同步关联，完整 unwind 不支持。最新验证与边界见 `docs/PROGRESS.md` 顶部；以下无后端说明为旧版快照。
 
 同日 1.28.32 后续：两台已验证按 Darwin ABI 读取方法栈参数和命中时直接调用者；不支持透明转发的 ObjC post 请求在安装前拒绝。当前研发包与离线算法验证的具体范围继续以 `docs/PROGRESS.md` 顶部为准。

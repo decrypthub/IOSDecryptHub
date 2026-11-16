@@ -1,5 +1,17 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-16：1.28.36 真实调用现场与完整同步 native 栈（研发包）
+
+- 新增 `trace_live_arm/read/cancel`：选择已安装 Inline 的下一次真实调用，在原 App 线程、TLS、SP 和原栈上执行 QBDI，不人工重新调用、不替换输入指针。完整保存 x0–x30、q0–q31、NZCV/FPCR/FPSR、原始 SP/LR、errno 及出口现场；IDH 专用 Dobby context veneer 在使用 IP 寄存器前保存 x16/x17。
+- QBDI 控制端使用预分配 guard 分析栈，guest 使用真实 App 栈；最多保留 8 会话，每次最多记录 8192 条。记录/时间预算耗尽只停止记录，继续原调用至正常返回；取消只适用于尚未命中。输出明确区分调用完成、记录截断与模块外 native transfer，不把 replay 当现场执行。
+- 公共入口和 post 桥补 CFI，arm64e 的 unwind 返回槽按原 CFA 单独签名，避免与转发 LR 混用。动态 Hook 从原 caller 现场展开，默认密码/网络事件也改采原始 PC/SP。系统 libunwind 最多 256 帧，缺元数据、循环、截断和正常根分别报告；命中线程不完整符号化，读取时补 UUID/RVA/最近符号，旧代 journal 不套用新 ASLR。
+- Mac 原有汇编/ABI/并发/journal、Darwin 类型与 Mach-O、更新策略及两种完整 deb 均通过；新增真实嵌套 post 栈展开测试通过，实际 arm64/arm64e 编译通过。原有完整包 CI 门禁保持不变，仍从固定源码构建依赖。
+- 两台授权设备均安装同一 1.28.36 整包，通过既有 Agent/native/PAC/P0/复杂 ABI 拒绝测试；新增 live 7 组自检及 3 项 MCP 回归通过，覆盖恰好执行一次、15 参数 packed stack、SIMD、隐藏 x8 结构体输出、原 IP0/IP1、errno 入口/出口、4 条预算不中断、命中前取消。
+- 快手 14.10.10 真实 UI 触发的 CRC/HMAC/白盒块，在两台各完整记录 2489/7603/5449 条指令；按同 callId/TID/SP/LR/真实参数指针核对原 entry/leave，输出与独立 zlib/SHA256/表驱动块运算一致。CRC 栈 rootless 85 帧、RootHide 129 帧，HMAC 76/76、白盒 77/77，全部 complete、未截断、error 0。
+- 每台另采 15 棵完整同步调用树、225 个配对调用及 15 次核心 15 参数正常入口/返回；各 15 个 facade 返回逐字匹配本轮 HTTP `__NS_sig3`。两台各独立验证 15 HMAC、45 白盒块、15 CRC，一致。此处不是输出算法材料，原始捕获仅留本机验证目录。
+
+研发整包已刷入两台，原 scope 保留；测试结束重启目标清除临时补丁并暂停采集。未发布 Release / APT。正常返回函数及模块内覆盖是约束；完整性指该同步 native 栈的实际展开结果，不恢复优化掉的 inline/tail-call 或异步逻辑帧，也不承诺异常/longjmp 控制流。普通 post ABI 与 Inline 硬卸载限制继续生效。操作、资源上限与测试入口见 [真实现场协议](LIVE_CONTEXT_TRACE.md)。
+
 ## 2026-11-16：1.28.35 RootHide Inline / QBDI（研发包）
 
 - RootHide 完整包链接真正的 arm64 / arm64e Dobby 与 QBDI，移除胖包禁用后端的分支；链接前校验请求切片。Dobby/QBDI 固定源码提交、分架构编译，arm64e 开启 QBDI PAC；修正上游 iOS 汇编硬编码 arm64 和静态 Config.h 的架构选择。

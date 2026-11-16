@@ -14,7 +14,7 @@
 
 v1.27.6 将版本检查切换到规范 APT 源，按安装包架构选择版本，更新与回退交给系统包管理器。Manager、Loader、daemon 与引擎统一升级；旧单引擎安装/回滚请求会被拒绝，遗留 staging 不再覆盖包内引擎。
 
-**开发主线与正式包分开**：当前 main 为 1.28.28 开发代码，已包含后续 Inline Hook、QBDI Trace 与运行时操作的开发提交，验证范围和已知限制见 [当前进度](./docs/PROGRESS.md)。仓库整合不发布新的 1.28.x 安装包；上面的 v1.27.6 是已发布完整包。常驻分析服务、新 Manager 与 scope 架构继续按路线图推进。
+**开发主线与正式包分开**：当前 main 为 1.28.36 开发代码，已在两台授权设备验证 Inline/PAC、QBDI 真实调用现场及同步 native 栈展开，验证范围和限制见 [当前进度](./docs/PROGRESS.md) 与 [真实现场协议](./docs/LIVE_CONTEXT_TRACE.md)。1.28.x 当前用于研发整包测试，尚未发布 Release/APT；上面的 v1.27.6 是已发布完整包。常驻分析服务、新 Manager 与 scope 架构继续按路线图推进。
 
 源码和问题反馈：[本仓 Issues](https://github.com/decrypthub/IOSDecryptHub/issues)。巨魔设备请使用 [巨魔版下载与说明](https://github.com/decrypthub/IOSDecryptHubTrollStore)。
 
@@ -24,9 +24,10 @@ v1.27.6 将版本检查切换到规范 APT 源，按安装包架构选择版本�
 
 ```bash
 brew install dpkg ldid cmake ninja  # 已安装的工具可跳过
-bash tools/build_dobby_ios.sh      # 首次构建准备 arm64 Inline Hook 静态库
+bash tools/build_dobby_ios.sh      # 准备真实 arm64 + arm64e Inline Hook 静态库
 bash tools/build_qbdi_ios.sh       # arm64 + arm64e/PAC QBDI/LLVM，需网络且耗时较长
 make test-updater  # 无需网络或手机的版本选择/旧更新请求边界回归
+make test-hook-runtime test-unwind-runtime test-hook-ios-build # 实际汇编、ABI、栈展开
 make deb           # 一次构建 rootless 和 RootHide 完整包
 ```
 

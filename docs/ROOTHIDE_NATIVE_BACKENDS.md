@@ -1,5 +1,7 @@
 # 1.28.35：RootHide Inline / QBDI
 
+这是 1.28.35 验证快照。1.28.36 已补真实调用现场跟踪、公共桥 CFI 和同步 native 栈展开，当前协议与限制见 [LIVE_CONTEXT_TRACE.md](LIVE_CONTEXT_TRACE.md)；以下 direct-caller-only/replay 描述保留当时边界。
+
 RootHide 胖包现在链接真实 arm64 与 arm64e 静态依赖。`get_capabilities` 的后端与进程架构以运行中的 Agent 为准，不能仅凭包版本或工具名判断加载成功。具体真机结果见 [当前进度](PROGRESS.md)。
 
 ## 构建与 PAC

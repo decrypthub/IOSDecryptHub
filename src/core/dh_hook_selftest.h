@@ -3,3 +3,5 @@
 NSDictionary *DHHookSelfTest(BOOL includeCImport);
 // 真实 Inline/QBDI 自检；只执行自有纯计算函数，Inline 软停后须重启清 patch。
 NSDictionary *DHNativeBackendSelfTest(void);
+
+NSDictionary *DHLiveBackendSelfTest(void);

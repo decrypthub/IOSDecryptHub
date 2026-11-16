@@ -129,7 +129,7 @@ NSString *DHHexFromData(NSData * _Nullable d);
 NSData   *DHDataFromHex(NSString * _Nullable hex);   // hex -> bytes; 容忍 0x/空白/大小写, 奇数位末尾忽略
 NSString *DHHexDumpFromData(NSData * _Nullable d);
 NSString *DHUTF8FromData(NSData * _Nullable d);
-NSString *DHCallStackFiltered(void);   // 已过滤系统 / 自身的调用栈
+NSString *DHCallStackFiltered(void);   // 有界完整原始栈，保留旧接口名；读取时延后符号化
 NSString *DHTimestampNow(void);
 
 NS_ASSUME_NONNULL_END

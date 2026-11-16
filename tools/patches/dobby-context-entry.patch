@@ -1,0 +1,69 @@
+diff --git a/source/InterceptRouting/InlineHookRouting.h b/source/InterceptRouting/InlineHookRouting.h
+--- a/source/InterceptRouting/InlineHookRouting.h
++++ b/source/InterceptRouting/InlineHookRouting.h
+@@ -28,5 +28,5 @@
+ };
+
+-PUBLIC inline int DobbyHook(void *address, void *fake_func, void **out_origin_func) {
++inline int DobbyHookImpl(void *address, void *fake_func, void **out_origin_func, bool preserve_context) {
+   __FUNC_CALL_TRACE__();
+   if (!address) {
+@@ -51,4 +51,5 @@
+
+   auto routing = new InlineHookRouting(entry, (addr_t)fake_func);
++  routing->preserve_context = preserve_context;
+   routing->BuildRouting();
+   if (routing->error) {
+@@ -74,2 +75,9 @@
+   return 0;
+ }
++
++PUBLIC inline int DobbyHook(void *address, void *fake_func, void **out_origin_func) {
++  return DobbyHookImpl(address, fake_func, out_origin_func, false);
++}
++extern "C" PUBLIC int DobbyHookWithContext(void *address, void *fake_func, void **out_origin_func) {
++  return DobbyHookImpl(address, fake_func, out_origin_func, true);
++}
+diff --git a/source/InterceptRouting/InterceptRouting.h b/source/InterceptRouting/InterceptRouting.h
+--- a/source/InterceptRouting/InterceptRouting.h
++++ b/source/InterceptRouting/InterceptRouting.h
+@@ -10,4 +10,5 @@
+ Trampoline *GenerateNearTrampolineBuffer(addr_t src, addr_t dst);
+ Trampoline *GenerateNormalTrampolineBuffer(addr_t from, addr_t to);
++Trampoline *GenerateContextTrampolineBuffer(addr_t from, addr_t to);
+
+ struct InterceptRouting {
+@@ -16,4 +17,5 @@
+   Trampoline *near_trampoline = 0;
+   int error = 0;
++  bool preserve_context = false;
+
+   explicit InterceptRouting(Interceptor::Entry *entry) : entry(entry) {
+@@ -73,4 +75,10 @@
+     }
+
++#if defined(TARGET_ARCH_ARM64)
++    if (preserve_context) {
++      trampoline = GenerateContextTrampolineBuffer(from, to);
++      return true;
++    }
++#endif
+     if (g_enable_near_trampoline) {
+       near_trampoline = GenerateNearTrampolineBuffer(from, to);
+diff --git a/source/TrampolineBridge/Trampoline/trampoline_arm64.cc b/source/TrampolineBridge/Trampoline/trampoline_arm64.cc
+--- a/source/TrampolineBridge/Trampoline/trampoline_arm64.cc
++++ b/source/TrampolineBridge/Trampoline/trampoline_arm64.cc
+@@ -45,3 +45,13 @@
+ }
+
++// IDH extension only: fake entry consumes the saved pair; generic DobbyHook is unchanged.
++Trampoline *GenerateContextTrampolineBuffer(addr_t from, addr_t to) {
++  TurboAssembler turbo_assembler_(from);
++  turbo_assembler_.stp(X(16), X(17), MemOperand(SP, -16, PreIndex));
++  CodeGen codegen(&turbo_assembler_);
++  codegen.LiteralLdrBranch((uint64_t)to);
++  turbo_assembler_.relocDataLabels();
++  auto block = turbo_assembler_.code_buffer()->dup();
++  return new Trampoline(TRAMPOLINE_ARM64_LDR_BR, block);
++}
+ #endif

@@ -3,6 +3,7 @@
 #import <Foundation/Foundation.h>
 #import "dh_log_json.h"
 #import "dh_event.h"
+#import "dh_unwind.h"
 
 // 分类短名单一真相源 —— 顺序必须与 DHCategory 枚举一致。
 // 加分类只改这里(和 log_store.h 枚举 + dh_capture.h 的 DH_CAP_CAT_COUNT), 其余处(http byCat/
@@ -166,7 +167,13 @@ static NSData *bounded_blob(NSData *data, NSUInteger maxBytes, BOOL *truncated) 
 NSDictionary *dh_log_entry_detail_bounded(DHLogEntry *e, NSUInteger maxBlobBytes,
                                            BOOL includeDumps) {
     NSMutableDictionary *m = [dh_log_entry_summary(e) mutableCopy] ?: [NSMutableDictionary dictionary];
-    if (e.eventPayload) m[@"payload"] = DHExportPayload(e.eventPayload, maxBlobBytes);
+    NSDictionary *encodedStack=DHDecodeRawStack(e.callStack);
+    if (e.eventPayload || encodedStack) {
+        NSMutableDictionary *payload=[DHExportPayload(e.eventPayload?:@{},maxBlobBytes) mutableCopy];
+        if (!payload[@"stack"] && encodedStack) payload[@"stack"]=encodedStack;
+        if (payload[@"stack"]) payload[@"stack"]=DHResolveStack(payload[@"stack"],!e.restoredFromJournal && [e.eventContext[@"processGeneration"] isEqual:DHProcessGeneration()]);
+        m[@"payload"]=payload;
+    }
     if (e.key) {
         BOOL truncated = NO;
         NSData *data = bounded_blob(e.key, maxBlobBytes, &truncated);
@@ -202,7 +209,8 @@ NSDictionary *dh_log_entry_detail_bounded(DHLogEntry *e, NSUInteger maxBlobBytes
         if (truncated) m[@"outputTruncated"] = @YES;
     }
     if (e.publicKeyInfo) m[@"publicKeyInfo"] = e.publicKeyInfo;
-    if (e.callStack)     m[@"callStack"] = e.callStack;
+    if (m[@"payload"][@"stack"]) m[@"callStack"]=DHStackText(m[@"payload"][@"stack"]);
+    else if (e.callStack) m[@"callStack"]=e.callStack;
     if (e.category == DHCategoryNetwork && e.detail.length) {
         NSString *req = nil, *resp = nil, *err = nil;
         NSInteger st = 0;

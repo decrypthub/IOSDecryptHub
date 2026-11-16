@@ -6,6 +6,7 @@
 #import "dh_noise.h"
 #import "dh_log_json.h"
 #import "dh_event.h"
+#import "dh_unwind.h"
 #include "dh_call_context.h"
 #import <sys/sysctl.h>
 #import <sys/time.h>
@@ -1021,28 +1022,8 @@ NSString *DHUTF8FromData(NSData *d) {
 }
 
 NSString *DHCallStackFiltered(void) {
-    // 通用 post thunk 尚无完整 unwind 契约。嵌套的内置采集不穿过它强行回溯/符号化。
-    if (dh_call_parent()) return @"Full unwind omitted inside dynamic post frame; use parentCallId and payload.caller";
-    NSArray *symbols = [NSThread callStackSymbols];
-    NSMutableString *cs = [NSMutableString string];
-    NSArray *filterOut = @[
-        @"fishhook", @"decrypt_helper", @"DHLogStore",
-        @"CoreFoundation", @"libsystem", @"libdispatch",
-        @"UIKitCore", @"Foundation`",
-    ];
-    int kept = 0;
-    for (NSUInteger i = 0; i < symbols.count; i++) {
-        NSString *sym = symbols[i];
-        BOOL skip = NO;
-        for (NSString *bad in filterOut) {
-            if ([sym containsString:bad]) { skip = YES; break; }
-        }
-        if (skip) continue;
-        [cs appendFormat:@"  [%2d] %@\n", kept++, sym];
-        if (kept >= 20) break;
-    }
-    if (kept == 0) [cs appendString:@"  (无应用相关栈帧)\n"];
-    return cs;
+    // 保留旧调用接口；命中线程只展开/编码原始 PC/SP，符号化在读取线程完成。
+    int saved=errno;DHRawStack stack;dh_unwind_current(&stack);NSString *result=DHEncodeRawStack(&stack);errno=saved;return result;
 }
 
 NSString *DHTimestampNow(void) {

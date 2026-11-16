@@ -1,6 +1,6 @@
 # Hook、事件与 Trace 技术设计
 
-2026-11-16 实施校注：现有 `src/` 研发线 1.28.35 已使用显式报告的 Dobby / QBDI 后端，在 rootless / RootHide 完成 Inline、PAC 与纯函数 replay 验证。当前实现和限制见 [PROGRESS.md](PROGRESS.md) 与 [ROOTHIDE_NATIVE_BACKENDS.md](ROOTHIDE_NATIVE_BACKENDS.md)；下文仍是新版架构设计，ElleKit 适配器及全部统一注册表规划不因此视为完成。
+2026-11-16 实施校注：现有 `src/` 研发线 1.28.36 已在 rootless / RootHide 完成 Inline/PAC、真实调用现场 QBDI 和同步 native 栈展开验证。当前实现和限制见 [PROGRESS.md](PROGRESS.md)、[真实现场协议](LIVE_CONTEXT_TRACE.md) 与 [1.28.35 后端快照](ROOTHIDE_NATIVE_BACKENDS.md)；下文仍是新版架构设计，ElleKit 适配器及全部统一注册表规划不因此视为完成。
 
 2026-10-25。状态：技术设计，尚未实现。产品与运行拓扑以 [PRODUCT_ARCHITECTURE.md](./PRODUCT_ARCHITECTURE.md) 为准：daemon 位于手机，PC 可选。
 

@@ -22,12 +22,14 @@
 #include "dh_call_context.h"
 #include "dh_hook_selftest.h"
 #include "dh_health.h"
+#include "dh_unwind.h"
 #include "dh_noise.h"
 #include "dh_spoof.h"
 #include "dh_files.h"
 #include "dump_manager.h"
 #include "hook_webkit.h"
 #include "../trace/qbdi_trace.h"
+#include "../trace/qbdi_live.h"
 #include <string.h>
 #include <math.h>
 
@@ -1683,6 +1685,8 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
         @"processGeneration": DHProcessGeneration(), @"eventSchemaVersion": @2,
         @"hookABI": @{@"fixedGPRStackForwarding": @YES, @"maxStackBytes": @256, @"maxArguments": @32,
             @"CPostRequiresDeclaration": @YES, @"floatAggregatePost": @NO, @"exceptionUnwind": @NO},
+        @"stackUnwind":@{@"backend":dh_unwind_available()?@"system-libunwind":@"unavailable",@"maxFrames":@(DH_STACK_MAX),@"thunkCFI":@YES,@"symbolication":@"deferred",@"scope":@"synchronous-native-thread; metadata gaps and budgets reported"},
+        @"liveTrace":@{@"maxSessions":@8,@"maxInstructions":@8192,@"maxPage":@256,@"originalThreadAndStack":@YES,@"budgetAction":@"stop recording; continue original",@"normalReturnRequired":@YES},
         @"variant":        @(dh_variant_id(v)),
         @"variantLabel":   @(dh_variant_label(v)),
         @"arch":           @(dh_cpu_arch()),
@@ -1693,6 +1697,7 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
             @"unpack":        (bits & DH_CAPBIT_UNPACK)        ? @YES : @NO,   // 脱壳
             @"hook_inline":   @(inlineAvailable),
             @"trace_function": @(traceAvailable),
+            @"trace_live": @(DHLiveAvailable() && inlineAvailable), @"native_stack_unwind": @(dh_unwind_available()),
         },
         @"capabilityBits": @(bits),
         @"process":        [[DHLogStore shared] processInfo] ?: @{},
@@ -3371,7 +3376,7 @@ static NSArray *tool_definitions(void) {
         },
     ];
     NSMutableArray *tools = [NSMutableArray array];
-    NSSet *mutations = [NSSet setWithArray:@[@"hook_method", @"hook_inline", @"hook_import", @"unhook", @"trace_function", @"objc_call", @"run_hook_selftest"]];
+    NSSet *mutations = [NSSet setWithArray:@[@"hook_method", @"hook_inline", @"hook_import", @"unhook", @"trace_function", @"objc_call", @"run_hook_selftest", @"trace_live_arm", @"trace_live_cancel", @"run_live_selftest"]];
     for (NSDictionary *definition in base) {
         NSMutableDictionary *d = [definition mutableCopy];
         NSMutableDictionary *schema = [d[@"inputSchema"] mutableCopy];
@@ -3427,6 +3432,19 @@ static NSArray *tool_definitions(void) {
         @"inputSchema": @{@"type": @"object", @"required": @[@"process_generation"], @"properties": @{
             @"process_generation": @{@"type": @"string"}, @"include_c_import": @{@"type": @"boolean"},
             @"include_native_backends": @{@"type": @"boolean", @"description": @"Test linked Inline/QBDI using IDH-owned pure fixtures, including packed stack/PAC calls and QBDI instruction budget. Leaves a soft-stopped native patch until target restart."}}}}];
+    [tools addObjectsFromArray:@[
+        @{@"name":@"trace_live_arm",@"description":@"Arm one actual next invocation of an enabled Inline hook. Captures all GPR/SIMD/flags and executes the original once under QBDI on its original thread and App stack; no replay or pointer substitution. Requires known normal return; exceptions/longjmp are unsupported. Record budgets stop recording only; they never abort the App call. At most eight retained sessions until restart.",
+          @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"slot",@"normal_return"],@"properties":@{
+            @"process_generation":@{@"type":@"string"},@"slot":@{@"type":@"integer",@"minimum":@0,@"maximum":@255},
+            @"normal_return":@{@"type":@"boolean"},@"max_insns":@{@"type":@"integer",@"minimum":@1,@"maximum":@8192},
+            @"max_ms":@{@"type":@"integer",@"minimum":@1,@"maximum":@10000},@"thread_id":@{@"type":@"string"}}}},
+        @{@"name":@"trace_live_read",@"description":@"Read pending/completed actual-call trace and bounded instruction pages, entry/exit CPU, original stack bytes, synchronous unwind and recording truncation. Does not execute the target. Native execution outside the target module is counted as opaque transfers.",
+          @"inputSchema":@{@"type":@"object",@"required":@[@"trace_id"],@"properties":@{@"trace_id":@{@"type":@"string"},@"offset":@{@"type":@"integer",@"minimum":@0},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@256}}}},
+        @{@"name":@"trace_live_cancel",@"description":@"Cancel an armed capture before a real call claims it. Never cancels an executing App function. Inline patch remains until target restart.",
+          @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"trace_id"],@"properties":@{@"process_generation":@{@"type":@"string"},@"trace_id":@{@"type":@"string"}}}},
+        @{@"name":@"run_live_selftest",@"description":@"Explicit IDH-owned live-call, exactly-once side effect, packed stack, SIMD, scratch registers, recording budget and unwind fixture tests. No business signing oracle. Restart target afterward.",
+          @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
+    ]];
     return tools;
 }
 
@@ -3530,11 +3548,36 @@ static NSDictionary *tool_set_webkit_probe(NSDictionary *args) {
 }
 
 static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
-    if ([@[@"hook_method", @"hook_inline", @"hook_import", @"unhook", @"trace_function", @"objc_call", @"run_hook_selftest"] containsObject:name]) {
+    if ([@[@"hook_method", @"hook_inline", @"hook_import", @"unhook", @"trace_function", @"objc_call", @"run_hook_selftest", @"trace_live_arm", @"trace_live_cancel", @"run_live_selftest"] containsObject:name]) {
         NSString *generation = args[@"process_generation"];
         if (![generation isKindOfClass:NSString.class] || ![generation isEqualToString:DHProcessGeneration()])
             return tool_err(@"missing or stale process_generation; fetch get_capabilities and re-resolve the target before mutation");
     }
+    if ([name isEqualToString:@"trace_live_arm"]) {
+        id normal=args[@"normal_return"];
+        if (![normal isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)normal)!=CFBooleanGetTypeID() || ![normal boolValue])
+            return tool_err(@"normal_return:true must explicitly assert a known normally returning target");
+        for (NSString *key in @[@"slot",@"max_insns",@"max_ms"])
+            if (args[key] && (![args[key] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)args[key])==CFBooleanGetTypeID() || !isfinite([args[key] doubleValue]) || [args[key] doubleValue]!=floor([args[key] doubleValue])))
+                return tool_err(@"slot and budgets must be finite integers");
+        if ([args[@"slot"] doubleValue]<0 || [args[@"slot"] doubleValue]>255 ||
+            (args[@"max_insns"] && ([args[@"max_insns"] doubleValue]<1 || [args[@"max_insns"] doubleValue]>8192)) ||
+            (args[@"max_ms"] && ([args[@"max_ms"] doubleValue]<1 || [args[@"max_ms"] doubleValue]>10000))) return tool_err(@"slot or live budget out of range");
+        NSInteger slot=[args[@"slot"] integerValue];uint64_t target=0,original=0,thread=0;
+        if (!args[@"slot"] || !dh_thunk_live_target((int)slot,&target,&original)) return tool_err(@"slot must be an enabled Inline hook in this process");
+        if (args[@"thread_id"] && (![args[@"thread_id"] isKindOfClass:NSString.class] || !dh_parse_addr_arg(args[@"thread_id"],&thread))) return tool_err(@"invalid thread_id");
+        NSDictionary *r=DHLiveArm((int)slot,target,original,args[@"max_insns"]?[args[@"max_insns"] unsignedIntValue]:4096,args[@"max_ms"]?[args[@"max_ms"] unsignedIntValue]:5000,thread);
+        return [r[@"ok"] boolValue]?tool_ok(r):tool_err(r[@"error"]);
+    }
+    if ([name isEqualToString:@"trace_live_read"] || [name isEqualToString:@"trace_live_cancel"]) {
+        if (![args[@"trace_id"] isKindOfClass:NSString.class]) return tool_err(@"trace_id must be a string");
+        for (NSString *key in @[@"offset",@"limit"])
+            if (args[key] && (![args[key] isKindOfClass:NSNumber.class] || !isfinite([args[key] doubleValue]) || [args[key] doubleValue]!=floor([args[key] doubleValue]) || CFGetTypeID((__bridge CFTypeRef)args[key])==CFBooleanGetTypeID() || [args[key] doubleValue]<0 || [args[key] doubleValue]>8192)) return tool_err(@"invalid page bounds");
+        if (args[@"limit"] && ([args[@"limit"] integerValue]<1 || [args[@"limit"] integerValue]>256)) return tool_err(@"limit must be 1..256");
+        NSDictionary *r=[name isEqualToString:@"trace_live_cancel"]?DHLiveCancel(args[@"trace_id"]):DHLiveRead(args[@"trace_id"],[args[@"offset"] unsignedIntValue],args[@"limit"]?[args[@"limit"] unsignedIntValue]:64);
+        return [r[@"ok"] boolValue]?tool_ok(r):tool_err(r[@"error"]);
+    }
+    if ([name isEqualToString:@"run_live_selftest"]) return tool_ok(DHLiveBackendSelfTest());
     if ([name isEqualToString:@"get_call"]) return tool_get_call(args);
     if ([name isEqualToString:@"run_hook_selftest"]) {
         id flag = args[@"include_c_import"];
@@ -3627,7 +3670,7 @@ static BOOL tool_is_heavy(NSString *name) {
                                       @"find_selector_refs", @"find_function_refs",
                                       @"analyze_function", @"disassemble_function",
                                       @"find_objc_methods", @"export_events", @"start_dump",
-                                      @"trace_function", @"run_hook_selftest"]];
+                                      @"trace_function", @"run_hook_selftest", @"run_live_selftest", @"trace_live_arm", @"trace_live_cancel"]];
     });
     return [heavy containsObject:name];
 }

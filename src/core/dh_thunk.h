@@ -27,6 +27,7 @@ extern "C" {
 int dh_thunk_inline_available(void);
 // 软停仍保留 Inline 补丁；Trace 原始目标前必须重启清除。
 int dh_thunk_is_inline_patched(uint64_t address);
+int dh_thunk_live_target(int slot,uint64_t *target,uint64_t *original);
 
 #define DH_THUNK_COUNT 256   // thunk 槽位总数 (单调分配; 软停不回收, 硬停后退休)
 

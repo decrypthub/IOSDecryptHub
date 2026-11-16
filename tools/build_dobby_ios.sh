@@ -18,6 +18,8 @@ git -C "$SRC" apply --check "$REPO/tools/patches/dobby-publish-original-before-p
 git -C "$SRC" apply "$REPO/tools/patches/dobby-publish-original-before-patch.patch"
 git -C "$SRC" apply --check "$REPO/tools/patches/dobby-quiescent-code-patch.patch"
 git -C "$SRC" apply "$REPO/tools/patches/dobby-quiescent-code-patch.patch"
+git -C "$SRC" apply --check "$REPO/tools/patches/dobby-context-entry.patch"
+git -C "$SRC" apply "$REPO/tools/patches/dobby-context-entry.patch"
 mkdir -p "$REPO/vendor/dobby/lib" "$REPO/vendor/dobby/include"
 for ARCH in arm64 arm64e; do
 BUILD="$RUN/build-$ARCH"

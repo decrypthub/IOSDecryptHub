@@ -21,6 +21,7 @@
 | `returnValue` | 是否请求、是否存在合法返回值、声明类型与可用数值；void 不解释成对象 |
 | `memory` | 阶段、来源寄存器、请求/实际长度、hex、截断和 captured/unreadable/empty/deferred 状态 |
 | `caller` | 命中时直接调用者 LR 与原调用者 SP |
+| `stack` | 1.28.36 起，最多 256 帧同步 native PC/SP、complete/truncated/error；读取时才解析当前代 UUID/RVA 和最近符号 |
 | `abi` | 签名来源、参数映射、栈转发范围及不支持的能力 |
 
 `capture_after` 在入口只标 deferred、不读取输出区，leave 才按入口指针采集。长度寄存器为 0 表示空数据。`capture_multi` 是入口窗口，`capture_ret_multi` 仅允许返回 x0/x1；两者不能混作原始函数参数。
@@ -63,4 +64,4 @@ Import 安装前解析可执行符号，缺失/数据符号不注册 fishhook；
 - MCP：`python tests/hook_mcp_test.py --endpoint http://<authorized-device>:8088 --call-id <retained-nested-call>`。
 - 复杂方法拒绝：`python tests/method_hook_guard_test.py --endpoint http://<authorized-device>:8088 --class-name IDHABIProbe --selector floating:`。
 
-1.28.35 起，RootHide 整包已链接真实 arm64 / arm64e Inline/QBDI 并经双机验证；操作前仍须用 get_capabilities 核对实际进程。动态跳板报告 callStackMode:direct-caller-only，以直接 LR/SP 和同步 callId 关联代替完整栈展开。原生后端自检、复制输入的 replay 与限制见 [RootHide 后端](ROOTHIDE_NATIVE_BACKENDS.md)。结构化 ObjC/Import 事件与调用关联不依赖这两个后端。
+1.28.36 起，动态跳板报告 `callStackMode:libunwind-context-CFI; deferred-symbolication`，加入同步 native 栈展开；默认密码/网络事件也保存原始栈，读取时再解析。旧代/恢复事件标记 `unavailable-for-old-generation`，不使用新进程 ASLR。缺元数据、优化掉的逻辑帧、异步因果链不补造；完整性须逐条看状态。新的 `trace_live_arm/read/cancel` 与 `run_live_selftest` 及其进程代要求见 [真实现场协议](LIVE_CONTEXT_TRACE.md)。1.28.35 原生后端和复制输入 replay 的历史验证见 [RootHide 后端](ROOTHIDE_NATIVE_BACKENDS.md)。
