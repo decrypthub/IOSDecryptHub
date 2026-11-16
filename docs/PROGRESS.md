@@ -1,5 +1,18 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.40 RootHide sig3 调度入口与因果链（研发包）
+
+- 先核对真实执行栈、App UUID/RVA、提交 stub/GOT 和运行时入口：普通网络分支经过已有 dispatch_async；额外延迟分支为公开 dispatch_block_create(0, block) → dispatch_after，队列是 com.kuaishou.statistics.serialQueue。旧宽泛排除条件会挡住目标队列；另一窗口的 256 条预算约 286ms 即被日志耗尽，签名在约 3.2s 后才执行。不能据“无 TaskID”断言缺少某种私有调度器。
+- 新 root_queue_include 只筛选没有 async parent 的根，保留换队列后代；queue_exclude 继续对每次提交生效。新增窗口开始/截止、停止原因、筛选计数、callback UUID/RVA 和公开 block 创建 caller 身份，关闭后保留最近窗口诊断，预算没有扩大。
+- 六个提交导入另加两个公开 block 构造器。捕获窗口内创建的 App block 在内层执行回调携带身份，提交仍传 libdispatch 原外层对象，保留 flags/QoS/取消/等待。校准 direct/async invoker 的真实 metadata 范围；执行前重用、入队后直接调用及释放但未观察到开始均不猜执行边，任务可标 unresolved，不能当 completed/aborted。创建绑定同样有每窗口/进程上限，不访问 libdispatch 私有布局。
+- Mac 17 组状态/GCD 运行时测试、原汇编/ABI/unwind、iOS 编译、更新策略和两种完整包构建通过。1.28.40 整包已刷入两台授权设备，scope 保留；两台 17 组自检、扩展 MCP 参数/所有权/状态验证及原 Inline/PAC/ABI/live 回归通过。现有完整包 CI 门禁保持不变。
+- 最终包首轮快手实测：RootHide 10 条普通网络链 + 1 条统计延迟链，Rootless 9 + 1。延迟链保留四级真实 TaskID：统计队列根 → 统计队列调度 → 特殊 block 的 dispatch_after → HTTP 队列签名/请求；完整同步调用树、原 callback 在实际 native 栈中、相同/后代 TaskID 与 HTTP sig3 精确匹配均核对，不按线程或时间猜父任务。
+- RootHide 在第二个全新进程代重新安装临时探针并复测，统计延迟四级链再次精确匹配 HTTP；新 ASLR 下按本代 UUID/RVA 和 TaskID 取证，未复用旧绝对地址。该窗口另有 2 条 unresolved 和 1 条仍 pending，均未捏造执行或完成。
+- 首轮 RootHide 46 棵同步树 / 690 个配对调用，Rootless 54 / 810；各树的核心 15 参数 ABI 与返回值/HTTP 一致，独立 HMAC、白盒块、CRC 验证分别为 46/138/46 与 54/162/54。两台另各完成真实 SDK CRC live 2489 指令、独立 zlib 一致；同步栈 RootHide 81、Rootless 89 帧，完整且 error 0。
+- 统计窗口每台有 1 条提交未观察到执行，明确 unresolved；RootHide 普通窗口另有 230 次其他边界展开证据不足，按既有规则抑制不确定关联，未生成业务 aborted。已验证链逐条满足 contextComplete 和真实 callback 栈证据。RunLoop 定时器、未选中的根、窗口前/预算后调用继续单独报告，不称作所有请求的完整异步图。
+
+未发布 Release/APT。当前协议和准确边界见 [状态保护/GCD](FLOW_STATE_AND_GCD.md)。
+
 ## 2026-11-16：1.28.37 非局部退出状态保护与有界 GCD（研发包）
 
 - 普通 post 登记有界保护记录，正常返回之外，在后续边界用 owned bridge/CFA 栈证据清理退出的调用、同步父上下文和 inFlight；已有 entry 的调用标 aborted，不伪造 leave。线程结束由独立 pthread-key 快照收尾，避免依赖可能已被清理的编译器 TLS。

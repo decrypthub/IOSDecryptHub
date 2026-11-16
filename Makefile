@@ -18,7 +18,7 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.37
+VERSION := 1.28.40
 TARGET  := decrypt_helper.dylib
 .DEFAULT_GOAL := all
 .PHONY: test-hook-runtime test-hook-ios-build test-unwind-runtime test-flow-runtime

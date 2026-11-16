@@ -10,6 +10,7 @@
 extern void DHFlowThrowCXX(void);
 extern int DHFlowCatchCXX(void (*body)(void *),void *context);
 static __thread jmp_buf *jumpTarget;
+static void require(BOOL good,NSString *message);
 @interface IDHFlowProbe:NSObject
 @property(strong) NSException *marker;
 @property(strong) NSMutableArray *observations;
@@ -50,6 +51,29 @@ static void function_body(void *p) {IDHFlowProbe *probe=CFBridgingRelease(p);[pr
     dispatch_group_t group=self.group;dispatch_queue_t queue=self.queue;
     if(self.mode==1) {dispatch_group_enter(group);dispatch_after(dispatch_time(DISPATCH_TIME_NOW,50000000),queue,^{[self normal:9];dispatch_group_leave(group);});return 1;}
     if(self.mode==2) {self.special=dispatch_block_create(DISPATCH_BLOCK_BARRIER,^{[self normal:99];});dispatch_block_cancel(self.special);dispatch_async(queue,self.special);return 0;}
+    if(self.mode==3) {
+        dispatch_group_enter(group);dispatch_async(queue,^{
+            // A live parent must propagate even when new roots no longer match.
+            DHFlowConfigure(YES,NO,8,10000,nil,@[@"nonmatching-root"]);
+            dispatch_group_enter(group);dispatch_async(queue,^{[self normal:23];dispatch_group_leave(group);});dispatch_group_leave(group);
+        });return 0;
+    }
+    if(self.mode==4) {
+        dispatch_group_enter(group);dispatch_block_t block=dispatch_block_create(DISPATCH_BLOCK_BARRIER,^{[self normal:31];dispatch_group_leave(group);});
+        dispatch_async(queue,block);require(dispatch_block_wait(block,dispatch_time(DISPATCH_TIME_NOW,5000000000))==0,@"created block wait changed");
+        dispatch_group_enter(group);dispatch_block_t qos=dispatch_block_create_with_qos_class(0,QOS_CLASS_UTILITY,0,^{[self normal:32];dispatch_group_leave(group);});
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,1000000),queue,qos);require(dispatch_block_wait(qos,dispatch_time(DISPATCH_TIME_NOW,5000000000))==0,@"QoS block wait changed");return 0;
+    }
+    if(self.mode==5) {
+        dispatch_suspend(queue);dispatch_group_enter(group);dispatch_group_enter(group);
+        dispatch_block_t block=dispatch_block_create(0,^{[self normal:33];dispatch_group_leave(group);});
+        dispatch_async(queue,block);dispatch_async(queue,block);dispatch_resume(queue);return 0;
+    }
+    if(self.mode==6) {
+        dispatch_suspend(queue);dispatch_group_enter(group);dispatch_group_enter(group);
+        dispatch_block_t block=dispatch_block_create(0,^{[self normal:34];dispatch_group_leave(group);});
+        dispatch_async(queue,block);block();dispatch_resume(queue);return 0;
+    }
     dispatch_group_enter(group);dispatch_async(queue,^{
         [self normal:1];dispatch_group_enter(group);dispatch_async(queue,^{[self normal:2];dispatch_group_leave(group);});dispatch_group_leave(group);
     });
@@ -93,25 +117,51 @@ NSDictionary *DHFlowSelfTest(void) {
         require([probe unverified]==2,@"incomplete unwind did not suppress uncertain links");[passed addObject:@"incomplete-unwind-suppresses-links-without-false-abort"];
         pthread_t worker;require(pthread_create(&worker,NULL,exit_body,(__bridge void *)probe)==0,@"thread fixture creation failed");pthread_join(worker,NULL);
         require([DHFlowState()[@"abandonedCalls"] unsignedLongLongValue]==initial+5,@"thread exit did not retire owned bridge");[passed addObject:@"thread-exit-retires-inflight-state"];
-        NSDictionary *configured=DHFlowConfigure(YES,NO,64,10000,nil);require([configured[@"ok"] boolValue],configured[@"error"]);
+        NSDictionary *configured=DHFlowConfigure(YES,NO,64,10000,nil,nil);require([configured[@"ok"] boolValue],configured[@"error"]);
         unsigned first=[DHFlowState()[@"retained"] unsignedIntValue];[probe.observations removeAllObjects];[probe schedule];drain(probe);
         NSDictionary *read=DHFlowRead(first,64,0);NSArray *tasks=read[@"tasks"];require(tasks.count==7,@"six APIs plus nested async not captured");
         BOOL nested=NO,cross=NO;for(NSDictionary *t in tasks) {require([t[@"state"] isEqual:@"completed"],@"task not complete");nested|=[t[@"asyncParentTaskId"] length]>0;cross|=![t[@"submissionThreadId"] isEqual:t[@"executionThreadId"]];}
         require(nested && cross && probe.observations.count==7,@"missing nested/cross-thread/exactly-once observations");
         for(NSDictionary *o in probe.observations)require([o[@"asyncTaskId"] length]>0,@"worker lost captured context");
+        for(NSDictionary *t in tasks)require([t[@"callbackIdentity"][@"imageUUID"] length]>0 && [t[@"callbackPC"] length]>0,@"callback identity unavailable");
         [passed addObject:@"six-GCD-imports-nested-edges-and-cross-thread-context"];result[@"tasks"]=tasks;
-        unsigned before=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,2,10000,nil);[probe.observations removeAllObjects];[probe schedule];drain(probe);
+        unsigned filteredBefore=[DHFlowState()[@"retained"] unsignedIntValue];NSUInteger observedBefore=probe.observations.count;
+        DHFlowConfigure(YES,NO,8,10000,nil,@[@"nonmatching-root"]);[probe schedule];drain(probe);
+        require([DHFlowState()[@"retained"] unsignedIntValue]==filteredBefore && probe.observations.count==observedBefore+7,@"root filter changed original callbacks or accepted unmatched roots");
+        require([DHFlowState()[@"rootQueueMisses"] unsignedLongLongValue]>0,@"root filter missing diagnostic count");[passed addObject:@"root-queue-filter-forwards-unmatched-work"];
+        DHFlowConfigure(YES,NO,8,10000,nil,@[@"FLOW.FIXTURE"]);probe.mode=3;[probe schedule];drain(probe);probe.mode=0;
+        require([DHFlowState()[@"retained"] unsignedIntValue]==filteredBefore+2,@"selected descendant was filtered after changing queues policy");
+        NSDictionary *child=[DHFlowRead(filteredBefore+1,1,0)[@"tasks"] firstObject];require([child[@"asyncParentTaskId"] length]>0,@"selected descendant lost parent identity");
+        [passed addObject:@"root-queue-filter-is-case-insensitive-and-keeps-descendants"];
+        unsigned specialBefore=[DHFlowState()[@"retained"] unsignedIntValue];[probe.observations removeAllObjects];DHFlowConfigure(YES,NO,16,10000,nil,nil);probe.mode=4;[probe schedule];drain(probe);
+        NSArray *specialTasks=DHFlowRead(specialBefore,16,0)[@"tasks"];require(specialTasks.count==2 && probe.observations.count==2,@"public block constructors lost or duplicated callbacks");
+        for(NSDictionary *t in specialTasks)require([t[@"state"] isEqual:@"completed"] && [t[@"dispatchBlockMetadataPreserved"] boolValue] && [t[@"blockCreationCallerIdentity"][@"imageUUID"] length]>0,@"public block creation/submission identity missing");
+        for(NSDictionary *o in probe.observations)require([o[@"asyncTaskId"] length]>0,@"public created-block inner body lost task");
+        [passed addObject:@"public-block-constructors-preserve-outer-wait-QoS-and-inner-context"];
+        specialBefore=[DHFlowState()[@"retained"] unsignedIntValue];[probe.observations removeAllObjects];DHFlowConfigure(YES,NO,16,10000,nil,nil);probe.mode=5;[probe schedule];drain(probe);probe.mode=0;
+        specialTasks=DHFlowRead(specialBefore,16,0)[@"tasks"];require(specialTasks.count==1 && probe.observations.count==2,@"reused block changed original execution count");
+        NSDictionary *ambiguous=specialTasks.firstObject;require([ambiguous[@"state"] isEqual:@"unresolved"] && [ambiguous[@"startedNs"] isEqual:@"0"] && [ambiguous[@"terminalReason"] isEqual:@"block-reused-before-observed-start"],@"ambiguous repeated submission invented an execution edge");
+        for(NSDictionary *o in probe.observations)require(![o[@"asyncTaskId"] length],@"ambiguous reused block retained an association");
+        [passed addObject:@"reused-before-start-forwards-twice-without-guessed-execution-edge"];
+        specialBefore=[DHFlowState()[@"retained"] unsignedIntValue];[probe.observations removeAllObjects];DHFlowConfigure(YES,NO,16,10000,nil,nil);probe.mode=6;[probe schedule];drain(probe);probe.mode=0;
+        specialTasks=DHFlowRead(specialBefore,16,0)[@"tasks"];require(specialTasks.count==1 && probe.observations.count==2,@"direct-plus-queued block changed original execution count");
+        ambiguous=specialTasks.firstObject;require([ambiguous[@"state"] isEqual:@"unresolved"] && [ambiguous[@"startedNs"] isEqual:@"0"] && [ambiguous[@"terminalReason"] isEqual:@"block-executed-outside-calibrated-async-invoker"],@"direct block call falsely claimed queued submission");
+        for(NSDictionary *o in probe.observations)require(![o[@"asyncTaskId"] length],@"direct block invocation invented an async edge");
+        [passed addObject:@"direct-call-after-enqueue-is-not-an-async-execution"];
+        unsigned before=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,2,10000,nil,nil);[probe.observations removeAllObjects];[probe schedule];drain(probe);
         require([DHFlowState()[@"retained"] unsignedIntValue]==before+2 && probe.observations.count==7,@"budget changed original callback execution");[passed addObject:@"task-budget-forwards-all-original-callbacks-once"];
-        before=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,2,1,nil);usleep(3000);[probe schedule];drain(probe);
+        require([DHFlowState()[@"windowStopReason"] isEqual:@"task-budget"],@"task budget stop reason unavailable");
+        before=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,2,1,nil,nil);usleep(3000);[probe schedule];drain(probe);
         require([DHFlowState()[@"retained"] unsignedIntValue]==before,@"expired window captured a new task");[passed addObject:@"expired-window-forwards-without-new-capture"];
-        DHFlowConfigure(YES,NO,2,10000,nil);probe.mode=1;[probe schedule];DHFlowConfigure(NO,NO,2,10000,nil);drain(probe);
+        require([DHFlowState()[@"windowStopReason"] isEqual:@"expired"],@"expired stop reason unavailable");
+        DHFlowConfigure(YES,NO,2,10000,nil,nil);probe.mode=1;[probe schedule];DHFlowConfigure(NO,NO,2,10000,nil,nil);drain(probe);
         require([probe normal:4]==5 && dh_call_async()==0 && dh_call_parent()==0,@"unrelated worker/caller context leaked");[passed addObject:@"disable-keeps-pending-task-and-does-not-leak-context"];
-        before=[DHFlowState()[@"retained"] unsignedIntValue];NSUInteger observed=probe.observations.count;DHFlowConfigure(YES,NO,8,10000,nil);probe.mode=2;[probe schedule];
+        before=[DHFlowState()[@"retained"] unsignedIntValue];NSUInteger observed=probe.observations.count;DHFlowConfigure(YES,NO,8,10000,nil,nil);probe.mode=2;[probe schedule];
         require(dispatch_block_wait(probe.special,dispatch_time(DISPATCH_TIME_NOW,5000000000))==0,@"special block wait/cancel semantics changed");
         require(probe.observations.count==observed && [DHFlowState()[@"retained"] unsignedIntValue]==before,@"cancelled dispatch block was wrapped or executed");[passed addObject:@"special-dispatch-block-cancel-wait-is-forwarded-unchanged"];
         for(NSNumber *slot in slots)require([dh_thunk_metadata(slot.intValue)[@"inFlight"] longLongValue]==0,@"owned inflight counter leaked");
         require([DHFlowState()[@"threadGuardCount"] intValue]==0,@"thread guard stack leaked");result[@"pass"]=@YES;
     }@catch(NSException *e) {result[@"error"]=e.reason?:@"flow fixture failed";}
-    @finally {jumpTarget=NULL;[DHLogStore shared].paused=NO;DHFlowConfigure(NO,NO,1,1,nil);for(NSNumber *slot in slots)dh_thunk_disable(slot.intValue);}
+    @finally {jumpTarget=NULL;[DHLogStore shared].paused=NO;DHFlowConfigure(NO,NO,1,1,nil,nil);for(NSNumber *slot in slots)dh_thunk_disable(slot.intValue);}
     result[@"passed"]=passed;result[@"slots"]=slots;result[@"state"]=DHFlowState();return result;
 }

@@ -12,7 +12,7 @@ int DHFlowOwnsImport(const char *symbol);
 #ifdef __OBJC__
 #import <Foundation/Foundation.h>
 NSDictionary *DHFlowFields(uint64_t task);
-NSDictionary *DHFlowConfigure(BOOL enabled,BOOL roots,unsigned budget,unsigned milliseconds,NSArray *excludedQueues);
+NSDictionary *DHFlowConfigure(BOOL enabled,BOOL roots,unsigned budget,unsigned milliseconds,NSArray *excludedQueues,NSArray *rootQueues);
 NSDictionary *DHFlowRead(unsigned offset,unsigned limit,uint64_t task);
 NSDictionary *DHFlowState(void);
 NSDictionary *DHFlowSelfTest(void);

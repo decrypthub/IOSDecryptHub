@@ -1,4 +1,4 @@
-# 1.28.37：非局部退出状态保护与有界 GCD 关联
+# 1.28.40：非局部退出状态保护与有界 GCD 关联
 
 本轮扩展现有 Agent 的调用状态与因果关系。真实 CPU 跟踪继续遵守 [LIVE_CONTEXT_TRACE.md](LIVE_CONTEXT_TRACE.md) 的正常返回约束；这里不增加 QBDI 内异常/longjmp 的透明执行支持。
 
@@ -22,13 +22,15 @@
 {"process_generation":"<current-generation>","enabled":true,"capture_roots":true,"max_tasks":128,"max_ms":30000}
 ```
 
-覆盖当前及未来镜像中六种公开导入：`dispatch_async`、`dispatch_after`、`dispatch_group_async` 及其 `_f` 版本。fishhook 注册成功只说明注册完成，实际覆盖须看任务记录和命中，不能保证每个导入写入或所有调度路径。
+覆盖当前及未来镜像中六种公开提交导入：`dispatch_async`、`dispatch_after`、`dispatch_group_async` 及其 `_f` 版本。fishhook 注册成功只说明注册完成，实际覆盖须看任务记录和命中，不能保证每个导入写入或所有调度路径。
 
 - 已观测同步调用或异步任务中提交的工作继承来源。`capture_roots:true` 另允许 `.app/` 镜像直接提交的工作成为根；关闭时只传播已有观测上下文。
 - 可选 queue_exclude 为最多 8 个非空、无 NUL、127 UTF8 字节以内的队列名子串，忽略大小写匹配；被排除的提交继续原样执行。IDH 自身提交不参与真实业务捕获，自有 fixture 使用明确的测试队列。避免日志/页面初始化任务先耗尽分析预算。
-- block 版本只包装 App/IDH 镜像中的普通 invoke。启动时用公开 dispatch_block_create 校准特殊 invoke，特殊 dispatch-block 和未知/系统 invoke 原样转发，不替换其 identity、QoS、取消/等待元数据。它们计入 skippedSpecialOrUnknownBlocks，不生成猜测的执行边。
+- `root_queue_include` 与 queue_exclude 使用同样的字符串约束和大小写规则；空列表不筛选。它只选择没有 async parent 的任务（包括有同步 call 来源的根），已选中任务的后代可以换队列；queue_exclude 仍对每一次提交优先生效。rootQueueMisses/queueExclusions 分别计数，不消耗任务记录。
+- 普通 block 包装 App/IDH 镜像中的 invoke。另保留 `dispatch_block_create` 与 `dispatch_block_create_with_qos_class` 两个公开创建入口：仅为捕获窗口内创建、内层 invoke 可识别的 block 建立有界绑定；公开构造器仍生成原有外层 dispatch-block，提交时传递该外层对象，保留 flags、QoS、取消/等待语义，执行时由内层回调携带已观察的提交身份。只关联唯一观察到的首次提交；首次安装用公开构造器和队列分别校准 direct/async 回调，只有调用者位于已校准 async invoker 的 metadata 范围才承认执行。提交后直接调用同一 block 不会抢占排队任务身份。不会读取 libdispatch 私有 block 数据布局。
+- 窗口前创建的特殊 block、未知/系统 invoke 仍原样转发并计 skippedSpecialOrUnknownBlocks。创建绑定最多每进程 1024 个、每窗口不超过本窗口任务预算，关闭或过期后不继续创建。重复提交或未经过提交入口的直接执行不能猜测执行边：若首次任务尚未开始，它变为 unresolved，executionThreadId/startedNs 仍为 0；block 最后释放且未观察到开始时同样记录 unresolved。正常原回调继续执行，不把缺失关联记成 App 异常、取消成功或正常完成。
 - `_f` 版本保留原 context/function，由固定记录保存并恰好调用原 callback 一次。queue、group、deadline 原样传递。首次安装提前解析固定转发符号；不承诺保留第三方逐镜像 interposer 链。
-- 安装时预留这六个导入的所有权，已有动态 Import Hook 时拒绝启用；安装后拒绝用动态 Import 再覆盖它们。软停仅停止新捕获，转发 patch 保留到目标重启。
+- 安装时预留这八个导入的所有权，已有动态 Import Hook 时拒绝启用；安装后拒绝用动态 Import 再覆盖它们。软停仅停止新捕获，转发 patch 保留到目标重启。
 
 每个任务分配当前代唯一 `asyncTaskId`，记录 `asyncParentTaskId`、`asyncSubmittedByCallId`、提交/执行 TID、queue、API 和时间。执行前安装任务上下文，正常返回或受支持的异常退出后恢复原上下文；保留任务也用真实包装帧的 unwind 范围、SP 与栈 cookie 核对有效性。GCD 可能复用线程，不能用 TID 或时间邻近推断父任务。
 
@@ -42,8 +44,8 @@
 
 ## 查询和历史
 
-- `get_flow_state`：预算、保留数、pending/running、abandonedCalls、unverifiedBoundaries、guardOverflows 和跳过/拒绝计数。threadGuardCount/threadAsyncTaskId 仅指处理命令的线程，不代表任意 App 线程。
-- `get_async_tasks`：offset/limit 分页，最大 128；可传完整 task_id 查询本代某任务。无对应记录时 unknownTask:true。任务记录包含真实来源边、提交 caller 身份和有界原始提交栈。
+- `get_flow_state`：预算、保留数、pending/running、abandonedCalls、unverifiedBoundaries、guardOverflows 和跳过/拒绝计数；windowStartedNs/windowDeadlineNs 和 windowStopReason 区分 capturing、task-budget、record-capacity、expired、disabled，关闭保留最近窗口诊断。threadGuardCount/threadAsyncTaskId 仅指处理命令的线程，不代表任意 App 线程。
+- `get_async_tasks`：offset/limit 分页，最大 128；可传完整 task_id 查询本代某任务。无对应记录时 unknownTask:true。任务记录包含真实来源边、提交 caller 和 callback 的 UUID/RVA、有界原始提交栈；公开创建的特殊 block 另含 blockCreationCallerIdentity 与 dispatchBlockMetadataPreserved。unresolved 表示提交已观察但执行关联不可用，不能算 completed/aborted。
 - `query_events.async_task_id`：精确查事件上下文；get_event/get_call 获取详情。submit/start/complete/aborted 任务事件与普通事件一样受存储预算和淘汰限制。
 - 任务表在当前 Agent RAM；重启后旧 task_id 不用于新进程查询。journal 中已保留的事件仍携带采集时的进程代和异步 ID，不能将新代任务表当成旧表。完整历史因果图取决于实际保留的事件，不补缺失边。
 
@@ -53,8 +55,12 @@
 
 `make test-flow-runtime` 在独立临时日志目录运行真实汇编与运行时测试；既有 hook/unwind/iOS 编译、updater 和两种完整 deb 检查继续执行。Makefile 按文件扩展名选择 C/ObjC/ObjC++，避免全局 -ObjC 将 C++ fixture 错当 ObjC；验收断言没有放宽。
 
-实机先恢复 all/other，再调用 `run_flow_selftest`。12 组自有 fixture 覆盖 ObjC/C++ 异常原样传播、longjmp 值、内部捕获不误退、暂停时的状态、缺失展开证据、线程退出、六类 GCD/嵌套跨线程任务、任务/时间预算、关闭后的待执行任务和特殊 block 取消/等待。完成后重启目标清理临时 Hook 和转发 patch。
+实机先恢复 all/other，再调用 `run_flow_selftest`。17 组自有 fixture 覆盖 ObjC/C++ 异常原样传播、longjmp 值、内部捕获不误退、暂停时的状态、缺失展开证据、线程退出、六类 GCD/嵌套跨线程任务、任务/时间预算、关闭后的待执行任务、特殊 block 取消/等待、根队列筛选及后代传播、两个公开 block 构造器、重复提交歧义和入队后直接调用不冒充异步执行。完成后重启目标清理临时 Hook 和转发 patch。
 
 接口回归：`python tests/flow_mcp_test.py --endpoint http://<authorized-device>:8088 --aborted-call-id <retained-owned-fixture-call>`。旧 P0/native/live/ABI 拒绝回归继续使用各自自有 fixture，业务请求由正常 UI 产生。设备验证和实际覆盖以 [PROGRESS.md](PROGRESS.md) 为准。
 
 设计参考：[Apple GCD 队列](https://developer.apple.com/library/archive/documentation/General/Conceptual/ConcurrencyProgrammingGuide/OperationQueues/OperationQueues.html)、[Apple dispatch-block 实现](https://github.com/apple-oss-distributions/libdispatch/blob/main/src/block.cpp)。
+
+## 定向分析窗口
+
+先记录真实队列、提交 caller 和 callback 身份，再选择根队列并排除已观察到的日志洪泛。不要用 `com.k` 等宽泛子串排除整个 App 的网络队列。先开启窗口再触发业务，按 windowStartedNs 与实际任务时间筛选样本；预算结束后发生的普通调用、窗口前已提交的工作及 RunLoop 同步回调分别报告。关联成功要求：完整保留祖先 TaskID 边、执行现场/同步 callId 配对，以及函数返回值与该任务或后代任务下 HTTP 字段的精确匹配；不得用 TID 或时间接近替代。

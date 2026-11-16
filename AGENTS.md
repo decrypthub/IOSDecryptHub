@@ -50,6 +50,8 @@ Always respond in Chinese-simplified.
 
 ## 当前验证状态（2026-11-16）
 
+2026-11-17 后续：1.28.40 已补根队列定向窗口、公开 dispatch-block 构造/执行关联与 direct/async 校准，RootHide 已核对统计队列 dispatch_after → HTTP 队列 sig3 的实际任务链；重复/直接执行歧义标 unresolved。最新 17 组自检和实测范围以 docs/PROGRESS.md 顶部、docs/FLOW_STATE_AND_GCD.md 为准，下面 1.28.37 的特殊 block 放行说明是旧快照。
+
 同日 1.28.37 后续：普通 post 增加非局部退出的状态保护，GCD 增加显式开启、有界任务表和提交/执行关联；状态不足时抑制不确定关联，不能将 unwind 提前停止当作异常退出。异步边与同步 parent/native 栈分开。当前协议见 `docs/FLOW_STATE_AND_GCD.md`；QBDI 内仍不支持异常/longjmp 透明执行，实际验收范围以 `docs/PROGRESS.md` 为准。
 
 同日 1.28.36 后续：补齐原 App 线程/栈/寄存器的 QBDI live-next-call、Dobby context 入口和公共桥 CFI，系统 libunwind 同步 native 栈在命中时只采 PC/SP、读取时符号化。两台真实快手 CRC/HMAC/白盒调用已通过，同步栈逐条报告完整/截断/错误；不能把正常返回约束、256 帧上限与模块内覆盖推广为任意异常/异步控制流支持。当前操作协议见 `docs/LIVE_CONTEXT_TRACE.md`，原有 post ABI 和 Inline 硬卸载限制继续生效。
