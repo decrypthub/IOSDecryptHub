@@ -32,7 +32,9 @@ cmake --build "$BUILD" -j"$(sysctl -n hw.ncpu)"
 mkdir -p "$REPO/vendor/qbdi/lib" "$REPO/vendor/qbdi/include/QBDI"
 cp "$BUILD/libQBDI.a" "$REPO/vendor/qbdi/lib/"
 cp "$SRC"/include/QBDI/*.h "$REPO/vendor/qbdi/include/QBDI/"
-cp "$BUILD"/include/QBDI/Config.h "$BUILD"/include/QBDI/Version.h \
+# Config.h 按静态/动态库分别生成；本仓链接 libQBDI.a，使用静态配置。
+cp "$BUILD/include-static/QBDI/Config.h" "$REPO/vendor/qbdi/include/QBDI/"
+cp "$BUILD"/include/QBDI/Version.h \
    "$BUILD"/include/QBDI/State.h "$BUILD"/include/QBDI/Options.h \
    "$REPO/vendor/qbdi/include/QBDI/"
 echo "✅ vendor/qbdi updated: $(ls -lh "$REPO/vendor/qbdi/lib/libQBDI.a" | awk '{print $5}')"

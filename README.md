@@ -23,9 +23,14 @@ v1.27.6 将版本检查切换到规范 APT 源，按安装包架构选择版本�
 在 Mac 上执行：
 
 ```bash
+brew install dpkg ldid cmake ninja  # 已安装的工具可跳过
+bash tools/build_dobby_ios.sh      # 首次构建准备 arm64 Inline Hook 静态库
+bash tools/build_qbdi_ios.sh       # 首次构建准备 arm64 QBDI/LLVM，需网络且耗时较长
 make test-updater  # 无需网络或手机的版本选择/旧更新请求边界回归
 make deb           # 一次构建 rootless 和 RootHide 完整包
 ```
+
+Dobby/QBDI 的静态库属于本机构建产物，不纳入 Git。源码签出后须先构建这两个依赖；CI 同样先准备依赖再执行原有更新策略和整包验证，不把缺库当作引擎编译回归。arm64e 支持范围与限制见各自 `vendor/` 说明。
 
 无需单独编译或从巨魔项目复制 dylib。v1.27.6 已通过 Mac 回归和双环境整包编译、包内容与签名检查；尚未在手机上验收安装、升级或包管理器跳转。详见 [当前进度](./docs/PROGRESS.md)；此前正式基线的核验记录见 [基线核验报告](./docs/BASELINE_AUDIT_2026-10-26.md)。
 

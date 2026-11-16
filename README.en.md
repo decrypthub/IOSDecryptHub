@@ -14,6 +14,18 @@ The injected dylib remains an internal build artifact. Users do not download, co
 
 The existing [v1.27.6 complete packages](https://github.com/decrypthub/IOSDecryptHub/releases/tag/v1.27.6) have moved here with identical bytes. The website and APT source remain [ios.decrypthub.com](https://ios.decrypthub.com/), with the same package ID and signing trust. Older releases remain available. Submit jailbreak issues to [this repository](https://github.com/decrypthub/IOSDecryptHub/issues).
 
+For a fresh macOS checkout, prepare the iOS analysis libraries before building complete packages (Xcode and network access are required):
+
+```bash
+brew install dpkg ldid cmake ninja
+bash tools/build_dobby_ios.sh
+bash tools/build_qbdi_ios.sh
+make test-updater
+make deb
+```
+
+The static libraries are generated locally and are not tracked in Git. QBDI also builds LLVM, so its first build can take a while. CI uses the same dependency preparation and retains the complete rootless/RootHide package checks. Architecture limitations are documented under `vendor/`.
+
 Design documents:
 
 - [Product architecture and delivery](./docs/PRODUCT_ARCHITECTURE.md)
