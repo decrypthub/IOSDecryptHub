@@ -18,13 +18,14 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.46
+VERSION := 1.28.47
 TARGET  := decrypt_helper.dylib
 .DEFAULT_GOAL := all
 .PHONY: test-hook-runtime test-hook-ios-build test-unwind-runtime test-flow-runtime
+.PHONY: test-operation-runtime test-unwind-recipes test-unwind-recipes-ios-build
 
 HOOK_TEST_SRC := tests/hook_runtime_test.m src/core/dh_thunk.m src/core/dh_call_context.c src/core/dh_event.m \
-    src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
+    src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_operations.m src/core/dh_flow_operation_selftest.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
     src/core/log_store.m src/core/dh_capture.c src/core/dh_noise.m src/core/dh_health.c src/core/dh_capability.c \
     src/core/fishhook.c src/server/dh_log_json.m
 
@@ -41,6 +42,11 @@ test-unwind-runtime:
 	@mkdir -p build
 	clang -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation tests/unwind_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) -lc++ -o build/unwind_runtime_test
 	python3 tests/run_unwind_runtime_test.py build/unwind_runtime_test
+
+test-operation-runtime:
+	@mkdir -p build
+	clang -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation tests/operation_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) -lc++ -o build/operation_runtime_test
+	python3 tests/run_unwind_runtime_test.py build/operation_runtime_test
 
 test-unwind-recipes:
 	@mkdir -p build
@@ -90,7 +96,7 @@ SRC     := src/core/fishhook.c \
            src/core/dh_thunk.m \
            src/core/dh_call_context.c \
            src/core/dh_event.m \
-           src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
+           src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_operations.m src/core/dh_flow_operation_selftest.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
            src/core/dh_noise.m \
            src/core/dh_spoof.m \
            src/core/dh_symtab.c \

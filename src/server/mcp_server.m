@@ -26,6 +26,7 @@
 #include "dh_vm_map.h"
 #include "dh_flow.h"
 #include "dh_flow_timers.h"
+#include "dh_flow_operations.h"
 #include "dh_noise.h"
 #include "dh_spoof.h"
 #include "dh_files.h"
@@ -1713,7 +1714,7 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
             @"unpack":        (bits & DH_CAPBIT_UNPACK)        ? @YES : @NO,   // 脱壳
             @"hook_inline":   @(inlineAvailable),
             @"trace_function": @(traceAvailable),
-            @"trace_live": @(DHLiveAvailable() && inlineAvailable), @"native_stack_unwind": @(dh_unwind_available()),@"native_stack_recipes":@((BOOL)dh_unwind_recipe_available()),
+            @"trace_live": @(DHLiveAvailable() && inlineAvailable), @"native_stack_unwind": @(dh_unwind_available()),@"native_stack_recipes":@((BOOL)dh_unwind_recipe_available()),@"operation_flow":@YES,
         },
         @"capabilityBits": @(bits),
         @"process":        [[DHLogStore shared] processInfo] ?: @{},
@@ -3465,6 +3466,8 @@ static NSArray *tool_definitions(void) {
           @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
     ]];
     [tools addObjectsFromArray:@[
+      @{@"name":@"get_operation_state",@"description":@"Read bounded operation submission/execution identities and separately sampled public lifecycle. Original operation, dependencies and cancellation are preserved. A start callback return does not imply asynchronous operation completion. Ordinary executionBlocks may contain forwarding wrappers; actual worker invokers are calibrated per process.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
+      @{@"name":@"run_operation_selftest",@"description":@"Run owned NSOperation/NSBlockOperation dependency, distinct worker identity, asynchronous lifecycle, cancellation, pending-disable and budget tests on isolated queues. Installs bounded typed scheduler adapters until process restart and disables the capture window on exit.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}},
       @{@"name":@"get_unwind_state",@"description":@"Read bounded canonical frame recipes, verified code identity and recovery/refusal counters. No App CFI or code is patched; disabled slots are never reused.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
       @{@"name":@"register_unwind_recipe",@"description":@"Opt in to read-only recovery for a function with independent LC_FUNCTION_STARTS bounds. A bounded A64 CFG/save-state validator rejects unsupported instructions, PAC frames and ambiguous SP/FP state. Capture rechecks code bytes, current stack, saved registers and unsigned LR callsite; an opted-in recipe takes precedence over system metadata, and refusal stops the capture at a reported boundary. Does not scan FP or make arbitrary missing metadata recoverable.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"address"],@"properties":@{@"process_generation":@{@"type":@"string"},@"address":@{@"type":@"string",@"description":@"Current executable address inside the function, strict 0x hex; recipe uses independent exact function bounds, at most 1024 bytes."}}}},
       @{@"name":@"set_unwind_recipe_enabled",@"description":@"Enable/disable a registered read-only recipe in the current process. No metadata patch is installed or removed; slot identity remains until process restart.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"recipe_slot",@"enabled"],@"properties":@{@"process_generation":@{@"type":@"string"},@"recipe_slot":@{@"type":@"integer",@"minimum":@1,@"maximum":@32},@"enabled":@{@"type":@"boolean"}}}},
@@ -3580,7 +3583,9 @@ static NSDictionary *tool_set_webkit_probe(NSDictionary *args) {
 }
 
 static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
-    if([@[@"register_unwind_recipe",@"set_unwind_recipe_enabled",@"run_unwind_selftest"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
+    if([@[@"register_unwind_recipe",@"set_unwind_recipe_enabled",@"run_unwind_selftest",@"run_operation_selftest"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
+    if([name isEqual:@"get_operation_state"])return tool_ok(DHFlowOperationState());
+    if([name isEqual:@"run_operation_selftest"])return tool_ok(DHFlowOperationSelfTest());
     if([name isEqual:@"get_unwind_state"])return tool_ok(DHUnwindRecipeState());
     if([name isEqual:@"run_unwind_selftest"])return tool_ok(DHUnwindRecipeSelfTest());
     if([name isEqual:@"set_unwind_recipe_enabled"]) {

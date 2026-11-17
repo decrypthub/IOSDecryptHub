@@ -25,6 +25,11 @@ void DHFlowRunCallback(uint64_t registration,dispatch_block_t body);
 // Actual runtime callback entry with no observed registration/enqueue history.
 void DHFlowRunEntry(const char *api,const char *queue,void *caller,void *callback,dispatch_block_t body);
 dispatch_block_t DHFlowWrapOneShot(const char *api,const char *queue,void *caller,dispatch_block_t body);
+// Typed one-shot schedulers keep submission identity even if capture is disabled
+// before execution. A callback can claim its prepared token only once.
+uint64_t DHFlowPrepareOneShot(const char *api,const char *queue,void *caller,void *callback,const char *label);
+void DHFlowRunPreparedOneShot(uint64_t task,dispatch_block_t body);
+void DHFlowUnresolvedOneShot(uint64_t task,const char *reason);
 void DHFlowRetireCallback(uint64_t registration,const char *reason);
 void DHFlowUpdateCallbackQueue(uint64_t registration,const char *queue);
 int DHFlowRegistrationState(uint64_t registration); // 0 retired/unknown; 1 this window; 2 another window

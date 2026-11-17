@@ -1,5 +1,16 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.47 NSOperation 实际执行与生命周期（研发包）
+
+- 五个固定 ABI 公开 Method 适配器及每具体类的 start/main 入口共用原 Hook 归属检查；原 operation、依赖、取消、并发上限、BOOL wait 和队列负责执行。普通 block 每执行体独立 token，Foundation 实际 invoker 校准后才领取身份；直接调用 executionBlocks 不抢队列任务。64 元数据记录、32 执行 Method、128 block 包装器有界且不复用，达限继续原工作并明确 unresolved。
+- 实测快手 `KSImageHodorTaskOperation` 覆盖 start，却报告非异步且不调用 main。已根据实际 Method 覆盖选择 start，独立同步自定义 start 夹具先红后绿。异步 start 返回与原 operation finished 分开，公开生命周期附采样时刻和对象存活状态；不把 callback completed 当作 operation 完成。
+- 独立夹具还复现旧适配器获取 App operation 监视锁时的额外等待。最终改用 IDH 自有锁并统一 worker 快照读取，原对象锁不再被适配器获取。没有新增会在 longjmp 后遗留的 operation TLS。
+- 最终 Mac v33 两类完整包、10 组 operation、原 flow/runtime/ABI/unwind/iOS/updater 门禁均通过；两台最终整包各通过 10 组新原生/4 项新 MCP、原 39 flow、7 项 timer、2 项诊断、6 原生/4 MCP unwind 和原 native/PAC/ABI/live 7 组与接口回归。原验收断言和 CI workflow 未放宽。
+- 实际 operation 窗口：两台各 28 棵完整签名树、420 对调用、核心 15 参数、sig3/HTTP 与独立原语一致。Rootless 64 个 operation、RootHide 43 个；每台对 KSImageHodorTaskOperation、SDAsyncBlockOperation 各保留 8 个原函数 Inline 入口，准确 PC/原参数/TaskID/线程和实际回调区间一致；另分别 40/72 条子提交栈确含原 SD callback 的 operation→GCD 边。Rootless 222 任务完成、34 项容量拒绝均 unresolved 且无执行字段；RootHide 256 完成。223/330 次展开不足仍保留真实诊断，不重建缺帧。该窗口没有签名树携带 operation TaskID，不称作 operation→sig3 链通过。
+- 换新代后的最终普通网络窗口：Rootless 31 棵/465 对，RootHide 23 棵/345 对，全部核心参数、HTTP 与独立 HMAC/白盒/CRC 分别 31/93/31、23/69/23 一致；4/6 条精确 GCD/native/HTTP 链。164/246 任务全部完成，两窗口展开不足增量均 0。根队列定向保持原 256 预算，没有据此声称所有请求都有完整异步图。
+
+协议与边界见 [OPERATION_FLOW.md](OPERATION_FLOW.md)。本切片的同源、安装字节和 CI 继续核对；Swift Task、其它实际调度、source 实际注册与 QBDI 异常/longjmp 透明执行及最终集成仍继续。没有发布 Release/APT。
+
 ## 2026-11-17：1.28.46 原生缺失元数据的有界恢复（研发包）
 
 - 新增显式登记的只读 A64 frame recipe：Reader 按独立 LC_FUNCTION_STARTS 边界验证最多 256 个指令槽、512 字节帧的 CFG、原始 x19–x30 保存状态和精确 SP/FP 关系；命中重查字节、栈界限、所有保存槽、无 PAC 的真实 LR 与 BL/BLR callsite。通过公开 unwind API 重建 caller cursor，包括非易失 D8–D15，不改 App CPU、代码或 CFI，不扫描 FP。32 条规则不替换、不复用，默认没有规则，开关与登记均检查本代 generation。
@@ -10,6 +21,8 @@
 - 两条规则恢复后另做正常协议回归：Rootless 22 棵/330 对、RootHide 21 棵/315 对完整调用树，核心 15 参数、返回 sig3/HTTP 及独立 HMAC/白盒/CRC 分别 22/66/22 与 21/63/21 一致；实际异步/native/HTTP 链为 5/4 条，窗口展开不足增量均为 0。样本范围以真实窗口为准，没有声称所有请求都具备异步图。
 
 协议与限制见 [NATIVE_UNWIND_RECOVERY.md](NATIVE_UNWIND_RECOVERY.md)。同源/CI 与本轮最终最高版本集成仍继续核对；NSOperation、Swift Task、其它实际私有调度、source 实际注册路径及 QBDI 异常/longjmp 透明执行仍在全部后续清单中。没有发布 Release/APT。
+
+1.28.46 最终复核：提交 `1116671` 的原完整包 CI [44058900353](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44058900353) 成功；204 个源码/测试/工具与最终构建精确同源，Rootless 安装每字节相同，RootHide 仅合法品牌和对应页 hash 变化。两台已清除临时 Hook/窗口/规则并暂停采集，scope 保留。全部后续继续。
 
 ## 2026-11-17：1.28.45 RunLoop / NSTimer（研发包）
 

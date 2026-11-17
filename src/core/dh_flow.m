@@ -1,6 +1,7 @@
 #import "dh_flow.h"
 #import "dh_flow_sources.h"
 #import "dh_flow_timers.h"
+#import "dh_flow_operations.h"
 #import "dh_event.h"
 #import "dh_call_context.h"
 #import "log_store.h"
@@ -111,7 +112,8 @@ NSDictionary *DHFlowFields(uint64_t token) {
 static void task_event(FlowTask *task,NSString *phase) {
     int saved=dh_in_hook;dh_in_hook=1;busy++;
     @autoreleasepool {
-        DHLogEntry *e=[DHLogEntry new];e.category=DHCategoryOther;e.algorithm=task->edgeKind==2?@"runtime-callback-entry":task->registration?@"registered-callback":@"gcd-async";e.operation=@(task->api);
+        BOOL operation=!strncmp(task->api,"NSOperation",11) || !strncmp(task->api,"NSBlockOperation",16);
+        DHLogEntry *e=[DHLogEntry new];e.category=DHCategoryOther;e.algorithm=task->edgeKind==2?@"runtime-callback-entry":task->registration?@"registered-callback":operation?@"operation-async":@"gcd-async";e.operation=@(task->api);
         DHStampEvent(e);NSMutableDictionary *c=[e.eventContext mutableCopy];c[@"kind"]=@"async-task";c[@"phase"]=phase;
         c[@"parentCallId"]=@"";[c addEntriesFromDictionary:DHFlowFields(task->id)];e.eventContext=c;
         e.eventPayload=@{@"queue":queue_text(task->queue),@"submissionThreadId":@(task->submitThread),@"executionThreadId":@(task->thread),@"edge":task->edgeKind==2?@"observed-callback-entry; registration-unobserved":task->registration?@"registered-handler-to-callback":@"observed-submit-to-execute",@"registrationId":registration_id(task->registration),@"terminalReason":@(task->terminal)};
@@ -216,7 +218,7 @@ __attribute__((noinline,optnone)) void DHAsyncExecute(FlowTask *task,dispatch_bl
     DHRawStack stack;dh_unwind_current(&stack);uint64_t sp=0;
     for (unsigned i=0;i<stack.count;i++) if(stack.pc[i]>=bodyStart && stack.pc[i]<bodyEnd) {sp=stack.sp[i];break;}
     pthread_mutex_lock(&flowLock);task->scopeSP=sp;task->cookie=(uint64_t *)&cookie;task->previous=current;task->state=2;
-    task->started=DHMonotonicNS();pthread_threadid_np(NULL,&task->thread);pthread_mutex_unlock(&flowLock);
+    if(!task->started)task->started=DHMonotonicNS();pthread_threadid_np(NULL,&task->thread);pthread_mutex_unlock(&flowLock);
     current=task;mirror();dh_call_set_async(task->id);task_event(task,@"start");BOOL normal=NO;errno=entryErrno;
     @try {body();normal=YES;}
     @finally {
@@ -235,7 +237,7 @@ static BOOL prepare_origin(const char *api,const char *label,void *caller,void *
     if (!parent && !call) {
         if (!roots) {errno=saved;return NO;}
         Dl_info info={0};int internal=dh_in_hook;dh_in_hook=1;BOOL app=dladdr(caller,&info) && info.dli_fname && strstr(info.dli_fname,".app/");dh_in_hook=internal;
-        if (!app && !runtimeEntry) {errno=saved;return NO;}
+        if (!app && !runtimeEntry && !ownedFixtureScope) {errno=saved;return NO;}
     }
     pthread_mutex_lock(&flowLock);
     for(unsigned i=0;i<excludedCount;i++)if(strcasestr(label,excludedQueues[i])) {atomic_fetch_add(&queueExclusions,1);pthread_mutex_unlock(&flowLock);errno=saved;return NO;}
@@ -349,6 +351,24 @@ dispatch_block_t DHFlowWrapOneShot(const char *api,const char *queue,void *calle
     BOOL selected=callback && prepare_origin(api,queue?:"",caller,(void *)callback,0,NO,NULL,&origin);
     FlowTask *task=selected?reserve_task(api,&origin,0,NULL,NO):NULL;errno=saved;
     return task?^{DHAsyncExecute(task,body);}:body;
+}
+uint64_t DHFlowPrepareOneShot(const char *api,const char *queue,void *caller,void *callback,const char *label) {
+    if(!callback)return 0;int saved=errno;FlowOrigin origin;
+    BOOL selected=prepare_origin(api,queue?:"",caller,callback,0,NO,label,&origin);
+    FlowTask *task=selected?reserve_task(api,&origin,0,NULL,NO):NULL;errno=saved;return task?task->id:0;
+}
+void DHFlowRunPreparedOneShot(uint64_t token,dispatch_block_t body) {
+    int saved=errno;uint64_t thread=0;pthread_threadid_np(NULL,&thread);FlowTask *task=NULL;pthread_mutex_lock(&flowLock);
+    if(token && token<=taskCount && tasks[token-1].state==1){task=&tasks[token-1];task->state=2;task->thread=thread;task->started=DHMonotonicNS();}
+    pthread_mutex_unlock(&flowLock);errno=saved;if(task)DHAsyncExecute(task,body);else body();
+}
+void DHFlowUnresolvedOneShot(uint64_t token,const char *reason) {
+    if(!token)return;int saved=errno;FlowTask *task=NULL;pthread_mutex_lock(&flowLock);
+    if(token<=taskCount && tasks[token-1].state==1) {
+        task=&tasks[token-1];task->state=5;strlcpy(task->terminal,reason?:"scheduler-did-not-observe-execution",sizeof(task->terminal));
+        task->finished=DHMonotonicNS();if(pending)pending--;
+    }
+    pthread_mutex_unlock(&flowLock);if(task)task_event(task,@"unresolved");errno=saved;
 }
 static FlowTask *block_task(const char *api,dispatch_queue_t q,dispatch_block_t b,void *caller) {
     if(!b || busy || dh_in_hook || dh_live_current())return NULL;
@@ -464,6 +484,7 @@ NSDictionary *DHFlowConfigureWithCallbacks(BOOL on,BOOL roots,unsigned budget,un
         if(dispatch_semaphore_wait(ready,dispatch_time(DISPATCH_TIME_NOW,5000000000)) || !asyncPC || !dh_unwind_bounds(asyncPC,&specialAsyncStart,&specialAsyncEnd) || (directPC>=specialAsyncStart && directPC<specialAsyncEnd))return claim_error(@"GCD async/direct block invokers cannot be distinguished");
         struct rebinding binds[]={{"dispatch_async",wrap_async,NULL},{"dispatch_after",wrap_after,NULL},{"dispatch_group_async",wrap_group,NULL},{"dispatch_async_f",wrap_async_f,NULL},{"dispatch_after_f",wrap_after_f,NULL},{"dispatch_group_async_f",wrap_group_f,NULL},{"dispatch_block_create",wrap_create,NULL},{"dispatch_block_create_with_qos_class",wrap_create_qos,NULL},{"dispatch_group_notify",wrap_notify,NULL},{"dispatch_group_notify_f",wrap_notify_f,NULL},{"dispatch_block_notify",wrap_block_notify,NULL}};
         DHFlowTimerPrepare();
+        DHFlowOperationPrepare();
         struct rebinding combined[32];size_t primaryCount=sizeof(binds)/sizeof(*binds);
         memcpy(combined,binds,sizeof(binds));memcpy(combined+primaryCount,sourceBindings,sourceCount*sizeof(*sourceBindings));
         memcpy(combined+primaryCount+sourceCount,timerBindings,timerCount*sizeof(*timerBindings));
