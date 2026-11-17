@@ -1,4 +1,4 @@
-# 1.28.40：非局部退出状态保护与有界 GCD 关联
+# 1.28.42：非局部退出状态保护与有界 GCD 关联
 
 本轮扩展现有 Agent 的调用状态与因果关系。真实 CPU 跟踪继续遵守 [LIVE_CONTEXT_TRACE.md](LIVE_CONTEXT_TRACE.md) 的正常返回约束；这里不增加 QBDI 内异常/longjmp 的透明执行支持。
 
@@ -11,6 +11,8 @@
 因此，函数内部抛出又捕获的异常仍保留活动父调用；不在全局 throw 入口清空所有调用。longjmp 不解析或修改不透明 jmp_buf，也不依靠普通 finally 保证清理。长期没有后续边界的记录可能继续保持 open，不能把它提前当作完成。
 
 栈缺元数据、截断或错误时不根据“没看到桥”断言退出；即使 libunwind 正常停止，也必须证明展开已经越过已知保护帧的栈位置。相关父调用/异步关联暂时抑制，事件标明 contextComplete:false 与 parentValidation，计入 unverifiedBoundaries。下一次充分证据可恢复判断。超过 64 个保护记录会计 guardOverflows，相应未登记记录的退出保护不作保证；正常函数转发继续。
+
+1.28.42 增加正向证据规则：即使更高层栈不完整，只要所有已登记 post 桥以及当前异步包装帧都实际出现，且准确 PC/SP 和 cookie 校验通过，仍保留已证实的活动上下文，并计 verifiedPartialBoundaries。这条路径不退休任何缺失帧；缺少任一锚仍抑制关联。它没有增加猜测性 FP 扫描或任意缺失元数据恢复。
 
 线程结束使用 pthread-key 中独立保存的快照收尾。不能只在 key destructor 读取编译器 TLS：Darwin 的 TLV 清理顺序可能使此时读到空状态。快照保留原 call/parent/async token，使线程退出的 aborted 事件仍有原身份。这里保护的是采集状态，不修复 App 自身的非法异常/longjmp，也不改变其 catch、跳转结果或线程退出行为。
 
@@ -45,6 +47,7 @@
 ## 查询和历史
 
 - `get_flow_state`：预算、保留数、pending/running、abandonedCalls、unverifiedBoundaries、guardOverflows 和跳过/拒绝计数；windowStartedNs/windowDeadlineNs 和 windowStopReason 区分 capturing、task-budget、record-capacity、expired、disabled，关闭保留最近窗口诊断。threadGuardCount/threadAsyncTaskId 仅指处理命令的线程，不代表任意 App 线程。
+- `get_flow_diagnostics`：最近 16 次不确定边界，offset 0–16、limit 1–4，默认 1；包括原因、真实末帧/锚 SP、候选任务与延迟符号化后的栈。candidateTaskId 不是已建立的因果边，association 明确为 suppressed。reasonCounts 区分 frame-budget、unwind-error、unwind-incomplete、stopped-before-guard、stopped-before-async-scope、wrapper-not-observed；栈 termination 另报告后端终止原因、stepResult、PC/SP/FP、procedure 和线程栈范围。各页是读取时的快照，活跃环被覆盖时检查 total/overwritten/记录 ID，不能假设跨页冻结。
 - `get_async_tasks`：offset/limit 分页，最大 128；可传完整 task_id 查询本代某任务。无对应记录时 unknownTask:true。任务记录包含真实来源边、提交 caller 和 callback 的 UUID/RVA、有界原始提交栈；公开创建的特殊 block 另含 blockCreationCallerIdentity 与 dispatchBlockMetadataPreserved。unresolved 表示提交已观察但执行关联不可用，不能算 completed/aborted。
 - `query_events.async_task_id`：精确查事件上下文；get_event/get_call 获取详情。submit/start/complete/aborted 任务事件与普通事件一样受存储预算和淘汰限制。
 - 任务表在当前 Agent RAM；重启后旧 task_id 不用于新进程查询。journal 中已保留的事件仍携带采集时的进程代和异步 ID，不能将新代任务表当成旧表。完整历史因果图取决于实际保留的事件，不补缺失边。
@@ -55,9 +58,11 @@
 
 `make test-flow-runtime` 在独立临时日志目录运行真实汇编与运行时测试；既有 hook/unwind/iOS 编译、updater 和两种完整 deb 检查继续执行。Makefile 按文件扩展名选择 C/ObjC/ObjC++，避免全局 -ObjC 将 C++ fixture 错当 ObjC；验收断言没有放宽。
 
-实机先恢复 all/other，再调用 `run_flow_selftest`。17 组自有 fixture 覆盖 ObjC/C++ 异常原样传播、longjmp 值、内部捕获不误退、暂停时的状态、缺失展开证据、线程退出、六类 GCD/嵌套跨线程任务、任务/时间预算、关闭后的待执行任务、特殊 block 取消/等待、根队列筛选及后代传播、两个公开 block 构造器、重复提交歧义和入队后直接调用不冒充异步执行。完成后重启目标清理临时 Hook 和转发 patch。
+实机先恢复 all/other，再调用 `run_flow_selftest`。18 组自有 fixture 覆盖 ObjC/C++ 异常原样传播、longjmp 值、内部捕获不误退、暂停时的状态、缺失展开证据、局部栈已包含真实活动桥时保留父关联、线程退出、六类 GCD/嵌套跨线程任务、任务/时间预算、关闭后的待执行任务、特殊 block 取消/等待、根队列筛选及后代传播、两个公开 block 构造器、重复提交歧义和入队后直接调用不冒充异步执行。完成后重启目标清理临时 Hook 和转发 patch。
 
 接口回归：`python tests/flow_mcp_test.py --endpoint http://<authorized-device>:8088 --aborted-call-id <retained-owned-fixture-call>`。旧 P0/native/live/ABI 拒绝回归继续使用各自自有 fixture，业务请求由正常 UI 产生。设备验证和实际覆盖以 [PROGRESS.md](PROGRESS.md) 为准。
+
+在自检之后、捕获关闭时运行 `python tests/flow_diagnostics_mcp_test.py --endpoint http://<authorized-device>:8088`，验证有界分页、停止证据、正向局部栈计数和非法请求不修改状态/Hook。原始栈 V2 编解码、V1 兼容及截断处理由 `make test-unwind-runtime` 验证。
 
 设计参考：[Apple GCD 队列](https://developer.apple.com/library/archive/documentation/General/Conceptual/ConcurrencyProgrammingGuide/OperationQueues/OperationQueues.html)、[Apple dispatch-block 实现](https://github.com/apple-oss-distributions/libdispatch/blob/main/src/block.cpp)。
 

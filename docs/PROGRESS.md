@@ -1,10 +1,22 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.42 栈边界诊断与已证实关联的保留（研发包）
+
+- native 栈增加精确终止原因、libunwind step 结果、最后 PC/SP/FP、procedure 范围与线程栈界限。原始记录升级为 V2，读取仍兼容 V1；缺行与畸形记录不报完整。`complete` 仍表示后端正常终止，不能单独证明到达线程根或越过某个已知包装帧。
+- `get_flow_state` 按六类原因统计证据不足；新只读 `get_flow_diagnostics` 保留最近 16 条原始边界、每页最多 4 条，由读取线程符号化。`candidateTaskId` 仅用于诊断，不建立父边；命中线程只保存有界快照。活跃环形缓冲区可能在两页之间变化，读取者应检查 total/overwritten 和记录 ID。
+- 局部栈已实际包含所有已登记 post 桥与当前异步包装帧的准确 PC/SP/cookie 时，保留已证实的关联；不会因更高层截断而丢掉该父关系。局部栈中没看到某帧仍不证明退出，不据此退休调用或任务。新增第 18 组真实活动桥夹具，旧缺口/异常/longjmp 状态保护回归继续通过。
+- Mac 原运行时、unwind、iOS 编译、更新策略与两种完整 deb 构建通过；同一源码 1.28.42 整包已刷入两台授权设备且 scope 保留。两台各通过 18 组状态/GCD 自检、新诊断 MCP 的分页/非法参数/只读验证，以及既有 native/PAC/ABI 和 7 组 live 自检及 MCP 回归。
+- 快手实际请求独立复核：Rootless 36 棵完整调用树、540 对调用，RootHide 25 棵、375 对调用；核心 15 参数 ABI、返回 sig3 与对应 HTTP 精确匹配，HMAC/白盒块/CRC 分别为 36/108/36 和 25/75/25 组一致。
+- 该真实窗口 Rootless 另有 15 次 `stopped-before-async-scope`：libunwind 在 App RVA `0xda476b4` 正常停止，但还未到已知包装锚。已记录真实缺口并抑制关联，没有伪造业务 aborted，也没有盲目扫描 FP 补帧。RootHide 本窗口未复现同类缺口，不代表任意路径都可完整展开。
+
+本版本完成诊断和有证据的局部恢复；任意缺失元数据路径的完整展开仍未解决。RunLoop/NSTimer、NSOperation、Swift Task、notify/source、私有调度适配和 QBDI 内异常/longjmp 透明执行仍未实现，不能用普通 post 的状态保护代替这些能力。未发布 Release/APT。
+
 ## 2026-11-17：1.28.41 系统库嵌套映射预检（全部后续项的第一切片）
 
 - 修复 Import 与 QBDI 两处重复的 vm_region_recurse_64 遍历：内核会把 address 改为当前 region 起点，下一层必须恢复原目标地址；不能检查 shared-cache 起点的另一片区域。两入口共用有界叶映射查询，继续要求目标确实位于当前 EXECUTE 叶区，不以 max_protection 或整个镜像范围代替。
 - 新只读 get_memory_mapping，提供每层原查询地址、实际 region、深度、当前/最大权限和内核错误；最多 16 次。非法输入、映射空洞、数据页、查询错误和过深嵌套保持拒绝。新增嵌套映射回归夹具通过，原运行时/ABI/unwind/iOS 编译、更新策略与两种完整 deb 构建通过。
 - 同一 1.28.41 完整包已安装到两台授权手机并保留 scope。两台实际 walk 均见 shared-cache 外层只读 submap 与目标 RX 叶映射；RootHide 旧负例 dispatch_block_create Import 已安装并观察真实配对调用，dispatch_queue_get_label QBDI 正常完成并返回可读队列名。真实数据符号仍为不可执行，畸形地址仍拒绝。
+- 原完整包 CI [44015331453](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44015331453) 在提交 `47b8b44` 通过，依赖准备、更新策略与双环境整包门禁未改。
 - 这只完成映射修复；用户本次要求的 native 展开改进、RunLoop/NSOperation/Swift Task/notify/source/私有调度、QBDI 异常/longjmp 透明执行仍继续实施，不以第一切片完成代替整体目标。
 
 

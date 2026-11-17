@@ -9,6 +9,7 @@
 #include <pthread.h>
 extern void DHFlowThrowCXX(void);
 extern int DHFlowCatchCXX(void (*body)(void *),void *context);
+extern int dh_thunk_post_frame(uint64_t pc,uint64_t sp,uint64_t callerSP);
 static __thread jmp_buf *jumpTarget;
 static void require(BOOL good,NSString *message);
 @interface IDHFlowProbe:NSObject
@@ -26,6 +27,7 @@ static void require(BOOL good,NSString *message);
 - (uint64_t)schedule;
 - (uint64_t)exitOut;
 - (uint64_t)unverified;
+- (uint64_t)partial;
 @end
 static void cpp_body(void *p) {[( __bridge IDHFlowProbe *)p cppOut];}
 static void *exit_body(void *p) {[( __bridge IDHFlowProbe *)p exitOut];return NULL;}
@@ -45,6 +47,14 @@ static void function_body(void *p) {IDHFlowProbe *probe=CFBridgingRelease(p);[pr
     unknown.complete=1;unknown.count=1;unknown.pc[0]=1;unknown.sp[0]=1;DHFlowCheck(&unknown);
     if(dh_call_parent() || dh_call_async())[NSException raise:@"IDHFlowFixture" format:@"premature stop retained an association"];
     return [self normal:1];
+}
+- (uint64_t)partial {
+    DHRawStack stack;dh_unwind_current(&stack);BOOL bridge=NO;
+    for(unsigned i=0;i<stack.count;i++)if(dh_thunk_post_frame(stack.pc[i],stack.sp[i],stack.sp[i]+0x560) || dh_thunk_post_frame(stack.pc[i],stack.sp[i],stack.sp[i]+0x460)){stack.count=i+1;bridge=YES;break;}
+    require(bridge,@"partial fixture did not capture the real active post bridge");
+    stack.complete=0;stack.truncated=1;stack.stopReason=DH_UNWIND_FRAME_LIMIT;
+    DHFlowCheck(&stack);require(dh_call_parent()!=0,@"verified active bridge lost parent because higher frames were truncated");
+    return 42;
 }
 - (uint64_t)catchInside {@try {@throw self.marker;}@catch(NSException *e) {return [self normal:8];}}
 - (uint64_t)schedule {
@@ -98,7 +108,7 @@ NSDictionary *DHFlowSelfTest(void) {
     @try {
         require(![DHLogStore shared].paused && ![[DHLogStore shared] isPausedForCategory:DHCategoryOther],@"resume all/other before selftest");
         dh_hook_options options;dh_thunk_options_default(&options);options.fixed_abi=1;options.capture_return=1;char error[512]={0};
-        for(NSString *name in @[@"normal:",@"throwOut",@"jumpOut",@"cppOut",@"catchInside",@"schedule",@"exitOut",@"unverified"]) {
+        for(NSString *name in @[@"normal:",@"throwOut",@"jumpOut",@"cppOut",@"catchInside",@"schedule",@"exitOut",@"unverified",@"partial"]) {
             int slot=dh_thunk_install_configured(DH_HOOK_METHOD,"IDHFlowProbe",name.UTF8String,0,0,NULL,&options,error,sizeof(error));require(slot>=0,@(error));[slots addObject:@(slot)];
         }
         uint64_t initial=[DHFlowState()[@"abandonedCalls"] unsignedLongLongValue];
@@ -115,6 +125,10 @@ NSDictionary *DHFlowSelfTest(void) {
         [DHLogStore shared].paused=YES;value=setjmp(env);if(!value)[probe jumpOut];[probe normal:0];[DHLogStore shared].paused=NO;
         require([DHFlowState()[@"abandonedCalls"] unsignedLongLongValue]==initial+4,@"paused bridge accounting leaked");[passed addObject:@"paused-capture-still-protects-inflight-state"];
         require([probe unverified]==2,@"incomplete unwind did not suppress uncertain links");[passed addObject:@"incomplete-unwind-suppresses-links-without-false-abort"];
+        uint64_t partialBefore=[DHFlowState()[@"verifiedPartialBoundaries"] unsignedLongLongValue];
+        require([probe partial]==42 && [DHFlowState()[@"verifiedPartialBoundaries"] unsignedLongLongValue]==partialBefore+1,@"positive owned-frame evidence did not survive a partial walk");
+        require([DHFlowDiagnostics(0,4)[@"records"] count]>0,@"uncertain boundaries missing diagnostic records");
+        [passed addObject:@"partial-stack-with-all-real-owned-anchors-keeps-proven-parent"];
         pthread_t worker;require(pthread_create(&worker,NULL,exit_body,(__bridge void *)probe)==0,@"thread fixture creation failed");pthread_join(worker,NULL);
         require([DHFlowState()[@"abandonedCalls"] unsignedLongLongValue]==initial+5,@"thread exit did not retire owned bridge");[passed addObject:@"thread-exit-retires-inflight-state"];
         NSDictionary *configured=DHFlowConfigure(YES,NO,64,10000,nil,nil);require([configured[@"ok"] boolValue],configured[@"error"]);

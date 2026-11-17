@@ -24,6 +24,13 @@ int main(void) {@autoreleasepool {
     if (![current[@"complete"] boolValue] || [current[@"frames"] count]<5) return 5;
     NSDictionary *cut=DHDecodeRawStack(@"IDH_NATIVE_STACK_V1 3 1 0 0\n1 2\n");
     if ([cut[@"complete"] boolValue] || ![cut[@"truncated"] boolValue]) return 6;
+    DHRawStack encoded={.count=1,.error=-10,.stopReason=DH_UNWIND_NO_PROCEDURE,.terminalPC=0x1234,.terminalSP=0x5678,.terminalFP=0x7890,.stackLow=0x5000,.stackHigh=0x9000,.procedureStart=0x1200,.procedureEnd=0x1300};
+    encoded.pc[0]=0x1234;encoded.sp[0]=0x5678;
+    NSDictionary *roundTrip=DHDecodeRawStack(DHEncodeRawStack(&encoded));
+    if(![roundTrip[@"termination"][@"reason"] isEqual:@"procedure-unavailable"] || ![roundTrip[@"termination"][@"fp"] isEqual:@"0x7890"] || [roundTrip[@"error"] intValue]!=-10)return 7;
+    NSDictionary *old=DHDecodeRawStack(@"IDH_NATIVE_STACK_V1 1 1 0 0\n1 2\n");
+    if(![old[@"complete"] boolValue] || ![old[@"termination"][@"reason"] isEqual:@"legacy-or-unspecified"])return 8;
+    if(DHDecodeRawStack(@"IDH_NATIVE_STACK_V2 1 1 0 0\n1 2\n"))return 9;
     for (DHLogEntry *event in [[DHLogStore shared] snapshot]) {
         if (![event.operation containsString:@"inner:"] || ![event.eventContext[@"phase"] isEqual:@"entry"]) continue;
         NSDictionary *stack=DHResolveStack(event.eventPayload[@"stack"],YES);

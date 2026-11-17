@@ -3464,6 +3464,7 @@ static NSArray *tool_definitions(void) {
           @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
     ]];
     [tools addObjectsFromArray:@[
+      @{@"name":@"get_flow_diagnostics",@"description":@"Read a bounded ring of uncertain stack boundaries with precise stop reason and last native PC/SP/FP. CandidateTaskId is diagnostic only, not an established parent. Raw stacks are resolved on this reader thread.",@"inputSchema":@{@"type":@"object",@"properties":@{@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@16},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@4}}}},
       @{@"name":@"configure_async_capture",@"description":@"Opt-in bounded GCD submit/execute correlation. Six public async/after/group submission imports plus two public block constructors. Selected first submissions of blocks created during capture preserve their original outer metadata and track the inner callback; reused-before-start is unresolved. Preexisting/unknown blocks pass through. Existing pending work keeps its identity after capture is disabled. No Swift/NSOperation/private scheduler coverage. Restart clears retained forwarding patches.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"enabled"],@"properties":@{@"process_generation":@{@"type":@"string"},@"enabled":@{@"type":@"boolean"},@"capture_roots":@{@"type":@"boolean"},@"queue_exclude":@{@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"root_queue_include":@{@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"max_tasks":@{@"type":@"integer",@"minimum":@1,@"maximum":@256},@"max_ms":@{@"type":@"integer",@"minimum":@1,@"maximum":@60000}}}},
       @{@"name":@"get_async_tasks",@"description":@"Read bounded observed GCD causal edges, submitter call/task and execution TID. Async edges are separate from native stacks and synchronous parentCallId. Pending is not completion; no guessed edges.",@"inputSchema":@{@"type":@"object",@"properties":@{@"task_id":@{@"type":@"string"},@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@1024},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@128}}}},
       @{@"name":@"get_flow_state",@"description":@"Read bounded async and nonlocal-exit protection counters. Thread-local counters refer to the handling thread; no arbitrary thread state mutation.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
@@ -3575,9 +3576,14 @@ static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
     if([@[@"configure_async_capture",@"run_flow_selftest"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
     if([name isEqual:@"get_flow_state"])return tool_ok(DHFlowState());
     if([name isEqual:@"run_flow_selftest"])return tool_ok(DHFlowSelfTest());
-    if([name isEqual:@"configure_async_capture"] || [name isEqual:@"get_async_tasks"]) {
+    if([name isEqual:@"configure_async_capture"] || [name isEqual:@"get_async_tasks"] || [name isEqual:@"get_flow_diagnostics"]) {
         for(NSString *key in @[@"enabled",@"capture_roots"])if(args[key] && (![args[key] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)args[key])!=CFBooleanGetTypeID()))return tool_err(@"flow switches must be booleans");
         for(NSString *key in @[@"offset",@"limit",@"max_tasks",@"max_ms"])if(args[key] && (![args[key] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)args[key])==CFBooleanGetTypeID() || !isfinite([args[key] doubleValue]) || [args[key] doubleValue]!=floor([args[key] doubleValue]) || [args[key] doubleValue]<0 || [args[key] doubleValue]>60000))return tool_err(@"flow bounds must be finite nonnegative integers");
+        if([name isEqual:@"get_flow_diagnostics"]) {
+            unsigned offset=[args[@"offset"] unsignedIntValue],limit=args[@"limit"]?[args[@"limit"] unsignedIntValue]:1;
+            if(offset>16 || !limit || limit>4)return tool_err(@"diagnostic page out of range");
+            return tool_ok(DHFlowDiagnostics(offset,limit));
+        }
         if([name isEqual:@"configure_async_capture"]) {
             if(!args[@"enabled"])return tool_err(@"enabled is required");
             unsigned budget=args[@"max_tasks"]?[args[@"max_tasks"] unsignedIntValue]:128,ms=args[@"max_ms"]?[args[@"max_ms"] unsignedIntValue]:30000;

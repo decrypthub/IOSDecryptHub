@@ -38,6 +38,11 @@ static uint64_t windowStarted;static char stopReason[32]="disabled";
 static _Atomic uint64_t rootQueueMisses,queueExclusions;
 static _Atomic uint64_t abandoned,unverified,guardOverflow,rejected,hiddenToken;
 static _Atomic uint64_t skippedBlocks;
+enum { FLOW_DIAGNOSTICS=16,FLOW_DIAGNOSTIC_REASONS=6 };
+static const char *diagnosticReasons[]={"frame-budget","unwind-error","unwind-incomplete","stopped-before-guard","stopped-before-async-scope","wrapper-not-observed"};
+typedef struct {uint64_t sequence,thread,when,task,anchor;unsigned reason;DHRawStack stack;} FlowDiagnostic;
+static FlowDiagnostic diagnostics[FLOW_DIAGNOSTICS];static uint64_t diagnosticSequence,reasonCounts[FLOW_DIAGNOSTIC_REASONS];
+static _Atomic uint64_t verifiedPartial;
 static uintptr_t specialInvoke;static void *agentBase;
 static uint64_t specialAsyncStart,specialAsyncEnd;
 static unsigned specialCreated,windowSpecialCreated;
@@ -92,20 +97,44 @@ static void task_event(FlowTask *task,NSString *phase) {
     }
     busy--;dh_in_hook=saved;
 }
+static void uncertain_boundary(const DHRawStack *stack,unsigned reason,uint64_t anchor) {
+    int savedErrno=errno;
+    uint64_t thread=0;pthread_threadid_np(NULL,&thread);
+    pthread_mutex_lock(&flowLock);atomic_fetch_add(&unverified,1);reasonCounts[reason]++;
+    uint64_t sequence=++diagnosticSequence;FlowDiagnostic *record=&diagnostics[(sequence-1)%FLOW_DIAGNOSTICS];
+    *record=(FlowDiagnostic){.sequence=sequence,.thread=thread,.when=DHMonotonicNS(),.task=current?current->id:0,.anchor=anchor,.reason=reason,.stack=*stack};
+    pthread_mutex_unlock(&flowLock);dh_call_set_trust(0);errno=savedErrno;
+}
 void DHFlowCheck(const DHRawStack *stack) {
     if (busy || dh_live_current()) return;
     if(!guardCount && !current) {dh_call_set_trust(1);return;}
-    if (!stack->complete || stack->error || stack->truncated) {atomic_fetch_add(&unverified,1);dh_call_set_trust(0);return;}
+    if (!stack->complete || stack->error || stack->truncated) {
+        // Presence proves a live owned scope even when frames above it cannot
+        // be recovered. Absence in a partial walk never proves an exit.
+        BOOL allPresent=YES;
+        for(unsigned n=0;n<guardCount;n++) {
+            BOOL found=NO;for(unsigned i=0;i<stack->count;i++)if(dh_thunk_post_frame(stack->pc[i],stack->sp[i],guards[n].sp)){found=YES;break;}
+            allPresent&=found;
+        }
+        if(current) {
+            BOOL found=NO;if(current->cookie && *current->cookie==current->id)
+                for(unsigned i=0;i<stack->count;i++)if(stack->pc[i]>=bodyStart && stack->pc[i]<bodyEnd && stack->sp[i]==current->scopeSP){found=YES;break;}
+            allPresent&=found;
+        }
+        if(allPresent){atomic_fetch_add(&verifiedPartial,1);dh_call_set_trust(1);return;}
+        uncertain_boundary(stack,stack->error?1:stack->truncated?0:2,current?current->scopeSP:guardCount?guards[guardCount-1].sp:0);return;
+    }
     // A normal libunwind stop can still occur below a known frame (e.g. codec stubs).
     // Absence is evidence of exit only after the walk has actually passed its anchor.
     uint64_t lastSP=stack->count?stack->sp[stack->count-1]:0;
     for(unsigned n=0;n<guardCount;n++) {
         BOOL found=NO;for(unsigned i=0;i<stack->count;i++)if(dh_thunk_post_frame(stack->pc[i],stack->sp[i],guards[n].sp)){found=YES;break;}
-        if(!found && lastSP<=guards[n].sp){atomic_fetch_add(&unverified,1);dh_call_set_trust(0);return;}
+        if(!found && lastSP<=guards[n].sp){uncertain_boundary(stack,3,guards[n].sp);return;}
     }
     if(current) {
+        if(!current->scopeSP){uncertain_boundary(stack,4,0);return;}
         BOOL found=NO;for(unsigned i=0;i<stack->count;i++)if(stack->pc[i]>=bodyStart && stack->pc[i]<bodyEnd && stack->sp[i]==current->scopeSP){found=YES;break;}
-        if(!found && lastSP<=current->scopeSP){atomic_fetch_add(&unverified,1);dh_call_set_trust(0);return;}
+        if(!found && lastSP<=current->scopeSP){uncertain_boundary(stack,4,current->scopeSP);return;}
     }
     dh_call_set_trust(1);
     int saved=errno;busy++;
@@ -125,7 +154,7 @@ void DHFlowCheck(const DHRawStack *stack) {
             // Suppress uncertain associations; normal/exception wrapper exit or a
             // verified subsequent callback entry owns terminal accounting.
             pthread_mutex_lock(&flowLock);task->associationGaps++;pthread_mutex_unlock(&flowLock);
-            atomic_fetch_add(&unverified,1);dh_call_set_trust(0);mirror();busy--;errno=saved;return;
+            uncertain_boundary(stack,5,task->scopeSP);mirror();busy--;errno=saved;return;
         }
         task->checkedCookie=task->cookie?*task->cookie:0;task->checkedScopeSP=task->scopeSP;
         for(unsigned i=0;i<stack->count;i++)if(stack->pc[i]>=bodyStart && stack->pc[i]<bodyEnd){task->checkedBodyPC=stack->pc[i];task->checkedBodySP=stack->sp[i];break;}
@@ -279,8 +308,9 @@ NSDictionary *DHFlowState(void) {
     pthread_mutex_lock(&flowLock);
     NSMutableArray *filters=[NSMutableArray array],*includes=[NSMutableArray array];for(unsigned i=0;i<excludedCount;i++)[filters addObject:@(excludedQueues[i])];for(unsigned i=0;i<rootQueueCount;i++)[includes addObject:@(rootQueues[i])];
     const char *reason=(!strcmp(stopReason,"capturing") && DHMonotonicNS()>deadline)?"expired":stopReason;
+    NSMutableDictionary *uncertain=[NSMutableDictionary dictionary];for(unsigned i=0;i<FLOW_DIAGNOSTIC_REASONS;i++)uncertain[@(diagnosticReasons[i])]=@(reasonCounts[i]);
     NSDictionary *r=@{@"enabled":@(atomic_load(&gateOn) && DHMonotonicNS()<=deadline),@"installed":@(installed),@"captureRoots":@(captureRoots),@"retained":@(taskCount),@"pendingOrRunning":@(pending),@"windowAccepted":@(windowCount),@"maxRecords":@1024,@"maxPending":@64,@"maxDepth":@8,
-        @"abandonedCalls":@(atomic_load(&abandoned)),@"unverifiedBoundaries":@(atomic_load(&unverified)),@"guardOverflows":@(atomic_load(&guardOverflow)),@"rejectedTasks":@(atomic_load(&rejected)),@"skippedSpecialOrUnknownBlocks":@(atomic_load(&skippedBlocks)),@"specialBindingsCreated":@(specialCreated),@"specialUnresolved":@(atomic_load(&specialUnresolved)),@"queueExclude":filters,@"rootQueueInclude":includes,@"windowStopReason":@(reason),@"windowStartedNs":[NSString stringWithFormat:@"%llu",windowStarted],@"windowDeadlineNs":[NSString stringWithFormat:@"%llu",deadline],@"rootQueueMisses":@(atomic_load(&rootQueueMisses)),@"queueExclusions":@(atomic_load(&queueExclusions)),@"threadGuardCount":@(guardCount),@"threadAsyncTaskId":task_id(dh_call_async())};
+        @"abandonedCalls":@(atomic_load(&abandoned)),@"unverifiedBoundaries":@(atomic_load(&unverified)),@"unverifiedReasonCounts":uncertain,@"verifiedPartialBoundaries":@(atomic_load(&verifiedPartial)),@"retainedBoundaryDiagnostics":@(MIN(diagnosticSequence,(uint64_t)FLOW_DIAGNOSTICS)),@"guardOverflows":@(atomic_load(&guardOverflow)),@"rejectedTasks":@(atomic_load(&rejected)),@"skippedSpecialOrUnknownBlocks":@(atomic_load(&skippedBlocks)),@"specialBindingsCreated":@(specialCreated),@"specialUnresolved":@(atomic_load(&specialUnresolved)),@"queueExclude":filters,@"rootQueueInclude":includes,@"windowStopReason":@(reason),@"windowStartedNs":[NSString stringWithFormat:@"%llu",windowStarted],@"windowDeadlineNs":[NSString stringWithFormat:@"%llu",deadline],@"rootQueueMisses":@(atomic_load(&rootQueueMisses)),@"queueExclusions":@(atomic_load(&queueExclusions)),@"threadGuardCount":@(guardCount),@"threadAsyncTaskId":task_id(dh_call_async())};
     pthread_mutex_unlock(&flowLock);return r;
 }
 NSDictionary *DHFlowConfigure(BOOL on,BOOL roots,unsigned budget,unsigned ms,NSArray *excluded,NSArray *included) {
@@ -340,4 +370,17 @@ NSDictionary *DHFlowRead(unsigned offset,unsigned limit,uint64_t token) {
     pthread_mutex_unlock(&flowLock);
     for(NSMutableDictionary *d in out){d[@"submissionCallerIdentity"]=DHTargetIdentity((void *)(uintptr_t)strtoull([d[@"submissionCallerPC"] UTF8String],NULL,16));d[@"callbackIdentity"]=DHTargetIdentity((void *)(uintptr_t)strtoull([d[@"callbackPC"] UTF8String],NULL,16));if(d[@"blockCreationCallerPC"])d[@"blockCreationCallerIdentity"]=DHTargetIdentity((void *)(uintptr_t)strtoull([d[@"blockCreationCallerPC"] UTF8String],NULL,16));}
     return @{@"tasks":out,@"retained":@(total),@"nextOffset":offset+limit<total?@(offset+limit):(id)NSNull.null,@"state":DHFlowState(),@"unknownTask":@(token && out.count==0)};
+}
+
+NSDictionary *DHFlowDiagnostics(unsigned offset,unsigned limit) {
+    FlowDiagnostic copy[4];unsigned copied=0;limit=MIN(limit,4U);
+    pthread_mutex_lock(&flowLock);uint64_t total=diagnosticSequence;unsigned retained=(unsigned)MIN(total,(uint64_t)FLOW_DIAGNOSTICS);
+    uint64_t first=total-retained+1;
+    for(unsigned i=offset;i<retained && copied<limit;i++)copy[copied++]=diagnostics[(first+i-1)%FLOW_DIAGNOSTICS];
+    pthread_mutex_unlock(&flowLock);NSMutableArray *out=[NSMutableArray array];
+    for(unsigned i=0;i<copied;i++) {FlowDiagnostic *d=&copy[i];[out addObject:@{
+        @"id":[NSString stringWithFormat:@"%llu",d->sequence],@"reason":@(diagnosticReasons[d->reason]),@"threadId":@(d->thread),@"monotonicNs":[NSString stringWithFormat:@"%llu",d->when],
+        @"candidateTaskId":task_id(d->task),@"expectedAnchorSP":[NSString stringWithFormat:@"0x%llx",d->anchor],@"stack":DHResolveStack(DHStackDictionary(&d->stack),YES),
+        @"association":@"suppressed; candidate identity is diagnostic only"}];}
+    return @{@"processGeneration":DHProcessGeneration(),@"retained":@(retained),@"total":[NSString stringWithFormat:@"%llu",total],@"overwritten":[NSString stringWithFormat:@"%llu",total-retained],@"records":out,@"nextOffset":offset+copied<retained?@(offset+copied):(id)NSNull.null};
 }

@@ -15,6 +15,7 @@ NSDictionary *DHFlowFields(uint64_t task);
 NSDictionary *DHFlowConfigure(BOOL enabled,BOOL roots,unsigned budget,unsigned milliseconds,NSArray *excludedQueues,NSArray *rootQueues);
 NSDictionary *DHFlowRead(unsigned offset,unsigned limit,uint64_t task);
 NSDictionary *DHFlowState(void);
+NSDictionary *DHFlowDiagnostics(unsigned offset,unsigned limit);
 NSDictionary *DHFlowSelfTest(void);
 #endif
 #endif
