@@ -28,6 +28,7 @@
 #include "dh_flow_timers.h"
 #include "dh_flow_operations.h"
 #include "dh_flow_swift.h"
+#include "dh_flow_dispatch.h"
 #include "dh_noise.h"
 #include "dh_spoof.h"
 #include "dh_files.h"
@@ -3467,6 +3468,9 @@ static NSArray *tool_definitions(void) {
           @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
     ]];
     [tools addObjectsFromArray:@[
+      @{@"name":@"get_dispatch_entry_state",@"description":@"Read explicit private libdispatch callout preparation, native ownership and forwarding state. Default off. Callback execution has no inferred source registration or enqueue edge.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
+      @{@"name":@"configure_dispatch_entry",@"description":@"Opt in to the actual two-pointer private libdispatch callout, discovered from an owned public source callback and validated against the complete recognized A64/PAC call prefix. Requires an independently configured bounded async window to record App callbacks. Existing observed task identity takes precedence; unobserved registration remains empty. Does not read private dispatch object layouts.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"enabled"],@"properties":@{@"process_generation":@{@"type":@"string"},@"enabled":@{@"type":@"boolean"}}}},
+      @{@"name":@"run_dispatch_entry_selftest",@"description":@"Run owned native private-dispatch ABI, unchanged context/function, repeated preexisting source delivery and disable fixtures. Refuses an active async window. Native patch remains until restart.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}},
       @{@"name":@"get_swift_events",@"description":@"Read the bounded native Swift scheduler event ring: exact creation lifetime, enqueue, native job entry/return, authoritative current Task, completion and retrospective completion recovery. schedulerSeq belongs to this ring, independently of query_events seq. Reports overwritten entries; a job container is separate from Swift parenthood. Live generation only.",@"inputSchema":@{@"type":@"object",@"properties":@{@"after_seq":@{@"type":@"integer",@"minimum":@0,@"maximum":@9007199254740991LL},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@64},@"swift_task_id":@{@"type":@"string"}}}},
       @{@"name":@"get_swift_state",@"description":@"Read Swift runtime preparation and bounded task lifetime counters. Default off. Native job return, runtime completion entry and task identity observations are distinct; no Job/TaskLocal private layout is read.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
       @{@"name":@"get_swift_tasks",@"description":@"Read observed Swift task creation lifetimes, authoritative current-task observations, selected native scheduler entries and calibrated runtime completion evidence. Creation source is separate from Swift structured parenthood. Old task addresses are never identities.",@"inputSchema":@{@"type":@"object",@"properties":@{@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@512},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@16}}}},
@@ -3589,7 +3593,13 @@ static NSDictionary *tool_set_webkit_probe(NSDictionary *args) {
 }
 
 static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
-    if([@[@"register_unwind_recipe",@"set_unwind_recipe_enabled",@"run_unwind_selftest",@"run_operation_selftest",@"run_swift_selftest",@"configure_swift_capture"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
+    if([@[@"register_unwind_recipe",@"set_unwind_recipe_enabled",@"run_unwind_selftest",@"run_operation_selftest",@"run_swift_selftest",@"configure_swift_capture",@"configure_dispatch_entry",@"run_dispatch_entry_selftest"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
+    if([name isEqual:@"get_dispatch_entry_state"])return tool_ok(DHDispatchEntryState());
+    if([name isEqual:@"run_dispatch_entry_selftest"])return tool_ok(DHDispatchEntrySelfTest());
+    if([name isEqual:@"configure_dispatch_entry"]) {
+        id value=args[@"enabled"];if(![value isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)value)!=CFBooleanGetTypeID())return tool_err(@"enabled must be boolean");
+        NSDictionary *r=DHDispatchEntryConfigure([value boolValue]);return [r[@"ok"] boolValue]?tool_ok(r):tool_err(r[@"error"]);
+    }
     if([name isEqual:@"get_swift_state"])return tool_ok(DHSwiftState());
     if([name isEqual:@"get_swift_events"]) {
         for(NSString *key in @[@"after_seq",@"limit"])
@@ -3794,7 +3804,7 @@ static BOOL tool_is_heavy(NSString *name) {
                                       @"find_selector_refs", @"find_function_refs",
                                       @"analyze_function", @"disassemble_function",
                                       @"find_objc_methods", @"export_events", @"start_dump",
-                                      @"trace_function", @"run_hook_selftest", @"run_live_selftest", @"trace_live_arm", @"trace_live_cancel",@"configure_async_capture",@"run_flow_selftest",@"configure_swift_capture",@"run_swift_selftest"]];
+                                      @"trace_function", @"run_hook_selftest", @"run_live_selftest", @"trace_live_arm", @"trace_live_cancel",@"configure_async_capture",@"run_flow_selftest",@"configure_swift_capture",@"run_swift_selftest",@"configure_dispatch_entry",@"run_dispatch_entry_selftest"]];
     });
     return [heavy containsObject:name];
 }

@@ -18,14 +18,14 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.48
+VERSION := 1.28.49
 TARGET  := decrypt_helper.dylib
 .DEFAULT_GOAL := all
 .PHONY: test-hook-runtime test-hook-ios-build test-unwind-runtime test-flow-runtime
 .PHONY: test-operation-runtime test-unwind-recipes test-unwind-recipes-ios-build
-.PHONY: test-swift-runtime
+.PHONY: test-swift-runtime test-dispatch-entry-runtime
 
-HOOK_TEST_SRC := tests/hook_runtime_test.m src/core/dh_thunk.m src/core/dh_call_context.c src/core/dh_event.m src/core/dh_flow_swift.m \
+HOOK_TEST_SRC := tests/hook_runtime_test.m src/core/dh_thunk.m src/core/dh_call_context.c src/core/dh_event.m src/core/dh_flow_swift.m src/core/dh_flow_dispatch.m \
     src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_operations.m src/core/dh_flow_operation_selftest.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
     src/core/log_store.m src/core/dh_capture.c src/core/dh_noise.m src/core/dh_health.c src/core/dh_capability.c \
     src/core/fishhook.c src/server/dh_log_json.m
@@ -59,6 +59,18 @@ test-swift-runtime:
 		xcrun swiftc -swift-version 5 -parse-as-library -O -emit-library -module-name IDHSwiftFixtures -target arm64-apple-macos12.0 tests/fixtures/IDHSwiftFixtures.swift -o build/IDHSwiftFixtures.dylib && \
 		clang -fobjc-arc -O2 -g -DDH_HAVE_INLINE=1 -DDH_HAVE_QBDI=0 -Isrc/core -Isrc/server -Ivendor/dobby/include -framework Foundation tests/swift_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) vendor/dobby/lib/macos-arm64/libdobby.a -lc++ -o build/swift_runtime_test && \
 		python3 tests/run_unwind_runtime_test.py build/swift_runtime_test; \
+	fi
+
+test-dispatch-entry-runtime:
+	@mkdir -p build
+	clang -std=c11 -Wall -Wextra -Werror -Isrc/core tests/dispatch_callout_abi_test.c -o build/dispatch_callout_abi_test
+	./build/dispatch_callout_abi_test
+	@if [ "$$(uname -m)" != arm64 ] || [ ! -f vendor/dobby/lib/macos-arm64/libdobby.a ]; then \
+		echo "SKIP: native arm64 macOS Dobby unavailable; run tools/build_dobby_macos.sh"; \
+	else \
+		mkdir -p build && \
+		clang -fobjc-arc -O2 -g -DDH_HAVE_INLINE=1 -DDH_HAVE_QBDI=0 -Isrc/core -Isrc/server -Ivendor/dobby/include -framework Foundation tests/dispatch_entry_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) vendor/dobby/lib/macos-arm64/libdobby.a -lc++ -o build/dispatch_entry_runtime_test && \
+		python3 tests/run_unwind_runtime_test.py build/dispatch_entry_runtime_test; \
 	fi
 
 test-unwind-recipes:
@@ -109,7 +121,7 @@ SRC     := src/core/fishhook.c \
            src/core/dh_thunk.m \
            src/core/dh_call_context.c \
            src/core/dh_event.m \
-           src/core/dh_flow_swift.m \
+           src/core/dh_flow_swift.m src/core/dh_flow_dispatch.m \
            src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_operations.m src/core/dh_flow_operation_selftest.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
            src/core/dh_noise.m \
            src/core/dh_spoof.m \

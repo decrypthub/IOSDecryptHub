@@ -1,5 +1,16 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.49 真实私有 dispatch callback 入口（研发包）
+
+- 从实际快手 source 栈定位未导出的两指针 libdispatch callout；自有公开 source `_f` 回调的原返回地址、当前 unwind 函数边界、镜像、完整识别的 A64/PAC 调用/返回序列与再次真实执行校准。原型与 Apple 官方声明一致，原 context/function、原系统异常处理和执行次数保持；不读私有 source/continuation 字段，不用最近符号或固定偏移。
+- 独立默认关闭的准备/开关/状态/自检。实际 App callback 使用原有有界 Flow 表、当前队列和真实函数指针，已有任务身份优先。仅记录 callback-entry，未见注册/入队的字段为空；关闭后仍原样执行。未开启或无窗口时直接转发，代码补丁保留到重启，所有权与 Inline/Trace 互斥。自有校准 context 由取消 block 保有，控制侧超时不遗留借用栈指针。
+- Mac 最终 v43 的独立 C 负例、新 native 4 组、Swift 及所有原门禁、两类完整包通过。两台先在新代安装并关闭私有适配器，再通过 Swift 81 生命周期/4 错误 future/5 MCP 与原 39 flow、7 timer、2 诊断、10 原生/4 MCP operation、6 原生/4 MCP unwind、native/PAC/ABI/live7 与接口；再各通过新 private 4 原生/5 MCP，原门禁未放宽。
+- 最终私有专窗 Rootless 19、RootHide 18 次实际原 callback，与 TaskID/PC/线程/区间及完整 native 栈精确匹配。窗口前和关闭后原 callback 继续，缺失注册/提交不补造；反复出现的 context 地址不当作 source 生命周期。两窗展开不足为 0。先期 v41 Rootless 3 次 App 日志路径 metadata 止步证据保留。
+- 开启私有入口和 Swift 观测的普通网络窗口：Rootless 22 棵/330 对、RootHide 24 棵/360 对完整签名树，核心 15 参数、HTTP 与独立 HMAC/白盒/CRC 分别 22/66/22、24/72/24；7/6 条精确 GCD/native/HTTP，256/246 任务完成，两窗不足增量 0。窗口无新 App Swift Task，没有私有入口→sig3 外推。
+- 最终 v43 source 页面另验证 Rootless 2 注册/14 次、RootHide 4 注册/10 次原 callback，全部 PC/Task/注册 ID/线程/区间和完整 native 栈一致；30/16 个旧 callback 没有补造注册。Rootless 先期窗口发生日志背压、缺少早期入口事件；最终按用途筛选 other 并周期导出，丢弃 0，原捕获配置逐字节恢复。没有扩大预算或用任务元数据代替丢失的原入口。
+
+协议见 [PRIVATE_DISPATCH_ENTRY.md](PRIVATE_DISPATCH_ENTRY.md)。同源/安装字节/CI 复核继续；QBDI 异常/longjmp 透明执行和最终最高版本集成仍继续。没有发布 Release/APT。
+
 ## 2026-11-17：1.28.48 Swift Task 原生身份与生命周期（研发包）
 
 - 独立默认关闭的 `configure_swift_capture` 与状态/任务/调度事件/自检五项工具。public Swift 5.5/5.7 runtime 的 typed swiftcall 创建、job、global/main/delay/deadline 入队与 swiftasync 最终回调保持原参数、executor、closure、TaskLocal 和实际任务对象；Rootless 缺少 deadline 导出时明确报告。最终回调必须尾调用原函数，runtime 镜像、真实函数指针和可执行映射逐项校准，不从弱 unwind 范围猜入口，不读取私有 Task/Job 布局。
@@ -9,6 +20,8 @@
 - 最终真实快手网络：Rootless 21 棵/315 对、RootHide 23 棵/345 对完整调用，核心 15 参数、sig3/HTTP 和独立 HMAC/白盒/CRC 分别 21/63/21、23/69/23 一致；7/6 条 GCD/native/HTTP 链，256/246 任务均完成，展开不足增量 0。Rootless 无新 App Swift Task；RootHide 实际捕获 5 次 App Task 创建和四个 job 入口/返回，初始 enqueue 身份有效、读取时任务未结束，不伪称 completed。没有观测到 Swift→sig3。
 
 协议见 [SWIFT_TASK_FLOW.md](SWIFT_TASK_FLOW.md)。同源/安装字节与原 CI 核对继续；其它实际私有调度、source 实际路径、QBDI 异常/longjmp 透明执行及最终最高版本集成仍继续。没有发布 Release/APT。
+
+1.28.48 最终复核：`2be1dba` 原完整包 CI [44101039455](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44101039455) 第2次成功；首次未分配到 hosted runner、无步骤执行。215 同源、双机 Agent/Swift 资源安装字节和清理全部通过，未改原 CI 门禁。
 
 ## 2026-11-17：1.28.47 NSOperation 实际执行与生命周期（研发包）
 
