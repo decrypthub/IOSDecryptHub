@@ -1,5 +1,21 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.45 RunLoop / NSTimer（研发包）
+
+- 六个公开 CF 导入与既有 20 项调度导入统一管理所有权；CF context/retain/release、原 loop/mode、重复/移除/失效及 PerformBlock 原参数保持。四类 NSTimer 工厂固定原型保留 double、BOOL、target、selector、userInfo/block，不解析私有 info。统一 typed native/Method 后端与动态 Hook 互斥，原 Dobby 发布约束及已补丁 Trace 拒绝继续生效。
+- 每代实际 RunLoop target/block timer 校准 Foundation `__NSFireTimer(timer, info)`，不匹配则不启用。新 callback-entry 边明确窗口前注册未观察到，registrationId/submittedBy 为空；新建 timer 的 registration 与每次 delivery 分开，手动 fire 不冒充调度。
+- 新只读 get_timer_state 与 root_callback_include：直接观察工厂的 target 类/selector 标签筛选根，未知标签不匹配、后代继续传播；不扩大原 256 预算。Agent 内部提交继续排除，只在自有夹具线程显式允许测试来源，新增负例防止日志任务继承 App 上下文。
+- 实测发现旧 source 转发强参数在系统 disposal 取消时额外 retain 触发 libdispatch 引用计数保护。已改借用 source/queue/object 参数，并单独保有真正包装的 handler。旧优化 IR 回归为红，新 arm64/arm64e 九种 wrapper 检查为绿；过程中 unsafe block capture 的生命周期问题由原 runtime 测试捕获，并以 owned handler 修复。保留失败证据，不将其归因于环境。
+- 最终 v15：Mac 35 组（native/factory 明确 skip）、旧 runtime/ABI/unwind/iOS/updater 和两种完整包构建通过；双机 39 组 flow、新 timer MCP 7 项、诊断 2 项及原 native/PAC/ABI/live 7 组和接口回归通过，scope 保留。同源与 CI 继续核对；全部后续目标尚未结束。
+
+
+- 实际 NSTimer 定向窗口：Rootless 26 棵/390 对、RootHide 27 棵/405 对完整树，所有核心 15 参数 ABI、返回 sig3/HTTP 与独立 HMAC、白盒、CRC 一致。每台另有 3 条同时具备实际 timer TaskID、原 Foundation callback 在 native 栈内与精确 HTTP 的链，真实创建实参为 `[KSRefreshControl timerToWaitDragingEndFired:]`。各窗口 256 任务全部正常完成；仍有预算/筛选外请求，2/3 次展开证据不足均保留诊断而不猜关联。
+- 早期宽窗口曾被弹窗遮挡或重复 timer 耗尽预算，失败与不足证据单独保留。swipe 工具默认 20 个移动事件会在此 App 反复创建刷新轮询 timer，最终验证使用真实标签和短手势/单个移动事件；仍保持原任务预算。注册的 submittedNs 与本次 deliveryObservedNs/startedNs 含义不同，不能拿注册时间统计本次窗口耗尽时刻。
+
+- 换新进程后的普通网络回归：Rootless 20 棵/300 对、RootHide 21 棵/315 对，全部核心参数、HTTP 与独立原语一致；每台另有 4 条真实 GCD/native/HTTP 任务链，窗口展开不足增量均为 0。两类窗口分开保存，不据此称所有请求均有完整图。
+
+协议和边界见 [RUNLOOP_TIMERS.md](RUNLOOP_TIMERS.md)。没有发布 Release/APT。
+
 ## 2026-11-17：1.28.44 source 注册/delivery 与根 API 定向（研发包）
 
 - 新有界注册层把来源注册与每次回调分开，提供 get_async_registrations、registrationId/asyncRegistrationId、deliveryObservedNs 和明确的 registered-handler-to-callback 边。128 个注册不复用、每页最多 8 条；source 生命周期创建绑定最多 64 个，原任务预算不扩大。新 root_api_include 选择根入口，后代保留传播。

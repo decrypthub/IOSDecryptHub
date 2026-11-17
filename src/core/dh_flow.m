@@ -1,5 +1,6 @@
 #import "dh_flow.h"
 #import "dh_flow_sources.h"
+#import "dh_flow_timers.h"
 #import "dh_event.h"
 #import "dh_call_context.h"
 #import "log_store.h"
@@ -25,13 +26,14 @@ typedef struct FlowTask {
     uint64_t scopeSP,*cookie; struct FlowTask *previous;
     void *context;dispatch_function_t function;
     int state,depth;unsigned associationGaps; // 1 pending, 2 running, 3 completed, 4 aborted
-    char api[64],queue[128],terminal[64];DHRawStack stack;
+    char api[64],queue[128],terminal[64],callbackLabel[192];DHRawStack stack;
     uint64_t registration,delivery;
+    unsigned edgeKind;uint64_t enteredCall;
     uint64_t checkedCookie,checkedScopeSP,checkedBodyPC,checkedBodySP;
 } FlowTask;
 typedef struct {
     uint64_t parent,call,caller,callback,creationCaller,when,thread,window;
-    char queue[128];
+    char queue[128],callbackLabel[192];
 } FlowOrigin;
 enum { FLOW_REGISTRATIONS=128 };
 typedef struct {
@@ -48,6 +50,7 @@ static _Atomic int claiming;
 static char excludedQueues[8][128];static unsigned excludedCount;
 static char rootQueues[8][128];static unsigned rootQueueCount;
 static char rootAPIs[8][128];static unsigned rootAPICount;
+static char rootCallbacks[8][128];static unsigned rootCallbackCount;static _Atomic uint64_t rootCallbackMisses;
 static uint64_t windowStarted;static char stopReason[32]="disabled";
 static _Atomic uint64_t rootQueueMisses,queueExclusions;
 static _Atomic uint64_t rootAPIMisses;
@@ -73,6 +76,7 @@ static void task_unresolved(FlowTask *task,const char *reason);
 @end
 static __thread FlowGuard guards[64];static __thread unsigned guardCount;
 static __thread int busy;static __thread FlowTask *current;
+static __thread BOOL ownedFixtureScope;
 static __thread int atTaskEntry;
 typedef struct {FlowGuard guards[64];unsigned count;FlowTask *current;} FlowExitState;
 static __thread FlowExitState *exitState;
@@ -101,15 +105,16 @@ static NSString *queue_text(const char *label) {
 NSDictionary *DHFlowFields(uint64_t token) {
     if (!token || token>FLOW_CAP) return @{@"asyncTaskId":@"",@"asyncParentTaskId":@"",@"asyncSubmittedByCallId":@""};
     FlowTask *t=&tasks[token-1];NSMutableDictionary *result=[@{@"asyncTaskId":task_id(token),@"asyncParentTaskId":task_id(t->parent),@"asyncSubmittedByCallId":DHCallID(t->call)} mutableCopy];
-    if(t->registration)result[@"asyncRegistrationId"]=registration_id(t->registration);return result;
+    if(t->registration)result[@"asyncRegistrationId"]=registration_id(t->registration);
+    if(t->edgeKind==2)result[@"asyncEnteredByCallId"]=DHCallID(t->enteredCall);return result;
 }
 static void task_event(FlowTask *task,NSString *phase) {
     int saved=dh_in_hook;dh_in_hook=1;busy++;
     @autoreleasepool {
-        DHLogEntry *e=[DHLogEntry new];e.category=DHCategoryOther;e.algorithm=task->registration?@"registered-callback":@"gcd-async";e.operation=@(task->api);
+        DHLogEntry *e=[DHLogEntry new];e.category=DHCategoryOther;e.algorithm=task->edgeKind==2?@"runtime-callback-entry":task->registration?@"registered-callback":@"gcd-async";e.operation=@(task->api);
         DHStampEvent(e);NSMutableDictionary *c=[e.eventContext mutableCopy];c[@"kind"]=@"async-task";c[@"phase"]=phase;
         c[@"parentCallId"]=@"";[c addEntriesFromDictionary:DHFlowFields(task->id)];e.eventContext=c;
-        e.eventPayload=@{@"queue":queue_text(task->queue),@"submissionThreadId":@(task->submitThread),@"executionThreadId":@(task->thread),@"edge":task->registration?@"registered-handler-to-callback":@"observed-submit-to-execute",@"registrationId":registration_id(task->registration),@"terminalReason":@(task->terminal)};
+        e.eventPayload=@{@"queue":queue_text(task->queue),@"submissionThreadId":@(task->submitThread),@"executionThreadId":@(task->thread),@"edge":task->edgeKind==2?@"observed-callback-entry; registration-unobserved":task->registration?@"registered-handler-to-callback":@"observed-submit-to-execute",@"registrationId":registration_id(task->registration),@"terminalReason":@(task->terminal)};
         [[DHLogStore shared] append:e];
     }
     busy--;dh_in_hook=saved;
@@ -218,11 +223,11 @@ __attribute__((noinline,optnone)) void DHAsyncExecute(FlowTask *task,dispatch_bl
         int finalErrno=errno;DHFlowBoundary();current=task->previous;mirror();dh_call_set_async(current?current->id:0);task_end(task,normal,normal?"normal-return":"exception-unwinding-wrapper");errno=finalErrno;
     }
 }
-static BOOL prepare_origin(const char *api,const char *label,void *caller,void *callback,uintptr_t creationCaller,FlowOrigin *out) {
+static BOOL prepare_origin(const char *api,const char *label,void *caller,void *callback,uintptr_t creationCaller,BOOL runtimeEntry,const char *callbackLabel,FlowOrigin *out) {
     if (!atomic_load(&gateOn) || busy || dh_in_hook || dh_live_current()) return NO;
     int saved=errno;caller=ptrauth_strip(caller,ptrauth_key_function_pointer);
     Dl_info origin={0};int internalCaller=dh_in_hook;dh_in_hook=1;dladdr(caller,&origin);dh_in_hook=internalCaller;
-    if(origin.dli_fbase==agentBase && strcmp(label,"com.iosdecrypthub.flow.fixture")) {errno=saved;return NO;}
+    if(origin.dli_fbase==agentBase && strcmp(label,"com.iosdecrypthub.flow.fixture") && !ownedFixtureScope) {errno=saved;return NO;}
     DHFlowBoundary();uint64_t parent=dh_call_async(),call=dh_call_parent();
     pthread_mutex_lock(&flowLock);
     if (!enabled || DHMonotonicNS()>deadline) {if(enabled)strlcpy(stopReason,"expired",sizeof(stopReason));enabled=NO;atomic_store(&gateOn,0);pthread_mutex_unlock(&flowLock);errno=saved;return NO;}
@@ -230,7 +235,7 @@ static BOOL prepare_origin(const char *api,const char *label,void *caller,void *
     if (!parent && !call) {
         if (!roots) {errno=saved;return NO;}
         Dl_info info={0};int internal=dh_in_hook;dh_in_hook=1;BOOL app=dladdr(caller,&info) && info.dli_fname && strstr(info.dli_fname,".app/");dh_in_hook=internal;
-        if (!app) {errno=saved;return NO;}
+        if (!app && !runtimeEntry) {errno=saved;return NO;}
     }
     pthread_mutex_lock(&flowLock);
     for(unsigned i=0;i<excludedCount;i++)if(strcasestr(label,excludedQueues[i])) {atomic_fetch_add(&queueExclusions,1);pthread_mutex_unlock(&flowLock);errno=saved;return NO;}
@@ -244,32 +249,38 @@ static BOOL prepare_origin(const char *api,const char *label,void *caller,void *
         BOOL match=NO;for(unsigned i=0;i<rootAPICount;i++)if(strcasestr(api,rootAPIs[i])){match=YES;break;}
         if(!match){atomic_fetch_add(&rootAPIMisses,1);pthread_mutex_unlock(&flowLock);errno=saved;return NO;}
     }
-    memset(out,0,sizeof(*out));out->parent=parent;out->call=call;out->caller=(uint64_t)caller;out->callback=(uint64_t)ptrauth_strip(callback,ptrauth_key_function_pointer);out->creationCaller=creationCaller;out->when=DHMonotonicNS();out->window=windowStarted;
+    if(!parent && rootCallbackCount) {
+        BOOL match=NO;for(unsigned i=0;i<rootCallbackCount;i++)if(callbackLabel && strcasestr(callbackLabel,rootCallbacks[i])){match=YES;break;}
+        if(!match){atomic_fetch_add(&rootCallbackMisses,1);pthread_mutex_unlock(&flowLock);errno=saved;return NO;}
+    }
+    memset(out,0,sizeof(*out));strlcpy(out->callbackLabel,callbackLabel?:"",sizeof(out->callbackLabel));out->parent=parent;out->call=call;out->caller=(uint64_t)caller;out->callback=(uint64_t)ptrauth_strip(callback,ptrauth_key_function_pointer);out->creationCaller=creationCaller;out->when=DHMonotonicNS();out->window=windowStarted;
     pthread_threadid_np(NULL,&out->thread);strlcpy(out->queue,label,sizeof(out->queue));pthread_mutex_unlock(&flowLock);errno=saved;return YES;
 }
-static FlowTask *reserve_task(const char *api,const FlowOrigin *origin,uint64_t registration,const DHRawStack *sourceStack) {
+static FlowTask *reserve_task(const char *api,const FlowOrigin *origin,uint64_t registration,const DHRawStack *sourceStack,BOOL runtimeEntry) {
     int saved=errno;pthread_mutex_lock(&flowLock);unsigned depth=origin->parent?tasks[origin->parent-1].depth+1:0;
     if (!enabled || origin->window!=windowStarted || DHMonotonicNS()>deadline || taskCount==FLOW_CAP || pending>=FLOW_PENDING || windowCount>=windowLimit || depth>=FLOW_DEPTH) {
         atomic_fetch_add(&rejected,1);pthread_mutex_unlock(&flowLock);errno=saved;return NULL;
     }
     FlowTask *t=&tasks[taskCount++];t->id=taskCount;t->parent=origin->parent;t->call=origin->call;t->depth=depth;t->state=1;t->caller=origin->caller;t->callback=origin->callback;t->creationCaller=origin->creationCaller;t->submitted=origin->when;t->submitThread=origin->thread;t->registration=registration;t->delivery=registration?DHMonotonicNS():0;pending++;windowCount++;
-    strlcpy(t->api,api,sizeof(t->api));strlcpy(t->queue,origin->queue,sizeof(t->queue));
+    t->edgeKind=runtimeEntry?2:registration?1:0;if(runtimeEntry){t->enteredCall=t->call;t->call=0;t->delivery=DHMonotonicNS();}
+    strlcpy(t->api,api,sizeof(t->api));strlcpy(t->queue,origin->queue,sizeof(t->queue));strlcpy(t->callbackLabel,origin->callbackLabel,sizeof(t->callbackLabel));
     if(windowCount==windowLimit || taskCount==FLOW_CAP){strlcpy(stopReason,taskCount==FLOW_CAP?"record-capacity":"task-budget",sizeof(stopReason));atomic_store(&gateOn,0);}
     pthread_mutex_unlock(&flowLock);
     int internal=dh_in_hook;dh_in_hook=1;busy++;DHRawStack raw;
     if(sourceStack)raw=*sourceStack;else dh_unwind_current(&raw);
     if (raw.count>32) {raw.count=32;raw.complete=0;raw.truncated=1;raw.stopReason=DH_UNWIND_FRAME_LIMIT;}
     pthread_mutex_lock(&flowLock);t->stack=raw;pthread_mutex_unlock(&flowLock);
-    task_event(t,registration?@"delivery":@"submit");busy--;dh_in_hook=internal;errno=saved;return t;
+    task_event(t,runtimeEntry?@"callback-entry":registration?@"delivery":@"submit");busy--;dh_in_hook=internal;errno=saved;return t;
 }
 static FlowTask *select_task(const char *api,dispatch_queue_t queue,void *caller,void *callback,uintptr_t creationCaller) {
     if(!DHFlowCallbackCaptureActive())return NULL;
-    int saved=errno;FlowOrigin origin;BOOL selected=prepare_origin(api,dispatch_queue_get_label(queue)?:"",caller,callback,creationCaller,&origin);
-    FlowTask *task=selected?reserve_task(api,&origin,0,NULL):NULL;errno=saved;return task;
+    int saved=errno;FlowOrigin origin;BOOL selected=prepare_origin(api,dispatch_queue_get_label(queue)?:"",caller,callback,creationCaller,NO,NULL,&origin);
+    FlowTask *task=selected?reserve_task(api,&origin,0,NULL,NO):NULL;errno=saved;return task;
 }
 int DHFlowCallbackCaptureActive(void) {return atomic_load(&gateOn) && !busy && !dh_in_hook && !dh_live_current();}
-uint64_t DHFlowRegisterCallback(const char *api,const char *queue,void *caller,void *callback) {
-    int saved=errno;FlowOrigin origin;if(!prepare_origin(api,queue?:"",caller,callback,0,&origin)){errno=saved;return 0;}
+uint64_t DHFlowRegisterCallback(const char *api,const char *queue,void *caller,void *callback) {return DHFlowRegisterNamedCallback(api,queue,caller,callback,NULL);}
+uint64_t DHFlowRegisterNamedCallback(const char *api,const char *queue,void *caller,void *callback,const char *label) {
+    int saved=errno;FlowOrigin origin;if(!prepare_origin(api,queue?:"",caller,callback,0,NO,label,&origin)){errno=saved;return 0;}
     DHRawStack raw;busy++;dh_unwind_current(&raw);busy--;
     if(raw.count>32){raw.count=32;raw.complete=0;raw.truncated=1;raw.stopReason=DH_UNWIND_FRAME_LIMIT;}
     pthread_mutex_lock(&flowLock);uint64_t token=0;
@@ -289,14 +300,27 @@ void DHFlowUpdateCallbackQueue(uint64_t token,const char *queue) {
     if(token<=registrationCount)strlcpy(registrations[token-1].origin.queue,queue?:"",128);
     pthread_mutex_unlock(&flowLock);errno=saved;
 }
+int DHFlowRegistrationState(uint64_t token) {
+    int state=0;pthread_mutex_lock(&flowLock);
+    if(token && token<=registrationCount && registrations[token-1].active)state=registrations[token-1].window==windowStarted?1:2;
+    pthread_mutex_unlock(&flowLock);return state;
+}
+void DHFlowAdapterInternalBegin(void) {busy++;}
+void DHFlowAdapterInternalEnd(void) {busy--;}
+void DHFlowSetOwnedFixtureScope(BOOL on) {ownedFixtureScope=on;}
 void DHFlowRunCallback(uint64_t token,dispatch_block_t body) {
     if(!token || token>FLOW_REGISTRATIONS){body();return;}int saved=errno;FlowRegistration copy={0};BOOL selected=NO,capture=DHFlowCallbackCaptureActive();
     pthread_mutex_lock(&flowLock);
     if(token<=registrationCount){FlowRegistration *r=&registrations[token-1];r->invoked++;selected=capture && r->active && r->window==windowStarted && enabled && DHMonotonicNS()<=deadline;copy=*r;}
     pthread_mutex_unlock(&flowLock);
-    FlowTask *task=selected?reserve_task(copy.api,&copy.origin,token,&copy.stack):NULL;
+    FlowTask *task=selected?reserve_task(copy.api,&copy.origin,token,&copy.stack,NO):NULL;
     if(task){pthread_mutex_lock(&flowLock);registrations[token-1].captured++;pthread_mutex_unlock(&flowLock);}
     errno=saved;if(task)DHAsyncExecute(task,body);else body();
+}
+void DHFlowRunEntry(const char *api,const char *queue,void *caller,void *callback,dispatch_block_t body) {
+    int saved=errno;pthread_mutex_lock(&flowLock);BOOL roots=captureRoots;pthread_mutex_unlock(&flowLock);
+    FlowOrigin origin;BOOL selected=roots && prepare_origin(api,queue?:"",caller,callback,0,YES,NULL,&origin);
+    FlowTask *task=selected?reserve_task(api,&origin,0,NULL,YES):NULL;errno=saved;if(task)DHAsyncExecute(task,body);else body();
 }
 static void (*original_async)(dispatch_queue_t,dispatch_block_t);
 static void (*original_after)(dispatch_time_t,dispatch_queue_t,dispatch_block_t);
@@ -320,6 +344,12 @@ static BOOL plain_block(dispatch_block_t b) {
     if(!known)atomic_fetch_add(&skippedBlocks,1);return known;
 }
 uintptr_t DHFlowCallbackBlockAddress(dispatch_block_t body) {return plain_block(body)?block_invoke(body):0;}
+dispatch_block_t DHFlowWrapOneShot(const char *api,const char *queue,void *caller,dispatch_block_t body) {
+    int saved=errno;uintptr_t callback=DHFlowCallbackBlockAddress(body);FlowOrigin origin;
+    BOOL selected=callback && prepare_origin(api,queue?:"",caller,(void *)callback,0,NO,NULL,&origin);
+    FlowTask *task=selected?reserve_task(api,&origin,0,NULL,NO):NULL;errno=saved;
+    return task?^{DHAsyncExecute(task,body);}:body;
+}
 static FlowTask *block_task(const char *api,dispatch_queue_t q,dispatch_block_t b,void *caller) {
     if(!b || busy || dh_in_hook || dh_live_current())return NULL;
     if(block_invoke(b)!=specialInvoke)return plain_block(b)?select_task(api,q,caller,(void *)block_invoke(b),0):NULL;
@@ -382,7 +412,7 @@ static void wrap_block_notify(dispatch_block_t dependency,dispatch_queue_t queue
 }
 static void *symbol(const char *name) {void *p=dlsym(RTLD_DEFAULT,name);return p?ptrauth_sign_unauthenticated(ptrauth_strip(p,ptrauth_key_function_pointer),ptrauth_key_function_pointer,0):NULL;}
 static const char *ownedImports[]={"dispatch_async","dispatch_after","dispatch_group_async","dispatch_async_f","dispatch_after_f","dispatch_group_async_f","dispatch_block_create","dispatch_block_create_with_qos_class","dispatch_group_notify","dispatch_group_notify_f","dispatch_block_notify"};
-int DHFlowOwnsImport(const char *name) {if((!atomic_load(&installed) && !atomic_load(&claiming)) || !name)return 0;for(unsigned i=0;i<sizeof(ownedImports)/sizeof(*ownedImports);i++)if(!strcmp(name,ownedImports[i]))return 1;return DHFlowSourceOwnsImport(name);}
+int DHFlowOwnsImport(const char *name) {if((!atomic_load(&installed) && !atomic_load(&claiming)) || !name)return 0;for(unsigned i=0;i<sizeof(ownedImports)/sizeof(*ownedImports);i++)if(!strcmp(name,ownedImports[i]))return 1;return DHFlowSourceOwnsImport(name) || DHFlowTimerOwnsImport(name);}
 static NSDictionary *claim_error(NSString *message) {atomic_store(&claiming,0);return @{@"ok":@NO,@"error":message};}
 NSDictionary *DHFlowState(void) {
     pthread_mutex_lock(&flowLock);
@@ -391,14 +421,16 @@ NSDictionary *DHFlowState(void) {
     NSMutableDictionary *uncertain=[NSMutableDictionary dictionary];for(unsigned i=0;i<FLOW_DIAGNOSTIC_REASONS;i++)uncertain[@(diagnosticReasons[i])]=@(reasonCounts[i]);
     NSDictionary *r=@{@"enabled":@(atomic_load(&gateOn) && DHMonotonicNS()<=deadline),@"installed":@(installed),@"captureRoots":@(captureRoots),@"retained":@(taskCount),@"pendingOrRunning":@(pending),@"windowAccepted":@(windowCount),@"maxRecords":@1024,@"maxPending":@64,@"maxDepth":@8,@"retainedRegistrations":@(registrationCount),@"windowRegistrations":@(windowRegistrations),@"maxRegistrations":@(FLOW_REGISTRATIONS),
         @"abandonedCalls":@(atomic_load(&abandoned)),@"unverifiedBoundaries":@(atomic_load(&unverified)),@"unverifiedReasonCounts":uncertain,@"verifiedPartialBoundaries":@(atomic_load(&verifiedPartial)),@"retainedBoundaryDiagnostics":@(MIN(diagnosticSequence,(uint64_t)FLOW_DIAGNOSTICS)),@"guardOverflows":@(atomic_load(&guardOverflow)),@"rejectedTasks":@(atomic_load(&rejected)),@"skippedSpecialOrUnknownBlocks":@(atomic_load(&skippedBlocks)),@"specialBindingsCreated":@(specialCreated),@"specialUnresolved":@(atomic_load(&specialUnresolved)),@"queueExclude":filters,@"rootQueueInclude":includes,@"windowStopReason":@(reason),@"windowStartedNs":[NSString stringWithFormat:@"%llu",windowStarted],@"windowDeadlineNs":[NSString stringWithFormat:@"%llu",deadline],@"rootQueueMisses":@(atomic_load(&rootQueueMisses)),@"queueExclusions":@(atomic_load(&queueExclusions)),@"threadGuardCount":@(guardCount),@"threadAsyncTaskId":task_id(dh_call_async()),@"sourceAdapters":DHFlowSourceState()};
-    NSMutableDictionary *result=[r mutableCopy];result[@"rootAPIInclude"]=apis;result[@"rootAPIMisses"]=@(atomic_load(&rootAPIMisses));pthread_mutex_unlock(&flowLock);return result;
+    NSMutableArray *callbacks=[NSMutableArray array];for(unsigned i=0;i<rootCallbackCount;i++)[callbacks addObject:@(rootCallbacks[i])];
+    NSMutableDictionary *result=[r mutableCopy];result[@"rootCallbackInclude"]=callbacks;result[@"rootCallbackMisses"]=@(atomic_load(&rootCallbackMisses));result[@"rootAPIInclude"]=apis;result[@"rootAPIMisses"]=@(atomic_load(&rootAPIMisses));pthread_mutex_unlock(&flowLock);return result;
 }
 NSDictionary *DHFlowConfigure(BOOL on,BOOL roots,unsigned budget,unsigned ms,NSArray *excluded,NSArray *included) {
     return DHFlowConfigureWithAPIs(on,roots,budget,ms,excluded,included,nil);
 }
-NSDictionary *DHFlowConfigureWithAPIs(BOOL on,BOOL roots,unsigned budget,unsigned ms,NSArray *excluded,NSArray *included,NSArray *apis) {
+NSDictionary *DHFlowConfigureWithAPIs(BOOL on,BOOL roots,unsigned budget,unsigned ms,NSArray *excluded,NSArray *included,NSArray *apis) {return DHFlowConfigureWithCallbacks(on,roots,budget,ms,excluded,included,apis,nil);}
+NSDictionary *DHFlowConfigureWithCallbacks(BOOL on,BOOL roots,unsigned budget,unsigned ms,NSArray *excluded,NSArray *included,NSArray *apis,NSArray *callbacks) {
     if (on && (!budget || budget>256 || !ms || ms>60000)) return @{@"ok":@NO,@"error":@"async window requires 1..256 tasks / 1..60000ms"};
-    for(id filters in @[(excluded?:@[]),(included?:@[]),(apis?:@[])]) {
+    for(id filters in @[(excluded?:@[]),(included?:@[]),(apis?:@[]),(callbacks?:@[])]) {
     if(![filters isKindOfClass:NSArray.class] || [filters count]>8)return @{@"ok":@NO,@"error":@"queue filters require at most eight substrings"};
     for(id value in filters)if(![value isKindOfClass:NSString.class] || ![value length] || [value lengthOfBytesUsingEncoding:NSUTF8StringEncoding]>127 || strlen([value UTF8String])!=[value lengthOfBytesUsingEncoding:NSUTF8StringEncoding])return @{@"ok":@NO,@"error":@"queue filter must be a nonempty NUL-free string up to 127 UTF8 bytes"};
     }
@@ -406,8 +438,11 @@ NSDictionary *DHFlowConfigureWithAPIs(BOOL on,BOOL roots,unsigned budget,unsigne
         int expected=0;if(!atomic_compare_exchange_strong(&claiming,&expected,1))return @{@"ok":@NO,@"error":@"GCD ownership installation is busy"};
         size_t sourceCount=0;const struct rebinding *sourceBindings=DHFlowSourceBindings(&sourceCount);
         if(!sourceBindings || sourceCount>16)return claim_error(@"dispatch source forwarding symbols unavailable");
+        size_t timerCount=0;const struct rebinding *timerBindings=DHFlowTimerBindings(&timerCount);
+        if(!timerBindings || timerCount>6)return claim_error(@"RunLoop timer forwarding symbols unavailable");
         for(unsigned i=0;i<sizeof(ownedImports)/sizeof(*ownedImports);i++)if(dh_thunk_has_import(ownedImports[i]))return claim_error(@"a dynamic Import hook already owns a GCD submission; restart before enabling flow capture");
         for(size_t i=0;i<sourceCount;i++)if(dh_thunk_has_import(sourceBindings[i].name))return claim_error(@"a dynamic Import hook already owns a dispatch source adapter; restart before enabling flow capture");
+        for(size_t i=0;i<timerCount;i++)if(dh_thunk_has_import(timerBindings[i].name))return claim_error(@"a dynamic Import hook already owns a RunLoop adapter; restart before enabling flow capture");
         original_create=symbol("dispatch_block_create");original_create_qos=symbol("dispatch_block_create_with_qos_class");
         if(!original_create || !original_create_qos)return claim_error(@"GCD public block constructors unavailable");
         dispatch_block_t special=original_create(0,^{});specialInvoke=block_invoke(special);
@@ -428,9 +463,11 @@ NSDictionary *DHFlowConfigureWithAPIs(BOOL on,BOOL roots,unsigned budget,unsigne
         original_async(calibration,async);
         if(dispatch_semaphore_wait(ready,dispatch_time(DISPATCH_TIME_NOW,5000000000)) || !asyncPC || !dh_unwind_bounds(asyncPC,&specialAsyncStart,&specialAsyncEnd) || (directPC>=specialAsyncStart && directPC<specialAsyncEnd))return claim_error(@"GCD async/direct block invokers cannot be distinguished");
         struct rebinding binds[]={{"dispatch_async",wrap_async,NULL},{"dispatch_after",wrap_after,NULL},{"dispatch_group_async",wrap_group,NULL},{"dispatch_async_f",wrap_async_f,NULL},{"dispatch_after_f",wrap_after_f,NULL},{"dispatch_group_async_f",wrap_group_f,NULL},{"dispatch_block_create",wrap_create,NULL},{"dispatch_block_create_with_qos_class",wrap_create_qos,NULL},{"dispatch_group_notify",wrap_notify,NULL},{"dispatch_group_notify_f",wrap_notify_f,NULL},{"dispatch_block_notify",wrap_block_notify,NULL}};
+        DHFlowTimerPrepare();
         struct rebinding combined[32];size_t primaryCount=sizeof(binds)/sizeof(*binds);
         memcpy(combined,binds,sizeof(binds));memcpy(combined+primaryCount,sourceBindings,sourceCount*sizeof(*sourceBindings));
-        if (rebind_symbols(combined,primaryCount+sourceCount)<0) return claim_error(@"GCD rebinding registration failed");installed=YES;atomic_store(&claiming,0);
+        memcpy(combined+primaryCount+sourceCount,timerBindings,timerCount*sizeof(*timerBindings));
+        if (rebind_symbols(combined,primaryCount+sourceCount+timerCount)<0) return claim_error(@"GCD rebinding registration failed");installed=YES;atomic_store(&claiming,0);
     }
     pthread_mutex_lock(&flowLock);
     if(!on) {
@@ -441,20 +478,21 @@ NSDictionary *DHFlowConfigureWithAPIs(BOOL on,BOOL roots,unsigned budget,unsigne
     for(unsigned i=0;i<excludedCount;i++)strlcpy(excludedQueues[i],[excluded[i] UTF8String],128);
     rootQueueCount=(unsigned)included.count;for(unsigned i=0;i<rootQueueCount;i++)strlcpy(rootQueues[i],[included[i] UTF8String],128);
     rootAPICount=(unsigned)apis.count;for(unsigned i=0;i<rootAPICount;i++)strlcpy(rootAPIs[i],[apis[i] UTF8String],128);
+    rootCallbackCount=(unsigned)callbacks.count;for(unsigned i=0;i<rootCallbackCount;i++)strlcpy(rootCallbacks[i],[callbacks[i] UTF8String],128);
     windowStarted=DHMonotonicNS();deadline=windowStarted+(uint64_t)ms*1000000;strlcpy(stopReason,on?"capturing":"disabled",sizeof(stopReason));atomic_store(&gateOn,on && taskCount<FLOW_CAP);if(on && taskCount==FLOW_CAP)strlcpy(stopReason,"record-capacity",sizeof(stopReason));pthread_mutex_unlock(&flowLock);
-    return @{@"ok":@YES,@"state":DHFlowState(),@"coverage":@"six public GCD submission imports, three group/block notification imports, two public block constructors and bounded dispatch source adapters; selected plain App blocks/function callbacks and uniquely observed first submissions of blocks created during capture; original dispatch-block metadata preserved; unknown/preexisting/reused blocks have no guessed execution edge; no Swift/NSOperation/private scheduling coverage"};
+    return @{@"ok":@YES,@"state":DHFlowState(),@"coverage":@"six public GCD submission imports, three group/block notification imports, two public block constructors and bounded dispatch source/RunLoop timer adapters; selected plain App blocks/function callbacks and uniquely observed first submissions of blocks created during capture; original dispatch-block metadata preserved; unknown/preexisting/reused blocks have no guessed execution edge; no Swift/NSOperation/private scheduling coverage"};
 }
 NSDictionary *DHFlowRead(unsigned offset,unsigned limit,uint64_t token) {
     NSMutableArray *out=[NSMutableArray array];pthread_mutex_lock(&flowLock);unsigned total=taskCount;
     for (unsigned i=offset;i<total && out.count<limit;i++) {
         FlowTask *t=&tasks[i];if(token && t->id!=token)continue;
         NSMutableDictionary *d=[DHFlowFields(t->id) mutableCopy];d[@"state"]=t->state==1?@"pending":t->state==2?@"running":t->state==3?@"completed":t->state==4?@"aborted":@"unresolved";
-        d[@"api"]=@(t->api);d[@"queue"]=queue_text(t->queue);d[@"submissionThreadId"]=@(t->submitThread);d[@"executionThreadId"]=@(t->thread);d[@"depth"]=@(t->depth);
+        d[@"callbackLabel"]=@(t->callbackLabel);d[@"api"]=@(t->api);d[@"queue"]=queue_text(t->queue);d[@"submissionThreadId"]=@(t->submitThread);d[@"executionThreadId"]=@(t->thread);d[@"depth"]=@(t->depth);
         d[@"submissionCallerPC"]=[NSString stringWithFormat:@"0x%llx",t->caller];d[@"callbackPC"]=[NSString stringWithFormat:@"0x%llx",t->callback];
         d[@"terminalReason"]=@(t->terminal);
         d[@"associationGaps"]=@(t->associationGaps);d[@"dispatchBlockMetadataPreserved"]=@(t->creationCaller!=0);if(t->creationCaller)d[@"blockCreationCallerPC"]=[NSString stringWithFormat:@"0x%llx",t->creationCaller];
-        d[@"registrationId"]=registration_id(t->registration);d[@"edge"]=t->registration?@"registered-handler-to-callback":@"observed-submit-to-execute";
-        if(t->registration)d[@"deliveryObservedNs"]=[NSString stringWithFormat:@"%llu",t->delivery];
+        d[@"registrationId"]=registration_id(t->registration);d[@"edge"]=t->edgeKind==2?@"observed-callback-entry; registration-unobserved":t->registration?@"registered-handler-to-callback":@"observed-submit-to-execute";
+        if(t->registration || t->edgeKind==2)d[@"deliveryObservedNs"]=[NSString stringWithFormat:@"%llu",t->delivery];
         if(t->state==4)d[@"scopeEvidence"]=@{@"cookie":[NSString stringWithFormat:@"%llu",t->checkedCookie],@"scopeSP":[NSString stringWithFormat:@"0x%llx",t->checkedScopeSP],@"observedWrapperPC":[NSString stringWithFormat:@"0x%llx",t->checkedBodyPC],@"observedWrapperSP":[NSString stringWithFormat:@"0x%llx",t->checkedBodySP]};
         d[@"submittedNs"]=[NSString stringWithFormat:@"%llu",t->submitted];d[@"startedNs"]=[NSString stringWithFormat:@"%llu",t->started];d[@"finishedNs"]=[NSString stringWithFormat:@"%llu",t->finished];
         // Submit stack is published before forwarding; do not resolve mutable in-flight records.
@@ -489,7 +527,7 @@ NSDictionary *DHFlowRegistrations(unsigned offset,unsigned limit) {
             @"asyncParentTaskId":task_id(o->parent),@"registeredByCallId":DHCallID(o->call),@"registrationThreadId":@(o->thread),
             @"registeredNs":[NSString stringWithFormat:@"%llu",o->when],@"retiredNs":[NSString stringWithFormat:@"%llu",r->retired],
             @"queueAtRegistration":queue_text(r->originalQueue),@"currentKnownQueue":queue_text(o->queue),@"observedInvocations":@(r->invoked),@"capturedInvocations":@(r->captured),
-            @"callbackIdentity":DHTargetIdentity((void *)(uintptr_t)o->callback),@"registrationCallerIdentity":DHTargetIdentity((void *)(uintptr_t)o->caller),
+            @"callbackLabel":@(o->callbackLabel),@"callbackIdentity":DHTargetIdentity((void *)(uintptr_t)o->callback),@"registrationCallerIdentity":DHTargetIdentity((void *)(uintptr_t)o->caller),
             @"registrationStack":DHResolveStack(DHStackDictionary(&r->stack),YES),@"edge":@"registered-handler-to-callback; not an observed enqueue"}];
     }
     return @{@"processGeneration":DHProcessGeneration(),@"retained":@(retained),@"maxRecords":@(FLOW_REGISTRATIONS),@"registrations":out,@"nextOffset":offset+copied<retained?@(offset+copied):(id)NSNull.null};

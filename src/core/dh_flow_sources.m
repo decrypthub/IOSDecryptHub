@@ -14,8 +14,8 @@ static pthread_mutex_t sourceLock=PTHREAD_MUTEX_INITIALIZER;
 static unsigned sourceObjects;
 static _Atomic uint64_t unknownSources,unwrappedHandlers;
 static const char sourceBindingKey;
-typedef void (*SourceBlockSetter)(dispatch_source_t,dispatch_block_t);
-typedef void (*SourceFunctionSetter)(dispatch_source_t,dispatch_function_t);
+typedef void (*SourceBlockSetter)(__unsafe_unretained dispatch_source_t,__unsafe_unretained dispatch_block_t);
+typedef void (*SourceFunctionSetter)(__unsafe_unretained dispatch_source_t,dispatch_function_t);
 static __typeof__(&dispatch_source_create) original_create;
 static __typeof__(&dispatch_source_cancel) original_cancel;
 static __typeof__(&dispatch_set_target_queue) original_target;
@@ -177,13 +177,15 @@ DH_SOURCE_SLOT(127)
 #undef DH_SOURCE_SLOT
 static dispatch_function_t functions[SOURCE_SLOTS]={source_f_0,source_f_1,source_f_2,source_f_3,source_f_4,source_f_5,source_f_6,source_f_7,source_f_8,source_f_9,source_f_10,source_f_11,source_f_12,source_f_13,source_f_14,source_f_15,source_f_16,source_f_17,source_f_18,source_f_19,source_f_20,source_f_21,source_f_22,source_f_23,source_f_24,source_f_25,source_f_26,source_f_27,source_f_28,source_f_29,source_f_30,source_f_31,source_f_32,source_f_33,source_f_34,source_f_35,source_f_36,source_f_37,source_f_38,source_f_39,source_f_40,source_f_41,source_f_42,source_f_43,source_f_44,source_f_45,source_f_46,source_f_47,source_f_48,source_f_49,source_f_50,source_f_51,source_f_52,source_f_53,source_f_54,source_f_55,source_f_56,source_f_57,source_f_58,source_f_59,source_f_60,source_f_61,source_f_62,source_f_63,source_f_64,source_f_65,source_f_66,source_f_67,source_f_68,source_f_69,source_f_70,source_f_71,source_f_72,source_f_73,source_f_74,source_f_75,source_f_76,source_f_77,source_f_78,source_f_79,source_f_80,source_f_81,source_f_82,source_f_83,source_f_84,source_f_85,source_f_86,source_f_87,source_f_88,source_f_89,source_f_90,source_f_91,source_f_92,source_f_93,source_f_94,source_f_95,source_f_96,source_f_97,source_f_98,source_f_99,source_f_100,source_f_101,source_f_102,source_f_103,source_f_104,source_f_105,source_f_106,source_f_107,source_f_108,source_f_109,source_f_110,source_f_111,source_f_112,source_f_113,source_f_114,source_f_115,source_f_116,source_f_117,source_f_118,source_f_119,source_f_120,source_f_121,source_f_122,source_f_123,source_f_124,source_f_125,source_f_126,source_f_127};
 
-static DHFlowSourceBinding *binding(dispatch_source_t source) {return objc_getAssociatedObject((id)source,&sourceBindingKey);}
+// System disposal paths may cancel an object after external refs reached zero.
+// Preserve the public borrowed ABI; do not add ARC retains on dispatch inputs.
+static DHFlowSourceBinding *binding(__unsafe_unretained dispatch_source_t source) {return objc_getAssociatedObject((id)source,&sourceBindingKey);}
 static void replace_registration(DHFlowSourceBinding *owner,unsigned kind,uint64_t registration) {
     if(!owner)return;
     pthread_mutex_lock(&sourceLock);uint64_t previous=owner->registrations[kind];owner->registrations[kind]=registration;pthread_mutex_unlock(&sourceLock);
     DHFlowRetireCallback(previous,registration?"source-handler-replaced":"source-handler-removed-or-unobserved");
 }
-static __attribute__((ns_returns_retained)) dispatch_source_t wrap_source_create(dispatch_source_type_t type,uintptr_t handle,uintptr_t mask,dispatch_queue_t queue) {
+static __attribute__((ns_returns_retained)) dispatch_source_t wrap_source_create(dispatch_source_type_t type,uintptr_t handle,uintptr_t mask,__unsafe_unretained dispatch_queue_t queue) {
     int saved=errno;BOOL observe=DHFlowCallbackCaptureActive();
     if(observe && !dh_call_parent() && !dh_call_async()) {
         Dl_info origin={0};int internal=dh_in_hook;dh_in_hook=1;
@@ -202,7 +204,7 @@ static __attribute__((ns_returns_retained)) dispatch_source_t wrap_source_create
     }
     errno=final;return source;
 }
-static void set_block(dispatch_source_t source,dispatch_block_t body,unsigned kind,void *caller) {
+static void set_block(__unsafe_unretained dispatch_source_t source,__unsafe_unretained dispatch_block_t body,unsigned kind,void *caller) {
     int saved=errno;DHFlowSourceBinding *owner=binding(source);char queue[128]={0};
     if(owner){pthread_mutex_lock(&sourceLock);memcpy(queue,owner->queue,sizeof(queue));pthread_mutex_unlock(&sourceLock);}
     uintptr_t callback=DHFlowCallbackBlockAddress(body);uint64_t registration=0;
@@ -211,10 +213,14 @@ static void set_block(dispatch_source_t source,dispatch_block_t body,unsigned ki
     replace_registration(owner,kind,registration);
     if(!registration){if(body && DHFlowCallbackCaptureActive())atomic_fetch_add(&unwrappedHandlers,1);errno=saved;original_block[kind](source,body);return;}
     DHFlowSourceHandlerLifetime *lifetime=[DHFlowSourceHandlerLifetime new];lifetime.registration=registration;
-    dispatch_block_t wrapped=^{DHFlowRunCallback(lifetime.registration,body);};
+    // Capturing an unsafe block parameter would keep a borrowed pointer after
+    // the setter returns. Only the wrapping path owns the handler, just as the
+    // original setter copies it; the source argument itself stays borrowed.
+    dispatch_block_t ownedBody=body;
+    dispatch_block_t wrapped=^{DHFlowRunCallback(lifetime.registration,ownedBody);};
     errno=saved;original_block[kind](source,wrapped);
 }
-static void set_function(dispatch_source_t source,dispatch_function_t body,unsigned kind,void *caller) {
+static void set_function(__unsafe_unretained dispatch_source_t source,dispatch_function_t body,unsigned kind,void *caller) {
     int saved=errno;DHFlowSourceBinding *owner=binding(source);char queue[128]={0};uint64_t registration=0;
     if(owner){pthread_mutex_lock(&sourceLock);memcpy(queue,owner->queue,sizeof(queue));pthread_mutex_unlock(&sourceLock);}
     if(body && owner)registration=DHFlowRegisterCallback(functionAPIs[kind],queue,caller,(void *)body);
@@ -227,20 +233,20 @@ static void set_function(dispatch_source_t source,dispatch_function_t body,unsig
     pthread_mutex_lock(&sourceLock);functionSlots[index]=(SourceFunctionSlot){registration,body};pthread_mutex_unlock(&sourceLock);
     errno=saved;original_function[kind](source,functions[index]);
 }
-static void wrap_event(dispatch_source_t source,dispatch_block_t body) {set_block(source,body,0,__builtin_return_address(0));}
-static void wrap_cancel(dispatch_source_t source,dispatch_block_t body) {set_block(source,body,1,__builtin_return_address(0));}
-static void wrap_registration(dispatch_source_t source,dispatch_block_t body) {set_block(source,body,2,__builtin_return_address(0));}
-static void wrap_event_f(dispatch_source_t source,dispatch_function_t body) {set_function(source,body,0,__builtin_return_address(0));}
-static void wrap_cancel_f(dispatch_source_t source,dispatch_function_t body) {set_function(source,body,1,__builtin_return_address(0));}
-static void wrap_registration_f(dispatch_source_t source,dispatch_function_t body) {set_function(source,body,2,__builtin_return_address(0));}
-static void wrap_source_cancel(dispatch_source_t source) {
+static void wrap_event(__unsafe_unretained dispatch_source_t source,__unsafe_unretained dispatch_block_t body) {set_block(source,body,0,__builtin_return_address(0));}
+static void wrap_cancel(__unsafe_unretained dispatch_source_t source,__unsafe_unretained dispatch_block_t body) {set_block(source,body,1,__builtin_return_address(0));}
+static void wrap_registration(__unsafe_unretained dispatch_source_t source,__unsafe_unretained dispatch_block_t body) {set_block(source,body,2,__builtin_return_address(0));}
+static void wrap_event_f(__unsafe_unretained dispatch_source_t source,dispatch_function_t body) {set_function(source,body,0,__builtin_return_address(0));}
+static void wrap_cancel_f(__unsafe_unretained dispatch_source_t source,dispatch_function_t body) {set_function(source,body,1,__builtin_return_address(0));}
+static void wrap_registration_f(__unsafe_unretained dispatch_source_t source,dispatch_function_t body) {set_function(source,body,2,__builtin_return_address(0));}
+static void wrap_source_cancel(__unsafe_unretained dispatch_source_t source) {
     int saved=errno;DHFlowSourceBinding *owner=binding(source);
     if(owner){pthread_mutex_lock(&sourceLock);owner->cancelRequested=YES;pthread_mutex_unlock(&sourceLock);}
     // A request is not cancellation completion. Original in-flight deliveries
     // finish normally; actual handler disposal retires registrations separately.
     errno=saved;original_cancel(source);
 }
-static void wrap_target(dispatch_object_t object,dispatch_queue_t queue) {
+static void wrap_target(__unsafe_unretained dispatch_object_t object,__unsafe_unretained dispatch_queue_t queue) {
     int saved=errno;DHFlowSourceBinding *owner=objc_getAssociatedObject((id)object,&sourceBindingKey);
     errno=saved;original_target(object,queue);int final=errno;
     if(owner) {

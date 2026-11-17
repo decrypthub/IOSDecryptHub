@@ -27,6 +27,14 @@ extern "C" {
 int dh_thunk_inline_available(void);
 // 软停仍保留 Inline 补丁；Trace 原始目标前必须重启清除。
 int dh_thunk_is_inline_patched(uint64_t address);
+// Internal, compile-time typed adapters share the same patch transaction and
+// target ownership as dynamic Inline hooks. The adapter validates its ABI with
+// owned fixtures; this registry does not infer a binary's signature.
+int dh_thunk_install_adapter(uint64_t address,void *replacement,void **original,
+                             const char *owner,const char *signature,char *error,size_t error_size);
+int dh_thunk_has_method(const char *class_name,const char *selector,int class_method);
+typedef struct {Method method;void *replacement;void **original;const char *owner;} dh_method_adapter_spec;
+int dh_thunk_install_method_adapters(const dh_method_adapter_spec *specs,unsigned count,char *error,size_t error_size);
 int dh_thunk_live_target(int slot,uint64_t *target,uint64_t *original);
 
 #define DH_THUNK_COUNT 256   // thunk 槽位总数 (单调分配; 软停不回收, 硬停后退休)
@@ -58,6 +66,7 @@ int dh_thunk_install_configured(dh_hook_kind kind, const char *owner, const char
 #ifdef __OBJC__
 @class NSDictionary;
 NSDictionary *dh_thunk_metadata(int slot);
+NSDictionary *dh_thunk_adapter_metadata(int adapter);
 #endif
 
 // 一个已装 hook 的运行时快照 (给 list_hooks 用)。

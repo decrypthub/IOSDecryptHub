@@ -95,6 +95,12 @@ static _Atomic int g_slot_published[DH_THUNK_COUNT];
 static _Atomic uint64_t g_slot_inflight[DH_THUNK_COUNT];
 static void dh_prepare_slot_options(int slot);
 static BOOL dh_addr_is_executable(uint64_t addr);
+enum { DH_NATIVE_ADAPTERS=16 };
+typedef struct {void *target,*replacement;void **original;char owner[80],signature[80];int ready;} DHNativeAdapter;
+static DHNativeAdapter g_adapters[DH_NATIVE_ADAPTERS];static unsigned g_adapter_count;
+enum { DH_METHOD_ADAPTERS=64 };
+typedef struct {Method method;void *replacement;void **original;char owner[80];} DHMethodAdapter;
+static DHMethodAdapter g_method_adapters[DH_METHOD_ADAPTERS];static unsigned g_method_adapter_count;
 int dh_thunk_is_inline_patched(uint64_t address) {
     int found=0;
     pthread_mutex_lock(&g_install_lock);
@@ -102,6 +108,7 @@ int dh_thunk_is_inline_patched(uint64_t address) {
     for (int i=0;i<count;i++)
         if (g_slots[i].used && g_slots[i].kind==DH_HOOK_INLINE &&
             (uint64_t)(uintptr_t)g_slots[i].target==address) { found=1;break; }
+    for(unsigned i=0;i<g_adapter_count;i++)if((uint64_t)(uintptr_t)g_adapters[i].target==address){found=1;break;}
     pthread_mutex_unlock(&g_install_lock);
     return found;
 }
@@ -118,6 +125,12 @@ static int dh_unsafe_runtime_symbol(const char *symbol) {
 int dh_thunk_has_import(const char *name) {
     int found=0;pthread_mutex_lock(&g_install_lock);int n=atomic_load(&g_next_slot);
     for(int i=0;i<n && i<DH_THUNK_COUNT;i++)if(g_slots[i].used && g_slots[i].kind==DH_HOOK_IMPORT && !strcmp(g_slots[i].import_symbol,name)) {found=1;break;}
+    pthread_mutex_unlock(&g_install_lock);return found;
+}
+int dh_thunk_has_method(const char *class_name,const char *selector,int class_method) {
+    Class cls=objc_getClass(class_name);Method method=class_method?class_getClassMethod(cls,sel_registerName(selector)):class_getInstanceMethod(cls,sel_registerName(selector));
+    int found=0;pthread_mutex_lock(&g_install_lock);int count=atomic_load(&g_next_slot);
+    for(int i=0;i<count && i<DH_THUNK_COUNT;i++)if(g_slots[i].used && g_slots[i].kind==DH_HOOK_METHOD && g_slots[i].method==method){found=1;break;}
     pthread_mutex_unlock(&g_install_lock);return found;
 }
 
@@ -154,7 +167,7 @@ int dh_thunk_install_configured(dh_hook_kind kind, const char *owner, const char
     if (err && errsz) err[0] = 0;
     if (dh_thunk_validate_options(options, err, errsz)) return -6;
     if (kind != DH_HOOK_METHOD && dh_unsafe_runtime_symbol(name)) {
-        if (err && errsz) snprintf(err, errsz, "%s",DHFlowOwnsImport(name)?"GCD import is owned by bounded async capture; restart before changing ownership":"allocator/runtime hooks are unsafe because the event handler allocates");
+        if (err && errsz) snprintf(err, errsz, "%s",DHFlowOwnsImport(name)?"scheduler import is owned by bounded async capture; restart before changing ownership":"allocator/runtime hooks are unsafe because the event handler allocates");
         return -6;
     }
     int post = options->capture_return || options->capture_after || options->capture_ret_multi[0];
@@ -975,6 +988,7 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
     }
     if (!m) return -3;
     pthread_mutex_lock(&g_install_lock);
+    for(unsigned i=0;i<g_method_adapter_count;i++)if(g_method_adapters[i].method==m){pthread_mutex_unlock(&g_install_lock);return -5;}
     int total = atomic_load_explicit(&g_next_slot, memory_order_relaxed);
     if (total > DH_THUNK_COUNT) total = DH_THUNK_COUNT;
     for (int i = 0; i < total; i++) {
@@ -1156,6 +1170,10 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
 
     pthread_mutex_lock(&g_install_lock);
     // 同一目标不允许重复 inline hook: 旧补丁会把入口改成 thunk, 再 DobbyHook 会去 hook thunk 本身。
+    for(unsigned i=0;i<g_adapter_count;i++)if(g_adapters[i].target==target) {
+        if(err && errsz)snprintf(err,errsz,"typed adapter %s owns this target; restart before changing its patch",g_adapters[i].owner);
+        pthread_mutex_unlock(&g_install_lock);return -5;
+    }
     int total = atomic_load_explicit(&g_next_slot, memory_order_relaxed);
     if (total > DH_THUNK_COUNT) total = DH_THUNK_COUNT;
     for (int i = 0; i < total; i++) {
@@ -1272,6 +1290,84 @@ const char *dh_thunk_inline_backend(void) {
 #else
     return "unavailable(not-linked)";
 #endif
+}
+
+int dh_thunk_install_adapter(uint64_t address,void *replacement,void **original,const char *owner,const char *signature,char *error,size_t error_size) {
+    if(error && error_size)error[0]=0;
+#if !DH_HAVE_INLINE || !DH_THUNK_ARM64
+    if(error && error_size)snprintf(error,error_size,"typed Inline adapter backend is not linked for this architecture");return -4;
+#else
+    void *target=ptrauth_strip((void *)(uintptr_t)address,ptrauth_key_function_pointer);
+    replacement=ptrauth_strip(replacement,ptrauth_key_function_pointer);
+    Dl_info own={0},relay={0},origin={0};dladdr((void *)dh_thunk_install_adapter,&own);dladdr(replacement,&relay);dladdr(target,&origin);
+    if(!target || !replacement || !original || !owner || !*owner || !signature || !*signature ||
+       strlen(owner)>=80 || strlen(signature)>=80 || !own.dli_fbase || !relay.dli_fbase || relay.dli_fbase!=own.dli_fbase ||
+       dh_unsafe_runtime_symbol(origin.dli_sname) || !dh_addr_is_executable((uint64_t)target) || !dh_addr_is_executable((uint64_t)replacement)) {
+        if(error && error_size)snprintf(error,error_size,"invalid typed adapter target, relay, ownership or signature declaration");return -2;
+    }
+    pthread_mutex_lock(&g_install_lock);
+    for(unsigned i=0;i<g_adapter_count;i++)if(g_adapters[i].target==target) {
+        DHNativeAdapter *old=&g_adapters[i];int same=old->ready && old->replacement==replacement && old->original==original && !strcmp(old->owner,owner) && !strcmp(old->signature,signature);
+        if(!same && error && error_size)snprintf(error,error_size,"typed target already reserved; restart before changing its immutable adapter");
+        pthread_mutex_unlock(&g_install_lock);return same?(int)i:-5;
+    }
+    int count=atomic_load(&g_next_slot);
+    for(int i=0;i<count && i<DH_THUNK_COUNT;i++)if(g_slots[i].used && g_slots[i].kind==DH_HOOK_INLINE && g_slots[i].target==target) {
+        if(error && error_size)snprintf(error,error_size,"dynamic Inline slot %d already owns this target",i);pthread_mutex_unlock(&g_install_lock);return -5;
+    }
+    if(g_adapter_count==DH_NATIVE_ADAPTERS){if(error && error_size)snprintf(error,error_size,"typed adapter capacity exhausted");pthread_mutex_unlock(&g_install_lock);return -1;}
+    unsigned index=g_adapter_count++;DHNativeAdapter *entry=&g_adapters[index];entry->target=target;entry->replacement=replacement;entry->original=original;
+    strlcpy(entry->owner,owner,sizeof(entry->owner));strlcpy(entry->signature,signature,sizeof(entry->signature));
+    // Existing pinned Dobby publishes signed original with release ordering
+    // before routing Active. Keep even failed publication reserved forever.
+    int status=DobbyHook(target,replacement,original);entry->ready=status==0 && __atomic_load_n(original,__ATOMIC_ACQUIRE)!=NULL;
+    if(!entry->ready && error && error_size)snprintf(error,error_size,"typed Dobby activation failed; reservation retained until restart (status %d)",status);
+    pthread_mutex_unlock(&g_install_lock);return entry->ready?(int)index:-4;
+#endif
+}
+NSDictionary *dh_thunk_adapter_metadata(int index) {
+    pthread_mutex_lock(&g_install_lock);if(index<0 || (unsigned)index>=g_adapter_count){pthread_mutex_unlock(&g_install_lock);return nil;}
+    DHNativeAdapter entry=g_adapters[index];pthread_mutex_unlock(&g_install_lock);
+    return @{@"adapterId":@(index),@"owner":@(entry.owner),@"signature":@(entry.signature),@"ready":@(entry.ready),
+        @"targetIdentity":DHTargetIdentity(entry.target),@"patchRetainedUntilRestart":@YES};
+}
+int dh_thunk_install_method_adapters(const dh_method_adapter_spec *specs,unsigned count,char *error,size_t error_size) {
+    if(error && error_size)error[0]=0;if(!specs || !count || count>8)return -2;
+    Dl_info own={0};dladdr((void *)dh_thunk_install_method_adapters,&own);
+    for(unsigned i=0;i<count;i++) {
+        const dh_method_adapter_spec *s=&specs[i];Dl_info relay={0};void *code=ptrauth_strip(s->replacement,ptrauth_key_function_pointer);dladdr(code,&relay);
+        if(!s->method || !s->original || !s->owner || !*s->owner || strlen(s->owner)>=80 || !own.dli_fbase || relay.dli_fbase!=own.dli_fbase || !dh_addr_is_executable((uint64_t)code)) {
+            if(error && error_size)snprintf(error,error_size,"invalid typed method adapter %u",i);return -2;
+        }
+        for(unsigned j=0;j<i;j++)if(specs[j].method==s->method){if(error && error_size)snprintf(error,error_size,"duplicate Method in typed adapter batch");return -2;}
+    }
+    pthread_mutex_lock(&g_install_lock);unsigned required=0;int total=atomic_load(&g_next_slot);
+    for(unsigned i=0;i<count;i++) {
+        const dh_method_adapter_spec *s=&specs[i];BOOL existing=NO;
+        for(int k=0;k<total && k<DH_THUNK_COUNT;k++)if(g_slots[k].used && g_slots[k].kind==DH_HOOK_METHOD && g_slots[k].method==(void *)s->method) {
+            if(error && error_size)snprintf(error,error_size,"dynamic Method slot %d already owns typed adapter target",k);pthread_mutex_unlock(&g_install_lock);return -5;
+        }
+        for(unsigned k=0;k<g_method_adapter_count;k++)if(g_method_adapters[k].method==s->method) {
+            DHMethodAdapter *old=&g_method_adapters[k];existing=YES;
+            if(ptrauth_strip(old->replacement,ptrauth_key_function_pointer)!=ptrauth_strip(s->replacement,ptrauth_key_function_pointer) || old->original!=s->original || strcmp(old->owner,s->owner)) {
+                if(error && error_size)snprintf(error,error_size,"typed Method target reserved by %s",old->owner);pthread_mutex_unlock(&g_install_lock);return -5;
+            }
+        }
+        if(!existing)required++;
+    }
+    if(g_method_adapter_count+required>DH_METHOD_ADAPTERS){if(error && error_size)snprintf(error,error_size,"typed Method adapter capacity exhausted");pthread_mutex_unlock(&g_install_lock);return -1;}
+    // The full IDH-owned batch passes before any IMP is changed. Other plugins'
+    // independent objc runtime writes are outside this transaction.
+    for(unsigned i=0;i<count;i++) {
+        const dh_method_adapter_spec *s=&specs[i];BOOL existing=NO;
+        for(unsigned k=0;k<g_method_adapter_count;k++)if(g_method_adapters[k].method==s->method){existing=YES;break;}
+        if(existing)continue;
+        DHMethodAdapter *entry=&g_method_adapters[g_method_adapter_count++];entry->method=s->method;entry->replacement=s->replacement;entry->original=s->original;strlcpy(entry->owner,s->owner,sizeof(entry->owner));
+        void *original=(void *)method_getImplementation(s->method);__atomic_store_n(s->original,original,__ATOMIC_RELEASE);
+        IMP replacement=(IMP)ptrauth_sign_unauthenticated(ptrauth_strip(s->replacement,ptrauth_key_function_pointer),ptrauth_key_function_pointer,0);
+        method_setImplementation(s->method,replacement);
+    }
+    pthread_mutex_unlock(&g_install_lock);return 0;
 }
 
 int dh_thunk_set_describe(int slot, int on) {

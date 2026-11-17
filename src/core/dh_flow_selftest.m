@@ -7,6 +7,7 @@
 #include <unistd.h>
 #include <errno.h>
 #include <pthread.h>
+#import "dh_flow_timers.h"
 extern void DHFlowThrowCXX(void);
 extern int DHFlowCatchCXX(void (*body)(void *),void *context);
 extern int dh_thunk_post_frame(uint64_t pc,uint64_t sp,uint64_t callerSP);
@@ -46,6 +47,18 @@ static void source_cancel_f(void *opaque) {DHFlowSourceFixtureContext *context=(
 static void source_registration_f(void *opaque) {DHFlowSourceFixtureContext *context=(__bridge id)opaque;source_record(context.run,@"registration",context.tag);}
 static void source_old_f(void *opaque) {DHFlowSourceFixtureContext *context=(__bridge id)opaque;source_record(context.run,@"replaced-handler-ran",context.tag);}
 static void source_finalize_f(void *opaque) {id released=CFBridgingRelease(opaque);(void)released;}
+typedef struct {__unsafe_unretained NSMutableArray *rows;unsigned fired,retains,releases;} DHTimerFixtureContext;
+static const void *timer_context_retain(const void *opaque) {((DHTimerFixtureContext *)opaque)->retains++;return opaque;}
+static void timer_context_release(const void *opaque) {((DHTimerFixtureContext *)opaque)->releases++;}
+static void timer_record(NSMutableArray *rows,NSString *kind) {
+    CFStringRef mode=CFRunLoopCopyCurrentMode(CFRunLoopGetCurrent());
+    [rows addObject:@{@"kind":kind,@"task":DHFlowFields(dh_call_async())[@"asyncTaskId"],@"mode":(__bridge NSString *)mode?:@"<manual>"}];if(mode)CFRelease(mode);
+}
+static void timer_context_callback(CFRunLoopTimerRef timer,void *opaque) {
+    DHTimerFixtureContext *context=opaque;context->fired++;timer_record(context->rows,@"cf-timer");
+    if(context->fired==2)CFRunLoopTimerInvalidate(timer);
+}
+static void timer_source_noop(void *opaque) {(void)opaque;}
 @interface IDHFlowProbe:NSObject
 @property(strong) NSException *marker;
 @property(strong) NSMutableArray *observations;
@@ -54,6 +67,11 @@ static void source_finalize_f(void *opaque) {id released=CFBridgingRelease(opaqu
 @property(strong) dispatch_group_t notificationDependency;
 @property int mode;
 @property(copy) dispatch_block_t special;
+@property(strong) NSMutableArray *timerRows;
+@property(weak) NSTimer *expectedTimer;
+@property(strong) id timerMarker;
+@property unsigned timerContextRetains;
+@property unsigned timerContextReleases;
 - (uint64_t)normal:(uint64_t)n;
 - (uint64_t)throwOut;
 - (uint64_t)jumpOut;
@@ -64,6 +82,8 @@ static void source_finalize_f(void *opaque) {id released=CFBridgingRelease(opaqu
 - (uint64_t)unverified;
 - (uint64_t)partial;
 - (NSArray *)sourceMode:(uint64_t)mode;
+- (NSArray *)timerMode:(uint64_t)mode;
+- (void)timerTick:(NSTimer *)timer;
 @end
 static void cpp_body(void *p) {[( __bridge IDHFlowProbe *)p cppOut];}
 static void *exit_body(void *p) {[( __bridge IDHFlowProbe *)p exitOut];return NULL;}
@@ -130,6 +150,71 @@ static void function_body(void *p) {IDHFlowProbe *probe=CFBridgingRelease(p);[pr
     require(!timedOut,@"source callbacks timed out; cancellation requested, callback storage remains lifetime-owned");
     for(unsigned i=0;i<100 && [DHFlowState()[@"pendingOrRunning"] unsignedIntValue];i++)usleep(10000);
     return [run.rows copy];
+}
+- (void)timerTick:(NSTimer *)timer {
+    timer_record(self.timerRows,timer==self.expectedTimer && timer.userInfo==self.timerMarker?@"native-timer-original-target":@"native-timer-argument-mismatch");
+    if(self.timerRows.count==2)[timer invalidate];
+}
+- (NSArray *)timerMode:(uint64_t)mode {
+    NSMutableArray *rows=[NSMutableArray array];CFRunLoopRef loop=CFRunLoopGetCurrent();CFStringRef custom=CFSTR("IDHFlowTimerMode");
+    if(mode==11) {
+        dispatch_semaphore_t done=dispatch_semaphore_create(0);
+        dispatch_queue_t queue=dispatch_queue_create("com.iosdecrypthub.internal-origin.fixture",DISPATCH_QUEUE_SERIAL);
+        DHFlowSetOwnedFixtureScope(NO);
+        @try {dispatch_async(queue,^{timer_record(rows,@"agent-internal-forwarded");dispatch_semaphore_signal(done);});}
+        @finally {DHFlowSetOwnedFixtureScope(YES);}
+        require(dispatch_semaphore_wait(done,dispatch_time(DISPATCH_TIME_NOW,5000000000))==0,@"internal origin callback timed out");return rows;
+    }
+    if(mode==1 || mode==2) {
+        DHTimerFixtureContext context={.rows=rows};CFRunLoopTimerContext input={.version=0,.info=&context,.retain=timer_context_retain,.release=timer_context_release};
+        CFRunLoopTimerRef timer=CFRunLoopTimerCreate(NULL,CFAbsoluteTimeGetCurrent()+0.001,0.002,0,0,timer_context_callback,&input);
+        require(timer!=NULL,@"CF timer fixture creation failed");CFRunLoopTimerContext actual={0};CFRunLoopTimerGetContext(timer,&actual);
+        require(actual.info==&context && actual.retain==input.retain && actual.release==input.release && context.retains==1,@"CF timer adapter changed public context or retain semantics");
+        CFRunLoopAddTimer(loop,timer,custom);
+        if(mode==2){CFRunLoopRemoveTimer(loop,timer,custom);CFRunLoopTimerInvalidate(timer);}
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.01,false);require(!rows.count,@"timer fired in the wrong runloop mode");
+        CFRunLoopRunInMode(custom,0.1,false);
+        require((mode==1 && rows.count==2) || (mode==2 && !rows.count),@"CF timer repeat/removal behavior changed");
+        require(!CFRunLoopTimerIsValid(timer),@"timer invalidation did not reach the original object");
+        CFRelease(timer);self.timerContextRetains=context.retains;self.timerContextReleases=context.releases;
+        require(context.retains==context.releases,@"CF timer context ownership did not balance before fixture storage left scope");return rows;
+    }
+    if(mode==3) {
+        __block CFRunLoopTimerRef expected=NULL;
+        CFRunLoopTimerRef timer=CFRunLoopTimerCreateWithHandler(NULL,CFAbsoluteTimeGetCurrent()+0.001,0,0,0,^(CFRunLoopTimerRef actual){timer_record(rows,actual==expected?@"cf-handler-original-timer":@"cf-handler-mismatch");});
+        expected=timer;require(timer!=NULL,@"CF handler fixture creation failed");CFRunLoopAddTimer(loop,timer,custom);CFRunLoopRunInMode(custom,0.1,false);
+        require(rows.count==1 && !CFRunLoopTimerIsValid(timer),@"one-shot CF handler behavior changed");CFRelease(timer);return rows;
+    }
+    if(mode==4) {
+        CFRunLoopSourceContext context={.version=0,.perform=timer_source_noop};CFRunLoopSourceRef keepAlive=CFRunLoopSourceCreate(NULL,0,&context);CFRunLoopAddSource(loop,keepAlive,custom);
+        CFRunLoopPerformBlock(loop,custom,^{timer_record(rows,@"runloop-block");CFRunLoopStop(loop);});CFRunLoopWakeUp(loop);
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.01,false);require(!rows.count,@"perform block ignored its original mode");CFRunLoopRunInMode(custom,0.1,false);
+        CFRunLoopRemoveSource(loop,keepAlive,custom);CFRunLoopSourceInvalidate(keepAlive);CFRelease(keepAlive);require(rows.count==1,@"perform block did not execute exactly once");return rows;
+    }
+    if(mode==5) {
+        // Created outside observation: only actual entry may be claimed.
+        DHFlowConfigure(NO,NO,1,1,nil,nil);self.timerRows=rows;self.timerMarker=[NSObject new];
+        NSTimer *timer=[NSTimer timerWithTimeInterval:0.002 target:self selector:@selector(timerTick:) userInfo:self.timerMarker repeats:YES];self.expectedTimer=timer;
+        CFRunLoopAddTimer(loop,(__bridge CFRunLoopTimerRef)timer,custom);
+        DHFlowConfigureWithAPIs(YES,YES,16,10000,nil,@[@"IDHFlowTimerMode"],@[@"NSTimer.runloop-callback"]);CFRunLoopRunInMode(custom,0.1,false);[timer invalidate];
+        require(rows.count==2 && [rows[0][@"kind"] isEqual:@"native-timer-original-target"] && [rows[1][@"kind"] isEqual:@"native-timer-original-target"] && !timer.valid,@"native timer original target/argument/invalidation changed");
+        self.expectedTimer=nil;return rows;
+    }
+    if(mode>=6 && mode<=10) {
+        self.timerRows=rows;self.timerMarker=[NSObject new];NSTimer *timer=nil;BOOL block=(mode==7 || mode==9),scheduled=(mode==8 || mode==9);
+        if(block) {
+            void (^body)(NSTimer *)=^(NSTimer *actual){timer_record(rows,actual==self.expectedTimer?@"factory-block-original-timer":@"factory-block-mismatch");if(rows.count==2)[actual invalidate];};
+            timer=scheduled?[NSTimer scheduledTimerWithTimeInterval:0.002 repeats:YES block:body]:[NSTimer timerWithTimeInterval:0.002 repeats:YES block:body];
+        } else timer=scheduled?[NSTimer scheduledTimerWithTimeInterval:0.002 target:self selector:@selector(timerTick:) userInfo:self.timerMarker repeats:YES]:[NSTimer timerWithTimeInterval:0.002 target:self selector:@selector(timerTick:) userInfo:self.timerMarker repeats:YES];
+        self.expectedTimer=timer;
+        if(mode==10){[timer fire];[timer fire];[timer invalidate];}
+        else if(scheduled) {CFRunLoopRunInMode(custom,0.01,false);require(!rows.count,@"scheduled factory moved timer out of original default mode");CFRunLoopRunInMode(kCFRunLoopDefaultMode,0.1,false);}
+        else {CFRunLoopAddTimer(loop,(__bridge CFRunLoopTimerRef)timer,custom);CFRunLoopRunInMode(custom,0.1,false);}
+        require(rows.count==2 && !timer.valid && fabs(timer.timeInterval-0.002)<1e-9,@"NSTimer factory changed interval, repeat count or invalidation");
+        for(NSDictionary *row in rows)require([row[@"kind"] isEqual:block?@"factory-block-original-timer":@"native-timer-original-target"],@"NSTimer factory changed original callback argument/target/userInfo");
+        self.expectedTimer=nil;return rows;
+    }
+    return rows;
 }
 - (uint64_t)schedule {
     dispatch_group_t group=self.group;dispatch_queue_t queue=self.queue;
@@ -209,10 +294,11 @@ NSDictionary *DHFlowSelfTest(void) {
     NSMutableArray *passed=[NSMutableArray array],*slots=[NSMutableArray array];NSMutableDictionary *result=[@{@"pass":@NO,@"restartRequired":@YES} mutableCopy];
     IDHFlowProbe *probe=[IDHFlowProbe new];probe.marker=[NSException exceptionWithName:@"IDH-original-marker" reason:@"fixture" userInfo:nil];probe.observations=[NSMutableArray array];
     probe.queue=dispatch_queue_create("com.iosdecrypthub.flow.fixture",DISPATCH_QUEUE_SERIAL);probe.group=dispatch_group_create();
+    DHFlowSetOwnedFixtureScope(YES);
     @try {
         require(![DHLogStore shared].paused && ![[DHLogStore shared] isPausedForCategory:DHCategoryOther],@"resume all/other before selftest");
         dh_hook_options options;dh_thunk_options_default(&options);options.fixed_abi=1;options.capture_return=1;char error[512]={0};
-        for(NSString *name in @[@"normal:",@"throwOut",@"jumpOut",@"cppOut",@"catchInside",@"schedule",@"exitOut",@"unverified",@"partial",@"sourceMode:"]) {
+        for(NSString *name in @[@"normal:",@"throwOut",@"jumpOut",@"cppOut",@"catchInside",@"schedule",@"exitOut",@"unverified",@"partial",@"sourceMode:",@"timerMode:"]) {
             int slot=dh_thunk_install_configured(DH_HOOK_METHOD,"IDHFlowProbe",name.UTF8String,0,0,NULL,&options,error,sizeof(error));require(slot>=0,@(error));[slots addObject:@(slot)];
         }
         uint64_t initial=[DHFlowState()[@"abandonedCalls"] unsignedLongLongValue];
@@ -314,6 +400,57 @@ NSDictionary *DHFlowSelfTest(void) {
         [probe schedule];drain(probe);
         require([DHFlowState()[@"retained"] unsignedIntValue]==sourceBefore && probe.observations.count==apiObserved+7 && [DHFlowState()[@"rootAPIMisses"] unsignedLongLongValue]>0,@"root API filter captured unrelated GCD roots or changed their original execution");
         [passed addObject:@"root-API-filter-is-case-insensitive-keeps-source-descendants-and-forwards-unmatched-roots"];
+        DHFlowConfigure(NO,NO,1,1,nil,nil);NSArray *timerBaseline=[probe timerMode:1];
+        unsigned baselineRetains=probe.timerContextRetains,baselineReleases=probe.timerContextReleases;
+        require(timerBaseline.count==2 && ![timerBaseline[0][@"task"] length] && ![timerBaseline[1][@"task"] length],@"uncaptured timer baseline acquired a task");
+        unsigned timerBefore=[DHFlowState()[@"retained"] unsignedIntValue];
+        DHFlowConfigure(YES,NO,32,10000,nil,nil);NSArray *timerRows=[probe timerMode:1];
+        require(probe.timerContextRetains==baselineRetains && probe.timerContextReleases==baselineReleases,@"CF timer context ownership differs from the same uncaptured repeat sequence");
+        require(timerRows.count==2 && [timerRows[0][@"task"] length]>0 && [timerRows[1][@"task"] length]>0 && ![timerRows[0][@"task"] isEqual:timerRows[1][@"task"]],@"CF repeat deliveries lost distinct task identities");
+        for(NSDictionary *row in timerRows)require([row[@"mode"] isEqual:@"IDHFlowTimerMode"],@"CF repeat callback ran in wrong mode");
+        require([DHFlowState()[@"retained"] unsignedIntValue]==timerBefore+2,@"CF timer created phantom enqueues or missed real deliveries");
+        [passed addObject:@"CF-timer-original-context-retain-release-repeat-and-runloop-mode-preserved"];
+        timerBefore=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,32,10000,nil,nil);[probe timerMode:2];
+        require([DHFlowState()[@"retained"] unsignedIntValue]==timerBefore,@"removed/invalid timer falsely became a pending delivery");
+        [passed addObject:@"CF-timer-removal-and-invalidation-do-not-invent-delivery-tasks"];
+        DHFlowConfigure(YES,NO,32,10000,nil,nil);timerRows=[probe timerMode:3];
+        require([timerRows.firstObject[@"task"] length]>0 && [timerRows.firstObject[@"kind"] isEqual:@"cf-handler-original-timer"],@"CF handler argument or task identity changed");
+        [passed addObject:@"CF-timer-handler-keeps-original-timer-and-one-shot-invalidation"];
+        timerBefore=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,32,10000,nil,nil);timerRows=[probe timerMode:4];
+        NSArray *performTasks=DHFlowRead(timerBefore,4,0)[@"tasks"];
+        require([timerRows.firstObject[@"task"] length]>0 && performTasks.count==1 && [performTasks.firstObject[@"api"] isEqual:@"CFRunLoopPerformBlock"] && [performTasks.firstObject[@"edge"] isEqual:@"observed-submit-to-execute"],@"runloop block mode/submission/execution identity changed");
+        [passed addObject:@"RunLoop-perform-block-preserves-mode-and-actual-single-queue-edge"];
+        if([DHFlowTimerState()[@"nativeEntryReady"] boolValue]) {
+            timerBefore=[DHFlowState()[@"retained"] unsignedIntValue];timerRows=[probe timerMode:5];
+            NSArray *nativeTasks=DHFlowRead(timerBefore,8,0)[@"tasks"];require(nativeTasks.count==2,@"native timer entries were lost or counted twice");
+            for(NSDictionary *row in timerRows)require([row[@"task"] length]>0,@"old timer actual entry not observed");
+            for(NSDictionary *task in nativeTasks)require([task[@"edge"] isEqual:@"observed-callback-entry; registration-unobserved"] && ![task[@"registrationId"] length] && ![task[@"asyncSubmittedByCallId"] length] && [task[@"asyncEnteredByCallId"] length]>0,@"old timer fabricated registration or submission history");
+            [passed addObject:@"native-Foundation-timer-entry-ABI-calibrated-without-fake-prewindow-registration"];
+        } else result[@"skipped"]=@[@{@"fixture":@"native-Foundation-timer-entry",@"reason":DHFlowTimerState()[@"nativeEntryReason"]}];
+        if([DHFlowTimerState()[@"factoriesReady"] boolValue]) {
+            for(NSNumber *mode in @[@6,@7,@8,@9]) {
+                timerBefore=[DHFlowState()[@"retained"] unsignedIntValue];unsigned registrationStart=[DHFlowState()[@"retainedRegistrations"] unsignedIntValue];
+                DHFlowConfigureWithCallbacks(YES,NO,16,10000,nil,nil,nil,@[@"IDHFlowProbe timerTick:",@"NSTimer.block"]);timerRows=[probe timerMode:mode.unsignedLongLongValue];
+                NSArray *tasks=DHFlowRead(timerBefore,8,0)[@"tasks"],*registrations=DHFlowRegistrations(registrationStart,8)[@"registrations"];
+                require(tasks.count==2 && registrations.count==1 && [registrations.firstObject[@"capturedInvocations"] unsignedIntValue]==2,@"NSTimer factory double-registered an internal CF create or conflated repeats");
+                for(NSDictionary *row in timerRows)require([row[@"task"] length]>0,@"registered NSTimer callback lost task identity");
+                for(NSDictionary *task in tasks)require([task[@"edge"] isEqual:@"registered-handler-to-callback"] && [task[@"registrationId"] length]>0,@"registered NSTimer delivery fabricated an enqueue");
+            }
+            [passed addObject:@"NSTimer-target-block-scheduled-and-unscheduled-factories-preserve-registration-mode-and-original-behavior"];
+            timerBefore=[DHFlowState()[@"retained"] unsignedIntValue];unsigned registrationBefore=[DHFlowState()[@"retainedRegistrations"] unsignedIntValue];
+            DHFlowConfigureWithCallbacks(YES,NO,16,10000,nil,nil,nil,@[@"IDHNoSuchTimerTarget"]);timerRows=[probe timerMode:6];
+            require(timerRows.count==2 && [DHFlowState()[@"retained"] unsignedIntValue]==timerBefore && [DHFlowState()[@"retainedRegistrations"] unsignedIntValue]==registrationBefore && [DHFlowState()[@"rootCallbackMisses"] unsignedLongLongValue]>0,@"timer callback label filter changed original execution or accepted unknown root");
+            [passed addObject:@"timer-target-selector-root-filter-preserves-original-callback"];
+            timerBefore=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,16,10000,nil,nil);timerRows=[probe timerMode:10];
+            require([DHFlowState()[@"retained"] unsignedIntValue]==timerBefore,@"manual fire was misreported as scheduled runtime callback");
+            for(NSDictionary *row in timerRows)require(![row[@"task"] length],@"manual fire invented asynchronous context");
+            [passed addObject:@"NSTimer-manual-fire-stays-synchronous-and-is-not-a-scheduled-delivery"];
+        } else {
+            NSMutableArray *skipped=[result[@"skipped"] mutableCopy]?:[NSMutableArray array];[skipped addObject:@{@"fixture":@"NSTimer-factory-correlation",@"reason":DHFlowTimerState()[@"factoryReason"]}];result[@"skipped"]=skipped;
+        }
+        unsigned internalBefore=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,8,10000,nil,nil);NSArray *internalRows=[probe timerMode:11];
+        require(internalRows.count==1 && ![internalRows[0][@"task"] length] && [DHFlowState()[@"retained"] unsignedIntValue]==internalBefore,@"Agent internal work inherited an App post/async context");
+        [passed addObject:@"Agent-internal-dispatch-stays-excluded-even-inside-observed-post"];
         unsigned filteredBefore=[DHFlowState()[@"retained"] unsignedIntValue];NSUInteger observedBefore=probe.observations.count;
         DHFlowConfigure(YES,NO,8,10000,nil,@[@"nonmatching-root"]);[probe schedule];drain(probe);
         require([DHFlowState()[@"retained"] unsignedIntValue]==filteredBefore && probe.observations.count==observedBefore+7,@"root filter changed original callbacks or accepted unmatched roots");
@@ -351,6 +488,6 @@ NSDictionary *DHFlowSelfTest(void) {
         for(NSNumber *slot in slots)require([dh_thunk_metadata(slot.intValue)[@"inFlight"] longLongValue]==0,@"owned inflight counter leaked");
         require([DHFlowState()[@"threadGuardCount"] intValue]==0,@"thread guard stack leaked");result[@"pass"]=@YES;
     }@catch(NSException *e) {result[@"error"]=e.reason?:@"flow fixture failed";}
-    @finally {jumpTarget=NULL;[DHLogStore shared].paused=NO;DHFlowConfigure(NO,NO,1,1,nil,nil);for(NSNumber *slot in slots)dh_thunk_disable(slot.intValue);}
+    @finally {jumpTarget=NULL;[DHLogStore shared].paused=NO;DHFlowConfigure(NO,NO,1,1,nil,nil);DHFlowSetOwnedFixtureScope(NO);for(NSNumber *slot in slots)dh_thunk_disable(slot.intValue);}
     result[@"passed"]=passed;result[@"slots"]=slots;result[@"state"]=DHFlowState();return result;
 }
