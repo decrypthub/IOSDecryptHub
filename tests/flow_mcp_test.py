@@ -27,7 +27,7 @@ class FlowTests(unittest.TestCase):
         for bad in [{'enabled':1},{'enabled':'true'},{'capture_roots':1},{'max_tasks':0},{'max_tasks':257},{'max_ms':0},{'max_ms':60001},{'max_ms':True},{'max_tasks':1.5},{'process_generation':'old'},{'queue_exclude':None},{'queue_exclude':['x']*9},{'queue_exclude':['']},{'queue_exclude':['a\x00b']},{'queue_exclude':['a'*128]},{'root_queue_include':None},{'root_queue_include':['x']*9},{'root_queue_include':['']},{'root_queue_include':['a\x00b']},{'root_queue_include':['a'*128]},{'root_queue_include':['汉'*43]},{'root_queue_include':'network'}]:
             with self.subTest(bad=bad):self.assertTrue(self.raw('configure_async_capture',{**base,**bad}).get('isError'))
         self.assertTrue(self.raw('configure_async_capture',{'process_generation':g}).get('isError'))
-        for symbol in ['dispatch_async','dispatch_block_create','dispatch_block_create_with_qos_class']:self.assertTrue(self.raw('hook_import',{'symbol':symbol,'process_generation':g}).get('isError'))
+        for symbol in ['dispatch_async','dispatch_block_create','dispatch_block_create_with_qos_class','dispatch_group_notify','dispatch_group_notify_f','dispatch_block_notify']:self.assertTrue(self.raw('hook_import',{'symbol':symbol,'process_generation':g}).get('isError'))
         for bad in [{'limit':0},{'limit':129},{'offset':1025},{'offset':True},{'task_id':'old:async:1'}]:
             with self.subTest(bad=bad):self.assertTrue(self.raw('get_async_tasks',bad).get('isError'))
         self.assertEqual(hooks,self.call('list_hooks'));self.assertEqual(before,self.call('get_flow_state'))

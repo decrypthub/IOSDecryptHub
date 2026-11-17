@@ -240,6 +240,9 @@ static void (*original_group)(dispatch_group_t,dispatch_queue_t,dispatch_block_t
 static void (*original_async_f)(dispatch_queue_t,void *,dispatch_function_t);
 static void (*original_after_f)(dispatch_time_t,dispatch_queue_t,void *,dispatch_function_t);
 static void (*original_group_f)(dispatch_group_t,dispatch_queue_t,void *,dispatch_function_t);
+static __typeof__(&dispatch_group_notify) original_notify;
+static __typeof__(&dispatch_group_notify_f) original_notify_f;
+static __typeof__(&dispatch_block_notify) original_block_notify;
 static __typeof__(&dispatch_block_create) original_create;
 static __typeof__(&dispatch_block_create_with_qos_class) original_create_qos;
 static uintptr_t block_invoke(dispatch_block_t b) {
@@ -300,8 +303,20 @@ static void invoke_f(void *p) {FlowTask *t=p;DHAsyncExecute(t,^{t->function(t->c
 static void wrap_async_f(dispatch_queue_t q,void *c,dispatch_function_t f) {FlowTask *t=select_task("dispatch_async_f",q,__builtin_return_address(0),(void *)f,0);if(t){t->context=c;t->function=f;original_async_f(q,t,invoke_f);}else original_async_f(q,c,f);}
 static void wrap_after_f(dispatch_time_t w,dispatch_queue_t q,void *c,dispatch_function_t f) {FlowTask *t=select_task("dispatch_after_f",q,__builtin_return_address(0),(void *)f,0);if(t){t->context=c;t->function=f;original_after_f(w,q,t,invoke_f);}else original_after_f(w,q,c,f);}
 static void wrap_group_f(dispatch_group_t g,dispatch_queue_t q,void *c,dispatch_function_t f) {FlowTask *t=select_task("dispatch_group_async_f",q,__builtin_return_address(0),(void *)f,0);if(t){t->context=c;t->function=f;original_group_f(g,q,t,invoke_f);}else original_group_f(g,q,c,f);}
+static void wrap_notify(dispatch_group_t group,dispatch_queue_t queue,dispatch_block_t body) {
+    int saved=errno;FlowTask *task=block_task("dispatch_group_notify",queue,body,__builtin_return_address(0));errno=saved;
+    if(task)original_notify(group,queue,^{DHAsyncExecute(task,body);});else original_notify(group,queue,body);
+}
+static void wrap_notify_f(dispatch_group_t group,dispatch_queue_t queue,void *context,dispatch_function_t body) {
+    int saved=errno;FlowTask *task=select_task("dispatch_group_notify_f",queue,__builtin_return_address(0),(void *)body,0);errno=saved;
+    if(task){task->context=context;task->function=body;original_notify_f(group,queue,task,invoke_f);}else original_notify_f(group,queue,context,body);
+}
+static void wrap_block_notify(dispatch_block_t dependency,dispatch_queue_t queue,dispatch_block_t notification) {
+    int saved=errno;FlowTask *task=block_task("dispatch_block_notify",queue,notification,__builtin_return_address(0));errno=saved;
+    if(task)original_block_notify(dependency,queue,^{DHAsyncExecute(task,notification);});else original_block_notify(dependency,queue,notification);
+}
 static void *symbol(const char *name) {void *p=dlsym(RTLD_DEFAULT,name);return p?ptrauth_sign_unauthenticated(ptrauth_strip(p,ptrauth_key_function_pointer),ptrauth_key_function_pointer,0):NULL;}
-static const char *ownedImports[]={"dispatch_async","dispatch_after","dispatch_group_async","dispatch_async_f","dispatch_after_f","dispatch_group_async_f","dispatch_block_create","dispatch_block_create_with_qos_class"};
+static const char *ownedImports[]={"dispatch_async","dispatch_after","dispatch_group_async","dispatch_async_f","dispatch_after_f","dispatch_group_async_f","dispatch_block_create","dispatch_block_create_with_qos_class","dispatch_group_notify","dispatch_group_notify_f","dispatch_block_notify"};
 int DHFlowOwnsImport(const char *name) {if((!atomic_load(&installed) && !atomic_load(&claiming)) || !name)return 0;for(unsigned i=0;i<sizeof(ownedImports)/sizeof(*ownedImports);i++)if(!strcmp(name,ownedImports[i]))return 1;return 0;}
 static NSDictionary *claim_error(NSString *message) {atomic_store(&claiming,0);return @{@"ok":@NO,@"error":message};}
 NSDictionary *DHFlowState(void) {
@@ -330,6 +345,8 @@ NSDictionary *DHFlowConfigure(BOOL on,BOOL roots,unsigned budget,unsigned ms,NSA
         original_async=symbol("dispatch_async");original_after=symbol("dispatch_after");original_group=symbol("dispatch_group_async");
         original_async_f=symbol("dispatch_async_f");original_after_f=symbol("dispatch_after_f");original_group_f=symbol("dispatch_group_async_f");
         if (!original_async || !original_after || !original_group || !original_async_f || !original_after_f || !original_group_f) return claim_error(@"GCD public forwarding symbols unavailable");
+        original_notify=symbol("dispatch_group_notify");original_notify_f=symbol("dispatch_group_notify_f");original_block_notify=symbol("dispatch_block_notify");
+        if(!original_notify || !original_notify_f || !original_block_notify)return claim_error(@"GCD public notification symbols unavailable");
         // Distinguish an actual GCD async invocation from calling the same
         // dispatch-block directly after enqueueing it. No private layout/offsets.
         __block uintptr_t directPC=0,asyncPC=0;
@@ -339,7 +356,7 @@ NSDictionary *DHFlowConfigure(BOOL on,BOOL roots,unsigned budget,unsigned ms,NSA
         dispatch_block_t async=original_create(0,^{asyncPC=(uintptr_t)ptrauth_strip(__builtin_return_address(0),ptrauth_key_function_pointer);dispatch_semaphore_signal(ready);});
         original_async(calibration,async);
         if(dispatch_semaphore_wait(ready,dispatch_time(DISPATCH_TIME_NOW,5000000000)) || !asyncPC || !dh_unwind_bounds(asyncPC,&specialAsyncStart,&specialAsyncEnd) || (directPC>=specialAsyncStart && directPC<specialAsyncEnd))return claim_error(@"GCD async/direct block invokers cannot be distinguished");
-        struct rebinding binds[]={{"dispatch_async",wrap_async,NULL},{"dispatch_after",wrap_after,NULL},{"dispatch_group_async",wrap_group,NULL},{"dispatch_async_f",wrap_async_f,NULL},{"dispatch_after_f",wrap_after_f,NULL},{"dispatch_group_async_f",wrap_group_f,NULL},{"dispatch_block_create",wrap_create,NULL},{"dispatch_block_create_with_qos_class",wrap_create_qos,NULL}};
+        struct rebinding binds[]={{"dispatch_async",wrap_async,NULL},{"dispatch_after",wrap_after,NULL},{"dispatch_group_async",wrap_group,NULL},{"dispatch_async_f",wrap_async_f,NULL},{"dispatch_after_f",wrap_after_f,NULL},{"dispatch_group_async_f",wrap_group_f,NULL},{"dispatch_block_create",wrap_create,NULL},{"dispatch_block_create_with_qos_class",wrap_create_qos,NULL},{"dispatch_group_notify",wrap_notify,NULL},{"dispatch_group_notify_f",wrap_notify_f,NULL},{"dispatch_block_notify",wrap_block_notify,NULL}};
         if (rebind_symbols(binds,sizeof(binds)/sizeof(*binds))<0) return claim_error(@"GCD rebinding registration failed");installed=YES;atomic_store(&claiming,0);
     }
     pthread_mutex_lock(&flowLock);
@@ -351,7 +368,7 @@ NSDictionary *DHFlowConfigure(BOOL on,BOOL roots,unsigned budget,unsigned ms,NSA
     for(unsigned i=0;i<excludedCount;i++)strlcpy(excludedQueues[i],[excluded[i] UTF8String],128);
     rootQueueCount=(unsigned)included.count;for(unsigned i=0;i<rootQueueCount;i++)strlcpy(rootQueues[i],[included[i] UTF8String],128);
     windowStarted=DHMonotonicNS();deadline=windowStarted+(uint64_t)ms*1000000;strlcpy(stopReason,on?"capturing":"disabled",sizeof(stopReason));atomic_store(&gateOn,on && taskCount<FLOW_CAP);if(on && taskCount==FLOW_CAP)strlcpy(stopReason,"record-capacity",sizeof(stopReason));pthread_mutex_unlock(&flowLock);
-    return @{@"ok":@YES,@"state":DHFlowState(),@"coverage":@"six public GCD submission imports plus two public block constructors; selected plain App blocks/function callbacks and uniquely observed first submissions of blocks created during capture; original dispatch-block metadata preserved; unknown/preexisting/reused blocks have no guessed execution edge; no Swift/NSOperation/private scheduling coverage"};
+    return @{@"ok":@YES,@"state":DHFlowState(),@"coverage":@"six public GCD submission imports, three group/block notification imports and two public block constructors; selected plain App blocks/function callbacks and uniquely observed first submissions of blocks created during capture; original dispatch-block metadata preserved; unknown/preexisting/reused blocks have no guessed execution edge; no Swift/NSOperation/private scheduling coverage"};
 }
 NSDictionary *DHFlowRead(unsigned offset,unsigned limit,uint64_t token) {
     NSMutableArray *out=[NSMutableArray array];pthread_mutex_lock(&flowLock);unsigned total=taskCount;

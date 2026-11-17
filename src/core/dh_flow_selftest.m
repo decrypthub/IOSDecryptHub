@@ -17,6 +17,7 @@ static void require(BOOL good,NSString *message);
 @property(strong) NSMutableArray *observations;
 @property(strong) dispatch_queue_t queue;
 @property(strong) dispatch_group_t group;
+@property(strong) dispatch_group_t notificationDependency;
 @property int mode;
 @property(copy) dispatch_block_t special;
 - (uint64_t)normal:(uint64_t)n;
@@ -84,6 +85,20 @@ static void function_body(void *p) {IDHFlowProbe *probe=CFBridgingRelease(p);[pr
         dispatch_block_t block=dispatch_block_create(0,^{[self normal:34];dispatch_group_leave(group);});
         dispatch_async(queue,block);block();dispatch_resume(queue);return 0;
     }
+    if(self.mode==7 || self.mode==9) {
+        dispatch_group_t dependency=dispatch_group_create();self.notificationDependency=dependency;dispatch_group_enter(dependency);
+        dispatch_group_enter(group);dispatch_group_enter(group);
+        dispatch_group_notify(dependency,queue,^{[self normal:41];dispatch_group_leave(group);});
+        dispatch_group_notify_f(dependency,queue,(__bridge_retained void *)self,function_body);
+        require(dispatch_group_wait(group,DISPATCH_TIME_NOW)!=0,@"notify callback ran before dependency completion");
+        if(self.mode==7)dispatch_group_leave(dependency);return 2;
+    }
+    if(self.mode==8) {
+        dispatch_block_t dependency=dispatch_block_create(DISPATCH_BLOCK_BARRIER,^{[self normal:999];});
+        dispatch_block_cancel(dependency);self.special=dependency;dispatch_group_enter(group);
+        dispatch_block_t notification=dispatch_block_create_with_qos_class(0,QOS_CLASS_UTILITY,0,^{[self normal:42];dispatch_group_leave(group);});
+        dispatch_block_notify(dependency,queue,notification);dispatch_async(queue,dependency);return 1;
+    }
     dispatch_group_enter(group);dispatch_async(queue,^{
         [self normal:1];dispatch_group_enter(group);dispatch_async(queue,^{[self normal:2];dispatch_group_leave(group);});dispatch_group_leave(group);
     });
@@ -139,6 +154,28 @@ NSDictionary *DHFlowSelfTest(void) {
         for(NSDictionary *o in probe.observations)require([o[@"asyncTaskId"] length]>0,@"worker lost captured context");
         for(NSDictionary *t in tasks)require([t[@"callbackIdentity"][@"imageUUID"] length]>0 && [t[@"callbackPC"] length]>0,@"callback identity unavailable");
         [passed addObject:@"six-GCD-imports-nested-edges-and-cross-thread-context"];result[@"tasks"]=tasks;
+        unsigned notifyBefore=[DHFlowState()[@"retained"] unsignedIntValue];[probe.observations removeAllObjects];
+        DHFlowConfigure(YES,NO,16,10000,nil,nil);probe.mode=7;[probe schedule];drain(probe);probe.mode=0;
+        NSArray *notifyTasks=DHFlowRead(notifyBefore,16,0)[@"tasks"];
+        require(notifyTasks.count==2 && probe.observations.count==2,@"group notify block/function changed callback/context count");
+        NSMutableSet *notifyAPIs=[NSMutableSet set];for(NSDictionary *t in notifyTasks){[notifyAPIs addObject:t[@"api"]];require([t[@"state"] isEqual:@"completed"] && [t[@"asyncSubmittedByCallId"] length]>0,@"group notify lost observed submission/completion");}
+        require([notifyAPIs isEqualToSet:[NSSet setWithArray:@[@"dispatch_group_notify",@"dispatch_group_notify_f"]]],@"group notify APIs not observed");
+        for(NSDictionary *o in probe.observations)require([o[@"asyncTaskId"] length]>0,@"group notify callback lost task identity");
+        [passed addObject:@"group-notify-block-and-function-preserve-dependency-context-once"];
+        notifyBefore=[DHFlowState()[@"retained"] unsignedIntValue];[probe.observations removeAllObjects];
+        DHFlowConfigure(YES,NO,16,10000,nil,nil);probe.mode=8;[probe schedule];drain(probe);probe.mode=0;
+        notifyTasks=DHFlowRead(notifyBefore,16,0)[@"tasks"];NSDictionary *notification=notifyTasks.firstObject;
+        require(notifyTasks.count==1 && probe.observations.count==1 && dispatch_block_testcancel(probe.special),@"block notify changed canceled dependency or callback count");
+        require([notification[@"api"] isEqual:@"dispatch_block_notify"] && [notification[@"state"] isEqual:@"completed"] && [notification[@"dispatchBlockMetadataPreserved"] boolValue],@"block notify did not preserve public notification metadata/identity");
+        require(dispatch_block_wait(probe.special,dispatch_time(DISPATCH_TIME_NOW,5000000000))==0,@"block notify changed dependency wait semantics");
+        [passed addObject:@"block-notify-preserves-cancelled-dependency-and-special-notification"];
+        notifyBefore=[DHFlowState()[@"retained"] unsignedIntValue];[probe.observations removeAllObjects];
+        DHFlowConfigure(YES,NO,16,10000,nil,nil);probe.mode=9;[probe schedule];DHFlowConfigure(NO,NO,1,1,nil,nil);
+        require([DHFlowState()[@"pendingOrRunning"] unsignedIntValue]==2,@"pending notifications were reported complete");
+        dispatch_group_leave(probe.notificationDependency);drain(probe);probe.mode=0;
+        notifyTasks=DHFlowRead(notifyBefore,16,0)[@"tasks"];require(notifyTasks.count==2 && probe.observations.count==2,@"disabling capture dropped pending notifications");
+        for(NSDictionary *o in probe.observations)require([o[@"asyncTaskId"] length]>0,@"pending notification lost previously observed submission");
+        [passed addObject:@"disable-retains-pending-notify-identity-until-original-dependency-completes"];
         unsigned filteredBefore=[DHFlowState()[@"retained"] unsignedIntValue];NSUInteger observedBefore=probe.observations.count;
         DHFlowConfigure(YES,NO,8,10000,nil,@[@"nonmatching-root"]);[probe schedule];drain(probe);
         require([DHFlowState()[@"retained"] unsignedIntValue]==filteredBefore && probe.observations.count==observedBefore+7,@"root filter changed original callbacks or accepted unmatched roots");

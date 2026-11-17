@@ -1,5 +1,14 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.43 GCD group/block notify（后续调度适配之一）
+
+- 在原六种提交和两个 block 构造器上补 `dispatch_group_notify`、`dispatch_group_notify_f`、`dispatch_block_notify`，十一项导入统一管理所有权。保留原 group/依赖 block、queue、context/function 和特殊 notification 的原外层对象；不会将登记通知当作依赖已结束或 callback 已执行。关闭窗口后，已登记的 pending 通知仍实际执行并保留原任务身份。
+- 新三组真实运行时夹具验证 block/function 通知在依赖完成后各执行一次、原 `_f` context、被取消依赖仍触发通知、特殊 notification 的 QoS/等待与关闭窗口后的 pending 语义；Mac 与双机 21 组 flow 通过。既有 Mac ABI/unwind/iOS、更新策略和两种完整 deb 构建通过。1.28.43 整包已刷入两台且保留 scope，扩展的 Import 所有权 MCP 回归通过。
+- 快手最终网络窗口：Rootless 29 棵 / 435 对，RootHide 24 棵 / 360 对；核心 15 参数、返回 sig3/HTTP、独立 HMAC/白盒/CRC 分别为 29/87/29 和 24/72/24 一致。Rootless 5 条、RootHide 4 条同时具备真实任务链、原 callback 的 native 栈证据和精确 HTTP 匹配。Rootless 另实际观察到 1 个已正常完成的 group notify；RootHide 该实际窗口未观察到 notify，三类通知的双机语义证据来自自有夹具。
+- 先期 RootHide 窗口有签名调用在窗口内找不到对应 HTTP，未将其当作完整链；收紧队列并回到首页后重新验证上述最终样本。先期另复现 176 次已知栈锚之前的元数据终止；最终定向窗口该计数增量为 0，两类窗口分别保留，不能据此称元数据缺口已修复。
+
+dispatch source、RunLoop/NSTimer、NSOperation、Swift Task、私有调度以及 QBDI 异常/longjmp 透明执行继续待实现。当前是完整目标的一个切片，未发布 Release/APT。
+
 ## 2026-11-17：1.28.42 栈边界诊断与已证实关联的保留（研发包）
 
 - native 栈增加精确终止原因、libunwind step 结果、最后 PC/SP/FP、procedure 范围与线程栈界限。原始记录升级为 V2，读取仍兼容 V1；缺行与畸形记录不报完整。`complete` 仍表示后端正常终止，不能单独证明到达线程根或越过某个已知包装帧。
