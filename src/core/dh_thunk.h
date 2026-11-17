@@ -36,6 +36,14 @@ int dh_thunk_has_method(const char *class_name,const char *selector,int class_me
 typedef struct {Method method;void *replacement;void **original;const char *owner;} dh_method_adapter_spec;
 int dh_thunk_install_method_adapters(const dh_method_adapter_spec *specs,unsigned count,char *error,size_t error_size);
 int dh_thunk_live_target(int slot,uint64_t *target,uint64_t *original);
+// Internal native control boundaries use silent full-CPU forwarding when no
+// trace owns them. They share the existing immutable target/patch registry.
+struct dh_hook_options;
+int dh_thunk_install_native_boundary(uint64_t address,unsigned boundaryKind,
+    const struct dh_hook_options *options,const char *label,char *error,size_t errorSize);
+int dh_thunk_control_enabled(unsigned slot);
+typedef struct {uint64_t start,end;} dh_thunk_code_range;
+unsigned dh_thunk_opaque_inline_ranges(dh_thunk_code_range *out,unsigned capacity);
 
 #define DH_THUNK_COUNT 256   // thunk 槽位总数 (单调分配; 软停不回收, 硬停后退休)
 
@@ -47,7 +55,7 @@ typedef enum {
 } dh_hook_kind;
 
 // 完整配置在发布 patch 之前应用；发布后的槽位配置不可变。
-typedef struct {
+typedef struct dh_hook_options {
     int describe_args, capture_return, capture_after;
     int fixed_abi; // ObjC 元数据不能识别 ...；post 需要调用者确认固定非变参原型。
     int ptr_arg, len_arg, max_bytes;
@@ -149,6 +157,8 @@ int  dh_thunk_uninstall(int slot, int hard, char *err, size_t errsz);
 
 // 枚举所有生效槽位, 回填到 out(最多 max 个), 返回实际写入条数。
 int  dh_thunk_list(dh_hook_info *out, int max);
+// Raw entry after the standard two-register native-context spill.
+uint64_t dh_thunk_native_context_entry(unsigned slot);
 
 #ifdef __cplusplus
 }

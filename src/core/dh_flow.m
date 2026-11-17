@@ -201,6 +201,18 @@ void DHFlowGuardEnd(uint64_t token) {
     for (unsigned i=guardCount;i>0;i--) if (guards[i-1].token==token) {memmove(guards+i-1,guards+i,(guardCount-i)*sizeof(*guards));guardCount--;break;}
     mirror();if(!guardCount && !current)dh_call_set_trust(1);
 }
+unsigned DHFlowGuardDetach(uint64_t token,DHFlowDetachedGuard *out,unsigned capacity) {
+    extern DHCallContext dh_thunk_detach_control(unsigned,uint64_t,const DHCallContext *);
+    if(!token || !out)return 0;unsigned begin=guardCount;
+    for(unsigned i=guardCount;i>0;i--)if(guards[i-1].token==token){begin=i-1;break;}
+    if(begin==guardCount || guardCount-begin>capacity)return 0;
+    unsigned count=0;
+    while(guardCount>begin) {
+        FlowGuard g=guards[--guardCount];DHCallContext call=dh_thunk_detach_control((unsigned)g.slot,g.token,&g.saved);
+        out[count++]=(DHFlowDetachedGuard){.slot=(unsigned)g.slot,.token=g.token,.call=call};atomic_fetch_add_explicit(&abandoned,1,memory_order_relaxed);
+    }
+    mirror();if(!guardCount && !current)dh_call_set_trust(1);return count;
+}
 static void task_end(FlowTask *task,BOOL normal,const char *reason) {
     pthread_mutex_lock(&flowLock);BOOL active=task->state<=2;
     if (active) {task->state=normal?3:4;strlcpy(task->terminal,reason,sizeof(task->terminal));task->finished=DHMonotonicNS();if(pending)pending--;task->cookie=NULL;}

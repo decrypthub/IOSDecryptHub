@@ -13,7 +13,7 @@ git init -q "$SRC"
 git -C "$SRC" remote add origin https://github.com/jmpews/Dobby
 git -C "$SRC" fetch --depth 1 origin "$REV"
 git -C "$SRC" checkout -q --detach FETCH_HEAD
-for PATCH in dobby-publish-original-before-patch dobby-quiescent-code-patch dobby-context-entry; do
+for PATCH in dobby-publish-original-before-patch dobby-quiescent-code-patch dobby-context-entry dobby-near-context-checkpoint; do
     git -C "$SRC" apply --check "$REPO/tools/patches/$PATCH.patch"
     git -C "$SRC" apply "$REPO/tools/patches/$PATCH.patch"
 done

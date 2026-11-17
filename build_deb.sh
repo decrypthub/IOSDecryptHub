@@ -139,6 +139,28 @@ compile_swift_fixture() {
     xcrun lipo -create "${SLICES[@]}" -output "$OUT"
 }
 
+compile_control_fixtures() {
+    local ARCHS="$1" OUT="$2" ARCH
+    local NATIVE_SLICES=() ROOT_SLICES=()
+    mkdir -p "$OUT"
+    for ARCH in $ARCHS; do
+        local NATIVE="$OUT/native-$ARCH.dylib" ROOT="$OUT/root-$ARCH.dylib"
+        xcrun --sdk iphoneos clang -arch "$ARCH" -isysroot "$SDK" -miphoneos-version-min=14.0 \
+            -dynamiclib -fobjc-arc -O1 -g -I"$SCRIPT_DIR/src/trace" \
+            "$SCRIPT_DIR/tests/fixtures/IDHControlNativeFixtures.mm" -lc++ \
+            -Wl,-install_name,@loader_path/IDHControlNativeFixtures.dylib -o "$NATIVE"
+        xcrun --sdk iphoneos clang -arch "$ARCH" -isysroot "$SDK" -miphoneos-version-min=14.0 \
+            -dynamiclib -fobjc-arc -O1 -g -I"$SCRIPT_DIR/src/trace" -framework Foundation \
+            "$SCRIPT_DIR/tests/fixtures/IDHControlFixtures.mm" "$NATIVE" -lc++ \
+            -Wl,-install_name,@loader_path/IDHControlFixtures.dylib -o "$ROOT"
+        NATIVE_SLICES+=( "$NATIVE" ); ROOT_SLICES+=( "$ROOT" )
+    done
+    xcrun lipo -create "${NATIVE_SLICES[@]}" -output "$OUT/IDHControlNativeFixtures.dylib"
+    xcrun lipo -create "${ROOT_SLICES[@]}" -output "$OUT/IDHControlFixtures.dylib"
+    otool -L "$OUT/IDHControlFixtures.dylib" | grep -F '@loader_path/IDHControlNativeFixtures.dylib' >/dev/null \
+        || error "owned control fixture has no packaged native helper dependency"
+}
+
 verify_macho_arch() {
     local PATH_TO_VERIFY="$1"
     local EXPECTED_ARCH="$2"
@@ -176,6 +198,7 @@ build_variant() {
     local APP_EXEC="$BUILD_DIR/_app-${VARIANT}/$APP_NAME"
     local DAEMON_OUT="$BUILD_DIR/_daemon-${VARIANT}/$DAEMON_BIN"
     local SWIFT_FIXTURE_OUT="$BUILD_DIR/_swift-${VARIANT}/IDHSwiftFixtures.dylib"
+    local CONTROL_FIXTURE_DIR="$BUILD_DIR/_control-${VARIANT}"
     local ENGINE_DYLIB
 
     ENGINE_DYLIB=$(require_vendor_dylib "$VARIANT" "$MACHO_ARCHS")
@@ -185,6 +208,7 @@ build_variant() {
     # Loaded only by the explicit Swift selftest on iOS 15+. The Agent has no
     # Swift dependency and keeps its existing iOS 14 loading compatibility.
     compile_swift_fixture "$MACHO_ARCHS" "$SWIFT_FIXTURE_OUT"
+    compile_control_fixtures "$MACHO_ARCHS" "$CONTROL_FIXTURE_DIR"
 
     info "打包 $VARIANT (arch=$ARCHITECTURE, prefix=${PREFIX:-/})..."
     rm -rf "$STAGE"
@@ -217,6 +241,7 @@ CTRL
 
     cp "$ENGINE_DYLIB" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
     cp "$SWIFT_FIXTURE_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/IDHSwiftFixtures.dylib"
+    cp "$CONTROL_FIXTURE_DIR/IDHControlFixtures.dylib" "$CONTROL_FIXTURE_DIR/IDHControlNativeFixtures.dylib" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/"
     cp "$SCRIPT_DIR/enabledBundles.default.plist" \
         "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/enabledBundles.default.plist"
     cp "$DAEMON_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
@@ -402,6 +427,10 @@ POSTRM
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
     verify_macho_arch "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/IDHSwiftFixtures.dylib" "$MACHO_ARCHS" "$VARIANT owned Swift fixture"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/IDHSwiftFixtures.dylib"
+    for CONTROL_RESOURCE in IDHControlFixtures IDHControlNativeFixtures; do
+        verify_macho_arch "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$CONTROL_RESOURCE.dylib" "$MACHO_ARCHS" "$VARIANT owned native control fixture"
+        ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$CONTROL_RESOURCE.dylib"
+    done
     ldid -S"$APP_ENTITLEMENTS" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
 
@@ -417,6 +446,7 @@ POSTRM
     # 不引入任何与已验证产物不同的变量。
     chmod 0755 "$PKG_STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.dylib"
     chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
+    chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/IDHControlFixtures.dylib" "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/IDHControlNativeFixtures.dylib"
 
     if ! dpkg-deb --build --root-owner-group "$PKG_STAGE" "$DEB_OUT" 2>"$BUILD_DIR/_dpkg-$VARIANT.log"; then
         rm -rf "$PKG_STAGE"

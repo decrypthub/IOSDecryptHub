@@ -22,8 +22,10 @@
 #include "dh_call_context.h"
 #import "dh_unwind.h"
 #import "dh_flow.h"
+#include "../trace/dh_control_breakpoint.h"
 #import "dh_flow_swift.h"
 #import "../trace/qbdi_live.h"
+#import "../trace/qbdi_control.h"
 #include <errno.h>
 
 // 内联后端按实际链接切片决定；arm64e Dobby 输出已签名函数指针，而 thunk 使用原始 br/blr。
@@ -34,6 +36,9 @@
 #if DH_HAVE_INLINE
 #include "dobby.h"
 extern int DobbyHookWithContext(void *,void *,void **);
+extern int DobbyHookWithContextNear(void *,void *,void **);
+extern const char *DobbyNearContextLastError(void);
+extern int DobbyHookWithContextBreakpoint(void *,void *,void **);
 #endif
 
 int dh_thunk_inline_available(void) {
@@ -90,6 +95,7 @@ static dh_slot_t g_slots[DH_THUNK_COUNT];
 static _Atomic int g_next_slot = 0;
 static pthread_mutex_t g_install_lock = PTHREAD_MUTEX_INITIALIZER;
 static __thread const dh_hook_options *g_pending_options;
+static __thread unsigned g_pending_control_kind;
 static dh_hook_options g_slot_options[DH_THUNK_COUNT];
 static NSDictionary *g_slot_targets[DH_THUNK_COUNT];
 static _Atomic int g_slot_published[DH_THUNK_COUNT];
@@ -246,10 +252,13 @@ NSDictionary *dh_thunk_metadata(int slot) {
     BOOL known = s->kind == DH_HOOK_METHOD || g_slot_options[slot].abi_declared;
     BOOL post = known && s->method_simple_gpr && s->method_arg_count <= 32 &&
         (s->return_type[0] == 'v' || dh_method_arg_type(s->return_type));
+    unsigned boundary=dh_control_boundary_kind((unsigned)slot);uint32_t physical=0;if(s->patched_len>=4)memcpy(&physical,s->patched,4);
     return @{@"hookId": [NSString stringWithFormat:@"%@:hook:%d", DHProcessGeneration(), slot],
         @"processGeneration": DHProcessGeneration(), @"targetIdentity": g_slot_targets[slot] ?: @{},
         @"configurationImmutable": @YES, @"callStackMode": @"libunwind-context-CFI; deferred-symbolication",
         @"inFlight": [NSString stringWithFormat:@"%llu", atomic_load(&g_slot_inflight[slot])],
+        @"nativeControlBoundary":@(boundary),@"captureMode":boundary==DH_CONTROL_ROOT?@"armed-native-control-only":boundary?@"internal-native-continuation":@"continuous-record-only",
+        @"controlCheckpointBackend":(boundary==DH_CONTROL_ROOT || boundary==DH_CONTROL_CHECKPOINT)?(physical==(0xd4200000u|(0x4944u<<5))?@"owned-mach-breakpoint":@"owned-near-island"):@"not-applicable",
         @"importBindingPolicy": s->kind == DH_HOOK_IMPORT ? @"resolved-symbol; present-and-future-images; interposers-not-preserved; write-coverage-not-guaranteed" : @"not-applicable",
         @"abi": @{@"source": s->kind == DH_HOOK_METHOD ? @"objc-runtime" : known ? @"client-declaration" : @"unknown",
             @"argumentCount": known ? @(s->method_arg_count) : (id)[NSNull null],
@@ -258,7 +267,7 @@ NSDictionary *dh_thunk_metadata(int slot) {
             @"postSupported": @(post), @"stackForwarding": @(post),
             @"fixedSignatureAsserted": @(s->kind == DH_HOOK_METHOD ? g_slot_options[slot].fixed_abi : known),
             @"variadicDetection": @NO,
-            @"floatAggregatePost": @NO, @"variadicPost": @NO, @"exceptionUnwind": @NO,
+            @"floatAggregatePost": @NO, @"variadicPost": @NO, @"exceptionUnwind": @(boundary==DH_CONTROL_ROOT),
             @"hardInlineUnhook": @NO}};
 }
 
@@ -362,10 +371,25 @@ __asm__(
 "  xpaci x16\n"
 #endif
 "  str  x16, [sp, #0xD8]\n"
-"  mov  x0, x17\n"
-"  add  x1, sp, #0\n"
+"  ldr x0, [sp, #0x48]\n"
+"  add x1, sp, #0x130\n"
+"  bl _dh_control_boundary_claim\n"
+"  cbz x0, Ldh_boundary_regular\n"
+"  tbnz x0, #0, Ldh_boundary_forward\n"
+".cfi_remember_state\n"
+"  ldr x1, [x0]\n"
+"  mov sp, x1\n"
+".cfi_undefined 30\n"
+"  b _dh_live_bridge\n"
+".cfi_restore_state\n"
+"Ldh_boundary_forward:\n"
+"  and x0, x0, #0xfffffffffffffffe\n"
+"  b Ldh_live_native_restore\n"
+"Ldh_boundary_regular:\n"
+"  ldr x0, [sp, #0x48]\n"
+"  add x1, sp, #0\n"
 "  add  x2, sp, #0x460\n"
-"  mov  x3, x30\n"
+"  ldr x3, [sp, #0xD0]\n"
 "  add x4, sp, #0x130\n"
 "  bl   _dh_thunk_handler\n"
 "  str  x0, [sp, #0x128]\n"
@@ -462,7 +486,15 @@ __asm__(
 ".cfi_undefined 30\n"
 "  mov x19, x0\n"
 "  bl _dh_live_run\n"
-"  cbnz x0, 8f\n"
+"  cbz x0, Ldh_live_fallback\n"
+"  mov x20, x0\n"
+"  mov x0, x19\n"
+"  bl _dh_live_native_handoff\n"
+"  cmp x0, #0\n"
+"  mov x0, x20\n"
+"  b.ne Ldh_live_native_restore\n"
+"  b 8f\n"
+"Ldh_live_fallback:\n"
 "  ldr x16, [x19, #8]\n"
 "  mov sp, x16\n"
 "  ldr x19, [x19, #168]\n"
@@ -511,6 +543,51 @@ __asm__(
 "  ldp x28, x29, [x17, #224]\n"
 "  ldp x16, x17, [x17, #128]\n"
 "  ret\n"
+"Ldh_live_native_restore:\n"
+"  mov x17, x0\n"
+"  ldr x16, [x17, #248]\n"
+"  mov sp, x16\n"
+".cfi_def_cfa sp, 0\n"
+"  ldp q0, q1, [x17, #288]\n"
+"  ldp q2, q3, [x17, #320]\n"
+"  ldp q4, q5, [x17, #352]\n"
+"  ldp q6, q7, [x17, #384]\n"
+"  ldp q8, q9, [x17, #416]\n"
+"  ldp q10, q11, [x17, #448]\n"
+"  ldp q12, q13, [x17, #480]\n"
+"  ldp q14, q15, [x17, #512]\n"
+"  ldp q16, q17, [x17, #544]\n"
+"  ldp q18, q19, [x17, #576]\n"
+"  ldp q20, q21, [x17, #608]\n"
+"  ldp q22, q23, [x17, #640]\n"
+"  ldp q24, q25, [x17, #672]\n"
+"  ldp q26, q27, [x17, #704]\n"
+"  ldp q28, q29, [x17, #736]\n"
+"  ldp q30, q31, [x17, #768]\n"
+"  ldr x16, [x17, #272]\n"
+"  msr fpcr, x16\n"
+"  ldr x16, [x17, #280]\n"
+"  msr fpsr, x16\n"
+"  ldr x16, [x17, #264]\n"
+"  msr nzcv, x16\n"
+"  ldr x30, [x17, #240]\n"
+"  ldp x0, x1, [x17, #0]\n"
+"  ldp x2, x3, [x17, #16]\n"
+"  ldp x4, x5, [x17, #32]\n"
+"  ldp x6, x7, [x17, #48]\n"
+"  ldp x8, x9, [x17, #64]\n"
+"  ldp x10, x11, [x17, #80]\n"
+"  ldp x12, x13, [x17, #96]\n"
+"  ldp x14, x15, [x17, #112]\n"
+"  ldp x18, x19, [x17, #144]\n"
+"  ldp x20, x21, [x17, #160]\n"
+"  ldp x22, x23, [x17, #176]\n"
+"  ldp x24, x25, [x17, #192]\n"
+"  ldp x26, x27, [x17, #208]\n"
+"  ldp x28, x29, [x17, #224]\n"
+"  ldr x16, [x17, #256]\n"
+"  ldr x17, [x17, #136]\n"
+"  br x16\n"
 ".cfi_endproc\n"
 );
 
@@ -522,9 +599,14 @@ static inline void *dh_slot_addr(int i) { return (uint8_t *)dh_thunk_table + (si
 static inline void *dh_slot_addr(int i) { (void)i; return NULL; }
 #define DH_THUNK_ARM64 0
 #endif
+uint64_t dh_thunk_native_context_entry(unsigned slot){return slot<DH_THUNK_COUNT && dh_slot_addr((int)slot)?(uint64_t)dh_slot_addr((int)slot)+4:0;}
 
 // 线程内重入保护: 处理器会调 Foundation(可能再触发被 hook 的底层函数), 用 TLS 标志防无限递归。
 static __thread int g_in_thunk = 0;
+static __thread DHCallContext g_control_entry_call;
+DHCallContext dh_thunk_control_entry_context(uint64_t token) {
+    return g_control_entry_call.id==token?g_control_entry_call:(DHCallContext){.id=token};
+}
 int dh_thunk_in_handler(void) {return g_in_thunk;}
 int dh_thunk_post_frame(uint64_t pc,uint64_t sp,uint64_t callerSP) {
 #if DH_THUNK_ARM64
@@ -740,6 +822,7 @@ uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint
     if ([DHLogStore shared].paused) { dh_in_hook=savedInternal; g_in_thunk = 0; errno=savedErrno; return guard; }
     DHCallContext call = dh_call_begin(g_dh_thunk_post[slot], DHMonotonicNS());
     dh_call_bind_runtime_task(&call,DHSwiftCurrentToken());
+    g_control_entry_call=call;
     if(guard)DHFlowGuardBind(guard,&call);
     @autoreleasepool {
         const dh_hook_options *o = &g_slot_options[slot];
@@ -1181,6 +1264,23 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
         if(err && errsz)snprintf(err,errsz,"typed adapter %s owns this target; restart before changing its patch",g_adapters[i].owner);
         pthread_mutex_unlock(&g_install_lock);return -5;
     }
+    if(g_pending_control_kind) {
+        uint64_t begin=(uint64_t)target,length=g_pending_control_kind>=DH_CONTROL_SETJMP?20:4;
+        for(unsigned i=0;i<g_adapter_count;i++) {
+            uint64_t prior=(uint64_t)g_adapters[i].target;
+            if(begin<prior+32 && prior<begin+length) {
+                if(err && errsz)snprintf(err,errsz,"native control boundary overlaps a retained typed adapter");pthread_mutex_unlock(&g_install_lock);return -5;
+            }
+        }
+        int count=atomic_load(&g_next_slot);
+        for(int i=0;i<count && i<DH_THUNK_COUNT;i++)if(g_slots[i].used && g_slots[i].kind==DH_HOOK_INLINE) {
+            uint64_t prior=(uint64_t)g_slots[i].target;unsigned kind=dh_control_boundary_kind(i);
+            uint64_t priorLength=kind==DH_CONTROL_ROOT || kind==DH_CONTROL_CHECKPOINT?4:32;
+            if(begin<prior+priorLength && prior<begin+length) {
+                if(err && errsz)snprintf(err,errsz,"native control boundary overlaps retained Inline slot %d",i);pthread_mutex_unlock(&g_install_lock);return -5;
+            }
+        }
+    }
     int total = atomic_load_explicit(&g_next_slot, memory_order_relaxed);
     if (total > DH_THUNK_COUNT) total = DH_THUNK_COUNT;
     for (int i = 0; i < total; i++) {
@@ -1256,8 +1356,16 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
 
     dh_prepare_slot_options(slot);
 
-    int rc = DobbyHookWithContext(target, (uint8_t *)dh_slot_addr(slot)+4,
+    if(g_pending_control_kind && !dh_control_publish(slot,(uint64_t)target,g_pending_control_kind,s->saved,(unsigned)s->saved_len)) {
+        s->used=0;pthread_mutex_unlock(&g_install_lock);
+        if(err && errsz)snprintf(err,errsz,"native control boundary publication failed before activation");return -4;
+    }
+    int nearBoundary=g_pending_control_kind==DH_CONTROL_ROOT || g_pending_control_kind==DH_CONTROL_CHECKPOINT;
+    int forcedBreakpoint=nearBoundary && dh_control_breakpoint_forced();char breakpointReason[256]={0};
+    int rc = forcedBreakpoint?-1:(nearBoundary?DobbyHookWithContextNear:DobbyHookWithContext)(target, (uint8_t *)dh_slot_addr(slot)+4,
                        (void **)&g_dh_thunk_orig[slot]);
+    if(nearBoundary && rc!=0 && !g_dh_thunk_orig[slot] && dh_control_breakpoint_prepare(breakpointReason,sizeof(breakpointReason)))
+        rc=DobbyHookWithContextBreakpoint(target,(uint8_t *)dh_slot_addr(slot)+4,(void **)&g_dh_thunk_orig[slot]);
     if (g_dh_thunk_orig[slot])
         __atomic_store_n(&g_dh_thunk_orig[slot], ptrauth_strip(g_dh_thunk_orig[slot], ptrauth_key_function_pointer), __ATOMIC_RELEASE);
     if (rc != 0 || g_dh_thunk_orig[slot] == NULL) {
@@ -1269,6 +1377,7 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
             return -4;
         }
         s->used = 0;
+        if(g_pending_control_kind)dh_control_unpublish(slot);
         s->name[0] = '\0';
         s->capture_multi[0] = '\0';
         atomic_store_explicit(&s->capture_multi_ready, 0, memory_order_release);
@@ -1279,13 +1388,16 @@ int dh_thunk_install_inline(const char *module, const char *symbol, uint64_t add
         atomic_compare_exchange_strong_explicit(&g_next_slot, &last, slot,
                                                 memory_order_relaxed, memory_order_relaxed);
         pthread_mutex_unlock(&g_install_lock);
-        if (err) snprintf(err, errsz, "DobbyHook(0x%llx) failed: rc=%d orig=%p",
-                          (unsigned long long)(uintptr_t)target, rc, g_dh_thunk_orig[slot]);
+        const char *nearReason=nearBoundary?DobbyNearContextLastError():"";
+        if (err) snprintf(err, errsz, "DobbyHook(0x%llx) failed: rc=%d orig=%p%s%s%s%s",
+                          (unsigned long long)(uintptr_t)target, rc, g_dh_thunk_orig[slot],
+                          nearReason && nearReason[0]?"; ":"",nearReason?:"",
+                          breakpointReason[0]?"; ":"",breakpointReason);
         return -4;
     }
     s->patched_len = dh_save_code_bytes(target, s->patched, sizeof(s->patched));
     atomic_store_explicit(&g_slot_published[slot], 1, memory_order_release);
-    atomic_store_explicit(&s->enabled, 1, memory_order_release);
+    atomic_store_explicit(&s->enabled, !g_pending_control_kind || g_pending_control_kind==DH_CONTROL_ROOT, memory_order_release);
     pthread_mutex_unlock(&g_install_lock);
     return slot;
 #endif
@@ -1297,6 +1409,59 @@ const char *dh_thunk_inline_backend(void) {
 #else
     return "unavailable(not-linked)";
 #endif
+}
+
+int dh_thunk_install_native_boundary(uint64_t address,unsigned kind,const dh_hook_options *options,const char *label,char *error,size_t size) {
+    if(kind<DH_CONTROL_ROOT || kind>DH_CONTROL_LONGJMP || !options ||
+       (kind==DH_CONTROL_ROOT && (!options->abi_declared || !options->capture_return))) {
+        if(error && size)snprintf(error,size,"control root requires an explicit fixed GPR ABI and return capture");return -6;
+    }
+    address=(uint64_t)ptrauth_strip((void *)address,ptrauth_key_function_pointer);
+    pthread_mutex_lock(&g_install_lock);int count=atomic_load(&g_next_slot);
+    for(int i=0;i<count && i<DH_THUNK_COUNT;i++)if(g_slots[i].used && g_slots[i].kind==DH_HOOK_INLINE && (uint64_t)g_slots[i].target==address) {
+        int same=dh_control_boundary_kind(i)==kind && atomic_load(&g_slot_published[i]) &&
+            !atomic_load(&g_slots[i].retired) && !memcmp(&g_slot_options[i],options,sizeof(*options));
+        pthread_mutex_unlock(&g_install_lock);
+        if(!same && error && size)snprintf(error,size,"target is already reserved by a different immutable Inline configuration");return same?i:-5;
+    }
+    pthread_mutex_unlock(&g_install_lock);
+    unsigned prior=g_pending_control_kind;g_pending_control_kind=kind;
+    int slot=dh_thunk_install_configured(DH_HOOK_INLINE,NULL,NULL,address,0,label,options,error,size);
+    g_pending_control_kind=prior;return slot;
+}
+int dh_thunk_control_enabled(unsigned slot) {
+    return slot<DH_THUNK_COUNT && dh_control_boundary_kind(slot)==DH_CONTROL_ROOT && atomic_load_explicit(&g_slots[slot].enabled,memory_order_acquire) && atomic_load_explicit(&g_slot_published[slot],memory_order_acquire);
+}
+unsigned dh_thunk_opaque_inline_ranges(dh_thunk_code_range *out,unsigned capacity) {
+    unsigned total=0;pthread_mutex_lock(&g_install_lock);int count=atomic_load(&g_next_slot);
+    for(int i=0;i<count && i<DH_THUNK_COUNT;i++)if(g_slots[i].used && g_slots[i].kind==DH_HOOK_INLINE) {
+        unsigned kind=dh_control_boundary_kind(i);if(kind==DH_CONTROL_ROOT || kind==DH_CONTROL_CHECKPOINT)continue;
+        uint64_t target=(uint64_t)g_slots[i].target;if(total<capacity)out[total]=(dh_thunk_code_range){target,target+32};total++;
+    }
+    for(unsigned i=0;i<g_adapter_count;i++) {
+        uint64_t target=(uint64_t)g_adapters[i].target;if(total<capacity)out[total]=(dh_thunk_code_range){target,target+32};total++;
+    }
+    pthread_mutex_unlock(&g_install_lock);return total;
+}
+
+DHCallContext dh_thunk_detach_control(unsigned slot,uint64_t token,const DHCallContext *snapshot) {
+    DHCallContext call={.id=token};if(slot>=DH_THUNK_COUNT)return call;
+    atomic_fetch_sub_explicit(&g_slot_inflight[slot],1,memory_order_relaxed);call=dh_call_end(token);
+    if(!call.tracked && snapshot && snapshot->id==token)call=*snapshot;return call;
+}
+void dh_thunk_emit_control_abort(const DHFlowDetachedGuard *g,const char *reason,uint64_t thread,uint64_t when,unsigned observation) {
+    if(!g || g->slot>=DH_THUNK_COUNT || !g->token || g->token>>63)return;
+    int saved=dh_in_hook;dh_in_hook=1;
+    @autoreleasepool {
+        DHLogEntry *e=[DHLogEntry new];e.category=DHCategoryOther;e.algorithm=@"hook-state";e.operation=@(g_slots[g->slot].name);e.threadId=thread;
+        NSString *phase=observation==4?@"unresolved":@"aborted";
+        NSMutableDictionary *context=[dh_function_context(e,(int)g->slot,g->call,phase) mutableCopy];
+        context[@"pairing"]=phase;context[@"emittedNs"]=context[@"monotonicNs"]?:@"";context[@"monotonicNs"]=[NSString stringWithFormat:@"%llu",when];e.eventContext=context;
+        NSString *detection=observation==1?@"public personality INSTALL_CONTEXT beyond the owned root":observation==2?@"observed longjmp entry to an environment outside the owned root":observation==4?@"control capture unavailable; original continues natively":observation==5?@"asynchronous longjmp request escaped an executing VM; continuation unexpanded":@"observed longjmp entry; destination environment unobserved";
+        e.eventPayload=@{@"reason":@(reason),@"returnValue":@{@"available":@NO},@"detection":detection,@"deferredEmission":@YES};
+        [[DHLogStore shared] append:e];
+    }
+    dh_in_hook=saved;
 }
 
 int dh_thunk_install_adapter(uint64_t address,void *replacement,void **original,const char *owner,const char *signature,char *error,size_t error_size) {

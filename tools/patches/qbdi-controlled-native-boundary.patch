@@ -1,0 +1,68 @@
+--- a/src/Engine/LLVMCPU.cpp
++++ b/src/Engine/LLVMCPU.cpp
+@@ -16,6 +16,7 @@
+  * limitations under the License.
+  */
+ #include <mutex>
++#include <atomic>
+ #include <utility>
+ 
+ #include "llvm/ADT/SmallVector.h"
+@@ -54,6 +55,18 @@
+ 
+ #include "spdlog/fmt/bin_to_hex.h"
+ 
++#if defined(QBDI_ARCH_AARCH64)
++using DHOriginalA64Reader50 = int (*)(uint64_t, uint32_t *);
++static std::atomic<DHOriginalA64Reader50> originalA64Reader50{nullptr};
++extern "C" __attribute__((visibility("default"))) unsigned qbdi_idhOriginalA64Version(void) { return 2; }
++extern "C" __attribute__((visibility("default"))) unsigned qbdi_idhNativeHandoffOption(void) { return 1u << 27; }
++extern "C" __attribute__((visibility("default"))) int qbdi_idhSetOriginalA64Reader(DHOriginalA64Reader50 reader) {
++  if (!reader) return 0;
++  DHOriginalA64Reader50 empty = nullptr;
++  return originalA64Reader50.compare_exchange_strong(empty, reader) || empty == reader;
++}
++#endif
++
+ namespace QBDI {
+ 
+ LLVMCPUs::LLVMCPUs(const std::string &_cpu,
+@@ -177,6 +190,13 @@
+ bool LLVMCPU::getInstruction(llvm::MCInst &instr, uint64_t &size,
+                              llvm::ArrayRef<uint8_t> bytes,
+                              uint64_t address) const {
++#if defined(QBDI_ARCH_AARCH64)
++  uint32_t originalWord;
++  auto reader = originalA64Reader50.load(std::memory_order_acquire);
++  if (bytes.size() >= 4 && reader && reader(address, &originalWord)) {
++    bytes = llvm::ArrayRef<uint8_t>(reinterpret_cast<uint8_t *>(&originalWord), 4);
++  }
++#endif
+   auto status =
+       disassembler->getInstruction(instr, size, bytes, address, llvm::nulls());
+   if (status == llvm::MCDisassembler::SoftFail) {
+--- a/src/Engine/Engine.cpp
++++ b/src/Engine/Engine.cpp
+@@ -412,8 +412,11 @@
+     VMAction action = CONTINUE;
+ 
+     // If this PC is not instrumented try to transfer execution
++    // IDH control mode always exits before executing uninstrumented code.
++    // Its CPU handoff preserves the native LR; default VMs remain unchanged.
++    const bool idhNativeHandoff = (static_cast<uint32_t>(options) & (1u << 27)) != 0;
+     if (execBroker->isInstrumented(currentPC) == false and
+-        execBroker->canTransferExecution(curGPRState)) {
++        (idhNativeHandoff or execBroker->canTransferExecution(curGPRState))) {
+ 
+ #if defined(QBDI_ARCH_ARM)
+       // Handle ARM mode
+@@ -437,6 +440,9 @@
+       QBDI_DEBUG("Executing 0x{:x} through execBroker", currentPC);
+       action = signalEvent(EXEC_TRANSFER_CALL, currentPC, nullptr, 0,
+                            curGPRState, curFPRState);
++      // Explicit handoff never falls through to the broker or expands native
++      // instructions, even when no broker-compatible return point exists.
++      if (idhNativeHandoff) action = STOP;
+       // transfer execution
+       if (action == CONTINUE) {
+         execBroker->transferExecution(currentPC, curGPRState, curFPRState);

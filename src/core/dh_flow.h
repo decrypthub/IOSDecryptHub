@@ -6,6 +6,10 @@
 uint64_t DHFlowGuardBegin(int slot,uint64_t callerSP);
 void DHFlowGuardBind(uint64_t guard,const DHCallContext *call);
 void DHFlowGuardEnd(uint64_t token);
+typedef struct {unsigned slot;uint64_t token;DHCallContext call;} DHFlowDetachedGuard;
+// Exact owned root token, not absence from a partial native stack. This path is
+// allocation-free and leaves log/JSON emission to the control reader.
+unsigned DHFlowGuardDetach(uint64_t rootToken,DHFlowDetachedGuard *out,unsigned capacity);
 void DHFlowCheck(const DHRawStack *stack);
 void DHFlowBoundary(void);
 int DHFlowOwnsImport(const char *symbol);

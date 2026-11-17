@@ -36,6 +36,7 @@
 #include "hook_webkit.h"
 #include "../trace/qbdi_trace.h"
 #include "../trace/qbdi_live.h"
+#include "../trace/qbdi_control_selftest.h"
 #include <string.h>
 #include <math.h>
 
@@ -1706,6 +1707,7 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
             @"CPostRequiresDeclaration": @YES, @"floatAggregatePost": @NO, @"exceptionUnwind": @NO},
         @"stackUnwind":@{@"backend":dh_unwind_available()?@"system-libunwind":@"unavailable",@"maxFrames":@(DH_STACK_MAX),@"thunkCFI":@YES,@"symbolication":@"deferred",@"scope":@"synchronous-native-thread; metadata gaps and budgets reported"},
         @"liveTrace":@{@"maxSessions":@8,@"maxInstructions":@8192,@"maxPage":@256,@"originalThreadAndStack":@YES,@"budgetAction":@"stop recording; continue original",@"normalReturnRequired":@YES},
+        @"nativeControlTrace":@{@"linked":@(DHLiveAvailable() && inlineAvailable),@"explicitPreparationRequired":@YES,@"defaultEnabled":@NO,@"sharedSessionBudget":@8,@"nativeABI":@"darwin-fixed-gpr",@"arbitrarySwiftABI":@NO,@"state":DHControlBackendState()},
         @"variant":        @(dh_variant_id(v)),
         @"variantLabel":   @(dh_variant_label(v)),
         @"arch":           @(dh_cpu_arch()),
@@ -1717,6 +1719,7 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
             @"hook_inline":   @(inlineAvailable),
             @"trace_function": @(traceAvailable),
             @"trace_live": @(DHLiveAvailable() && inlineAvailable), @"native_stack_unwind": @(dh_unwind_available()),@"native_stack_recipes":@((BOOL)dh_unwind_recipe_available()),@"operation_flow":@YES,@"swift_task_flow":@(inlineAvailable),
+            @"trace_native_control":@(DHLiveAvailable() && inlineAvailable),
         },
         @"capabilityBits": @(bits),
         @"process":        [[DHLogStore shared] processInfo] ?: @{},
@@ -3490,6 +3493,27 @@ static NSArray *tool_definitions(void) {
       @{@"name":@"get_flow_state",@"description":@"Read bounded async and nonlocal-exit protection counters. Thread-local counters refer to the handling thread; no arbitrary thread state mutation.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
       @{@"name":@"run_flow_selftest",@"description":@"Explicit IDH-owned exception/longjmp cleanup, caught exception, GCD context propagation, bounded budget and worker-reuse fixtures. Does not run business signing functions; restart target after testing.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
     ]];
+    NSMutableDictionary *controlProperties=[@{
+        @"process_generation":@{@"type":@"string"},
+        @"address":@{@"type":@"string",@"pattern":@"^0x[0-9a-fA-F]+$"},
+        @"native_abi":@{@"type":@"string",@"enum":@[@"darwin-fixed-gpr"]}
+    } mutableCopy];
+    for(NSDictionary *definition in tools)if([definition[@"name"] isEqual:@"hook_inline"])
+        for(NSString *key in @[@"abi",@"describe_args",@"capture_memory",@"capture_after",@"capture_multi",@"capture_ret_multi"])
+            if(definition[@"inputSchema"][@"properties"][key])controlProperties[key]=definition[@"inputSchema"][@"properties"][key];
+    NSMutableDictionary *controlABI=[controlProperties[@"abi"] mutableCopy];
+    controlABI[@"description"]=@"Known fixed GPR arguments/return. Native-control mode handles standard C++/ObjC exceptions and observed nonlocal jumps; variadic, aggregate, floating and special Swift ABI declarations are unavailable.";
+    NSMutableDictionary *controlABIProperties=[controlABI[@"properties"] mutableCopy];[controlABIProperties removeObjectForKey:@"exception_unwind"];controlABI[@"properties"]=controlABIProperties;controlProperties[@"abi"]=controlABI;
+    [tools addObjectsFromArray:@[
+        @{@"name":@"prepare_control_trace",@"description":@"Prepare an explicit original-call QBDI native-control root. Requires a current aligned function address and a known fixed nonvariadic GPR ABI. Runs one owned native exception/jump calibration, consuming one of the shared eight retained sessions. Preserves original native SP/LR across opaque helpers and resumes actual inside catch/setjmp continuations; outside exits have no fabricated return. Optional memory windows are copied at the real entry/return. Swift/special register ABIs and arbitrary asynchronous signals inside a running VM are outside this mode. No business function is invoked by preparation. Patches remain until restart; an unarmed root forwards silently.",
+          @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"address",@"native_abi",@"abi"],@"properties":controlProperties}},
+        @{@"name":@"trace_control_arm",@"description":@"Arm the next actual call of a prepared native-control root; never replay or replace arguments. Uses the original thread/stack, standard native C/C++/ObjC boundaries and exact PC/SP continuation ownership. Recording limits never abort the original call. Read with trace_live_read; cancel a pending capture with trace_live_cancel. The original normal-return arm mode remains separate.",
+          @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"slot"],@"properties":@{
+            @"process_generation":@{@"type":@"string"},@"slot":@{@"type":@"integer",@"minimum":@0,@"maximum":@255},
+            @"max_insns":@{@"type":@"integer",@"minimum":@1,@"maximum":@8192},@"max_ms":@{@"type":@"integer",@"minimum":@1,@"maximum":@10000},@"thread_id":@{@"type":@"string"}}}},
+        @{@"name":@"get_control_trace_state",@"description":@"Read native-control preparation/calibration, retained roots/continuations and the shared eight-session budget. Does not install or execute anything.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
+        @{@"name":@"run_control_selftest",@"description":@"Run owned real native C++/ObjC inside/outside catches, destructor/finally, observed setjmp/longjmp/siglongjmp, mask and 0-to-1 behavior, recursive root, adjacent native calls, retained disabled forwarding, recording budget and cancellation. force_breakpoints:true independently exercises the owned Mach checkpoint backend. Requires a fresh process with eight unused sessions and no async window; restart afterward. Business functions are not called.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"},@"force_breakpoints":@{@"type":@"boolean"}}}}
+    ]];
     return tools;
 }
 
@@ -3681,10 +3705,36 @@ static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
         }
         return tool_ok(DHFlowRead(offset,limit,task));
     }
-    if ([@[@"hook_method", @"hook_inline", @"hook_import", @"unhook", @"trace_function", @"objc_call", @"run_hook_selftest", @"trace_live_arm", @"trace_live_cancel", @"run_live_selftest"] containsObject:name]) {
+    if ([@[@"hook_method", @"hook_inline", @"hook_import", @"unhook", @"trace_function", @"objc_call", @"run_hook_selftest", @"trace_live_arm", @"trace_live_cancel", @"run_live_selftest",@"prepare_control_trace",@"trace_control_arm",@"run_control_selftest"] containsObject:name]) {
         NSString *generation = args[@"process_generation"];
         if (![generation isKindOfClass:NSString.class] || ![generation isEqualToString:DHProcessGeneration()])
             return tool_err(@"missing or stale process_generation; fetch get_capabilities and re-resolve the target before mutation");
+    }
+    if([name isEqual:@"get_control_trace_state"])return tool_ok(DHControlBackendState());
+    if([name isEqual:@"run_control_selftest"]) {
+        id force=args[@"force_breakpoints"];
+        if(force && (![force isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)force)!=CFBooleanGetTypeID()))return tool_err(@"force_breakpoints must be a boolean");
+        return tool_ok(DHControlBackendSelfTestWithBreakpoints([force boolValue]));
+    }
+    if([name isEqual:@"prepare_control_trace"]) {
+        uint64_t address=0;NSString *text=args[@"address"];
+        if(![text isKindOfClass:NSString.class] || ![text hasPrefix:@"0x"] || !dh_parse_addr_arg(text,&address) || !address || address%4 || !dh_vm_address_executable(address))return tool_err(@"address must be a current aligned executable 0x function address");
+        if(![args[@"native_abi"] isEqual:@"darwin-fixed-gpr"])return tool_err(@"native_abi must explicitly assert darwin-fixed-gpr; special Swift/register ABIs are not supported");
+        NSMutableDictionary *declared=[args mutableCopy];declared[@"capture_return"]=@YES;
+        dh_hook_options options;NSString *error=nil;
+        if(!dh_hook_options_from_args(declared,&options,&error) || !options.abi_declared)return tool_err(error?:@"an explicit fixed GPR abi declaration is required");
+        NSDictionary *calibration=DHControlEnsureCalibrated();if(![calibration[@"ok"] boolValue])return tool_err(calibration[@"error"]?:@"owned native control calibration failed");
+        NSDictionary *prepared=DHLiveControlPrepare(address,&options);return [prepared[@"ok"] boolValue]?tool_ok(prepared):tool_err(prepared[@"error"]);
+    }
+    if([name isEqual:@"trace_control_arm"]) {
+        for(NSString *key in @[@"slot",@"max_insns",@"max_ms"])
+            if(args[key] && (![args[key] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)args[key])==CFBooleanGetTypeID() || !isfinite([args[key] doubleValue]) || [args[key] doubleValue]!=floor([args[key] doubleValue])))return tool_err(@"slot and budgets must be finite integers");
+        if(!args[@"slot"] || [args[@"slot"] doubleValue]<0 || [args[@"slot"] doubleValue]>255 ||
+           (args[@"max_insns"] && ([args[@"max_insns"] doubleValue]<1 || [args[@"max_insns"] doubleValue]>8192)) ||
+           (args[@"max_ms"] && ([args[@"max_ms"] doubleValue]<1 || [args[@"max_ms"] doubleValue]>10000)))return tool_err(@"control slot or budget out of range");
+        uint64_t thread=0;if(args[@"thread_id"] && (![args[@"thread_id"] isKindOfClass:NSString.class] || !dh_parse_addr_arg(args[@"thread_id"],&thread)))return tool_err(@"invalid thread_id");
+        NSDictionary *r=DHLiveControlArm([args[@"slot"] intValue],args[@"max_insns"]?[args[@"max_insns"] unsignedIntValue]:4096,args[@"max_ms"]?[args[@"max_ms"] unsignedIntValue]:5000,thread);
+        return [r[@"ok"] boolValue]?tool_ok(r):tool_err(r[@"error"]);
     }
     if ([name isEqualToString:@"trace_live_arm"]) {
         id normal=args[@"normal_return"];
@@ -3804,7 +3854,7 @@ static BOOL tool_is_heavy(NSString *name) {
                                       @"find_selector_refs", @"find_function_refs",
                                       @"analyze_function", @"disassemble_function",
                                       @"find_objc_methods", @"export_events", @"start_dump",
-                                      @"trace_function", @"run_hook_selftest", @"run_live_selftest", @"trace_live_arm", @"trace_live_cancel",@"configure_async_capture",@"run_flow_selftest",@"configure_swift_capture",@"run_swift_selftest",@"configure_dispatch_entry",@"run_dispatch_entry_selftest"]];
+                                      @"trace_function", @"run_hook_selftest", @"run_live_selftest", @"trace_live_arm", @"trace_live_cancel",@"configure_async_capture",@"run_flow_selftest",@"configure_swift_capture",@"run_swift_selftest",@"configure_dispatch_entry",@"run_dispatch_entry_selftest",@"prepare_control_trace",@"trace_control_arm",@"run_control_selftest"]];
     });
     return [heavy containsObject:name];
 }

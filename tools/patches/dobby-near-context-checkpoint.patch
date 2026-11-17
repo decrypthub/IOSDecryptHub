@@ -1,0 +1,216 @@
+--- a/source/InterceptRouting/InlineHookRouting.h
++++ b/source/InterceptRouting/InlineHookRouting.h
+@@ -19,7 +19,7 @@
+   void BuildRouting() {
+     __FUNC_CALL_TRACE__();
+ 
+-    GenerateTrampoline();
++    if (!GenerateTrampoline()) { error = 1; return; }
+ 
+     GenerateRelocatedCode();
+ 
+@@ -27,7 +27,7 @@
+   }
+ };
+ 
+-inline int DobbyHookImpl(void *address, void *fake_func, void **out_origin_func, bool preserve_context) {
++inline int DobbyHookImpl(void *address, void *fake_func, void **out_origin_func, int preserve_context) {
+   __FUNC_CALL_TRACE__();
+   if (!address) {
+     ERROR_LOG("address is 0x0");
+@@ -81,3 +81,10 @@
+ extern "C" PUBLIC int DobbyHookWithContext(void *address, void *fake_func, void **out_origin_func) {
+   return DobbyHookImpl(address, fake_func, out_origin_func, true);
+ }
++
++extern "C" PUBLIC int DobbyHookWithContextNear(void *address, void *fake_func, void **out_origin_func) {
++  return DobbyHookImpl(address, fake_func, out_origin_func, 2);
++}
++extern "C" PUBLIC int DobbyHookWithContextBreakpoint(void *address, void *fake_func, void **out_origin_func) {
++  return DobbyHookImpl(address, fake_func, out_origin_func, 3);
++}
+--- a/source/InterceptRouting/InterceptRouting.h
++++ b/source/InterceptRouting/InterceptRouting.h
+@@ -10,13 +10,16 @@
+ Trampoline *GenerateNearTrampolineBuffer(addr_t src, addr_t dst);
+ Trampoline *GenerateNormalTrampolineBuffer(addr_t from, addr_t to);
+ Trampoline *GenerateContextTrampolineBuffer(addr_t from, addr_t to);
++Trampoline *GenerateNearContextTrampolineBuffer(addr_t from, addr_t to);
++Trampoline *GenerateBreakpointContextTrampolineBuffer(addr_t from, addr_t to);
++int GenNearContextOriginalInstruction(CodeMemBlock *,CodeMemBlock *);
+ 
+ struct InterceptRouting {
+   Interceptor::Entry *entry = 0;
+   Trampoline *trampoline = 0;
+   Trampoline *near_trampoline = 0;
+   int error = 0;
+-  bool preserve_context = false;
++  int preserve_context = 0;
+ 
+   explicit InterceptRouting(Interceptor::Entry *entry) : entry(entry) {
+   }
+@@ -75,6 +77,11 @@
+     }
+ 
+ #if defined(TARGET_ARCH_ARM64)
++    if (preserve_context >= 2) {
++      near_trampoline = preserve_context == 3 ? GenerateBreakpointContextTrampolineBuffer(from, to) : GenerateNearContextTrampolineBuffer(from, to);
++      if (!near_trampoline) { error = 1; return false; }
++      return true;
++    }
+     if (preserve_context) {
+       trampoline = GenerateContextTrampolineBuffer(from, to);
+       return true;
+@@ -102,7 +109,9 @@
+     auto preferred_size = trampoline_size();
+     auto origin = CodeMemBlock(code_addr, preferred_size);
+     auto relocated = CodeMemBlock(0, 0);
+-    GenRelocateCodeAndBranch((void *)code_addr, &origin, &relocated);
++    int specialized = preserve_context >= 2 ? GenNearContextOriginalInstruction(&origin,&relocated) : 0;
++    if (specialized < 0) { error = 1; return; }
++    if (!specialized) GenRelocateCodeAndBranch((void *)code_addr, &origin, &relocated);
+     if (relocated.size == 0) {
+       error = 1;
+       return;
+--- a/source/InterceptRouting/NearBranchTrampoline/near_trampoline_arm64.cc
++++ b/source/InterceptRouting/NearBranchTrampoline/near_trampoline_arm64.cc
+@@ -78,4 +78,139 @@
+   return tramp;
+ }
+ 
++
++#if defined(__APPLE__)
++#include <mach/mach.h>
++#include "UnifiedInterface/platform-darwin/mach_vm.h"
+ #endif
++// A checkpoint may use only pages allocated exclusively for this purpose.
++// No code caves, MAP_FIXED overwrite, or unverified executable padding.
++static thread_local const char *idh_near_error = "";
++static thread_local char idh_near_error_storage[128];
++extern "C" PUBLIC const char *DobbyNearContextLastError() { return idh_near_error; }
++static MemBlock AllocateOwnedCheckpointIsland(addr_t pos, size_t range) {
++#if defined(__APPLE__)
++  idh_near_error = "no exclusively owned checkpoint page within the strict A64 B range";
++  static stl::vector<simple_linear_allocator_t *> pages;
++  const size_t requested = 32;
++  const addr_t lower = pos > range ? pos - range + 4 : OSMemory::PageSize();
++  const addr_t upper = pos + range;
++  for (auto page : pages) {
++    auto cursor = (addr_t)page->cursor();
++    if (page->capacity - page->size >= requested && cursor >= lower && cursor < upper - requested)
++      return {(addr_t)page->alloc(requested), requested};
++  }
++  if (pages.size() >= 16) { idh_near_error = "owned checkpoint page budget (16) exhausted"; return {}; }
++  const size_t page_size = OSMemory::PageSize();
++  // Let the kernel search its current allocatable map before consulting a
++  // userspace region snapshot. ANYWHERE never replaces an existing mapping.
++  mach_vm_address_t hint = ALIGN_CEIL(lower, page_size);
++  kern_return_t searched = mach_vm_allocate(mach_task_self(), &hint, page_size, VM_FLAGS_ANYWHERE);
++  if (searched == KERN_SUCCESS) {
++    if (hint >= lower && hint < upper && page_size <= upper - hint &&
++        OSMemory::SetPermission((void *)hint,page_size,kReadExecute)) {
++      auto page = new simple_linear_allocator_t((uint8_t *)hint,page_size);
++      pages.push_back(page);return {(addr_t)page->alloc(requested), requested};
++    }
++    mach_vm_deallocate(mach_task_self(),hint,page_size);
++  }
++  auto regions = ProcessRuntime::getMemoryLayout();
++  // The main image may be the first mapped region. Its lower ASLR gap is
++  // valid owned allocation space too; do not discard the first/last gaps.
++  for (size_t i = 0; i <= regions.size(); ++i) {
++    addr_t previous = i ? regions[i - 1].end() : lower;
++    addr_t next = i < regions.size() ? regions[i].addr() : upper;
++    addr_t begin = previous > lower ? previous : lower;
++    begin = ALIGN_CEIL(begin, page_size);
++    addr_t end = next < upper ? next : upper;
++    if (end < begin || end - begin < page_size) continue;
++    mach_vm_address_t allocated = begin;
++    // FIXED without OVERWRITE atomically fails if another mapping won the gap.
++    kern_return_t claimed = mach_vm_allocate(mach_task_self(), &allocated, page_size, VM_FLAGS_FIXED);
++    if (claimed != KERN_SUCCESS) {
++      snprintf(idh_near_error_storage,sizeof(idh_near_error_storage),"exclusive checkpoint allocation failed (Mach %d)",claimed);
++      idh_near_error = idh_near_error_storage;continue;
++    }
++    if (allocated != begin || !OSMemory::SetPermission((void *)allocated,page_size,kReadExecute)) {
++      idh_near_error = "exclusively allocated checkpoint page could not become RX";
++      mach_vm_deallocate(mach_task_self(),allocated,page_size); continue;
++    }
++    auto page = new simple_linear_allocator_t((uint8_t *)allocated,page_size);
++    pages.push_back(page);
++    return {(addr_t)page->alloc(requested), requested};
++  }
++#endif
++  return {};
++}
++
++
++// One original A64 instruction is patched. The nearby island saves IP0/IP1
++// before using an indirect branch, preserving the existing IDH context ABI.
++Trampoline *GenerateBreakpointContextTrampolineBuffer(addr_t src, addr_t dst) {
++  (void)dst;
++  TurboAssembler code(src);code.Emit(0xd4200000u | (0x4944u << 5));
++  return new Trampoline(TRAMPOLINE_ARM64_B_XXX,code.code_buffer()->dup());
++}
++
++Trampoline *GenerateNearContextTrampolineBuffer(addr_t src, addr_t dst) {
++  auto allocation = AllocateOwnedCheckpointIsland(src, ARM64_B_XXX_RANGE);
++  if (!allocation.addr() || allocation.addr() % 4) return nullptr;
++  idh_near_error = "";
++  auto delta = (long long)allocation.addr() - (long long)src;
++  if (delta <= -(long long)ARM64_B_XXX_RANGE || delta >= (long long)ARM64_B_XXX_RANGE) return nullptr;
++  TurboAssembler island;
++  island.fixed_addr = allocation.addr();
++  island.stp(X(16), X(17), MemOperand(SP, -16, PreIndex));
++  CodeGen codegen(&island);
++  codegen.LiteralLdrBranch((uint64_t)dst);
++  island.relocDataLabels();
++  auto island_block = AssemblerCodeBuilder::FinalizeFromTurboAssembler(&island);
++  if (!island_block.addr()) return nullptr;
++  auto forward = new Trampoline(FORWARD_TRAMPOLINE_ARM64, island_block);
++  TurboAssembler branch(src);
++  branch.b(delta);
++  return new Trampoline(TRAMPOLINE_ARM64_B_XXX_AND_FORWARD_TRAMP, branch.code_buffer()->dup(), forward);
++}
++
++
++// A relocated link instruction must present its *original* LR to the native
++// callee, including on the disabled path. Only the single-word mode can jump
++// directly back to original PC+4; the old 20B relocation remains unchanged.
++int GenNearContextOriginalInstruction(CodeMemBlock *origin,CodeMemBlock *relocated) {
++  if (origin->size != 4) return -1;
++  uint32_t word = *(uint32_t *)origin->addr();
++  bool immediate = (word & 0xfc000000u) == 0x94000000u;
++  bool reg = (word & 0xfffffc1fu) == 0xd63f0000u;
++  bool authZero = (word & 0xfffff81fu) == 0xd63f081fu;
++  bool authTwo = (word & 0xfffff800u) == 0xd73f0800u;
++  if (!immediate && !reg && !authZero && !authTwo) {
++    // Unknown link forms cannot quietly use a fake LR.
++    return (word & 0xfe200000u) == 0xd6200000u ? -1 : 0;
++  }
++  TurboAssembler code;
++  unsigned rn = (word >> 5) & 31;
++  unsigned rm = word & 31;
++  // IP0 is the declared native handoff scratch. A private ABI using it as
++  // a live input to this link is outside this single-instruction boundary.
++  if (!immediate && (rn == 16 || (authTwo && rm == 16))) return -1;
++  if (authZero || authTwo) {
++    uint32_t branch = word & ~(1u << 21); // BLRA* -> BRA*, same key/modifier.
++    code.mov(X(16),X(rn));branch = (branch & ~(31u << 5)) | (16u << 5);
++    if (authTwo && rm == 30) {code.mov(X(17),X(30));branch = (branch & ~31u) | 17u;}
++    // IP0 branch also has the standard call-veneer BTI compatibility. IP1 is
++    // used only if the original LR itself was the authentication modifier.
++    code.Mov(X(30),origin->addr()+4);code.Emit(branch);
++    *relocated = AssemblerCodeBuilder::FinalizeFromTurboAssembler(&code);
++    return relocated->size ? 1 : -1;
++  }
++  if (reg) code.mov(X(16),X(rn));
++  code.Mov(X(30),origin->addr()+4);
++  if (immediate) {
++    int64_t offset = ((int64_t)(int32_t)(word << 6)) >> 4;
++    code.Mov(X(16),origin->addr()+offset);code.br(X(16));
++  } else code.br(X(16));
++  *relocated = AssemblerCodeBuilder::FinalizeFromTurboAssembler(&code);
++  return relocated->size ? 1 : -1;
++}
++
++#endif

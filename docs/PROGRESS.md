@@ -1,5 +1,19 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-18：1.28.50 原生异常／跳转现场跟踪与最终集成（研发包）
+
+- 新增显式准备的 `live-native-control`，保留原 `normal_return:true` 模式及共享八会话上限。离开模块前从 QBDI 交还真实 CPU／SP／LR，在原线程执行 native helper；通过真实返回点、公开 personality 安装的 landing pad 和实际观察的 setjmp continuation 恢复同一 VM。内部捕获后确实继续记录指令；外部退出以 POD 脱离准确 root／子 guard，再在读取侧生成原线程的 aborted 事件，没有伪造返回值。不读取私有 `jmp_buf` 或猜 LSDA。
+- 单指令恢复点优先用专属近距岛。快手密集映射及不可分配的表观 ASLR 空隙已在真机复现，增加具体内核错误和专属 Mach BRK 后端；保留原 task handler 的六种行为／code 协议转发、thread handler 冲突拒绝、端口所有权与命中计数，不替换 App SIGTRAP 处理器。原始指令在物理 patch 前发布给 QBDI 解码器，关闭后的 BL／认证链接仍保持真实 LR；旧 20B Inline 入口先转为原生，避免把 veneer 临时 SP 当成 caller SP。
+- Mac 最终 v52 完整包、全部原门禁通过。新增近距完整／准备后原 live、强制 Mach 完整／准备后原 live 四个独立进程，以及六种原处理器转发、thread 冲突、原未知 trap 共八项；验证 GPR／SIMD／flags／TLS／mask 和 identity send-right 引用。新原生 CI 独立于原完整包 workflow，使用真正 ARM64 host 依赖与 SDK MIG，不替换或放宽旧门禁。
+- 两台最终整包各通过近距与强制 Mach 的八会话自检，以及七项非法 MCP 请求。验证原异常对象／结果／析构／finally、内外捕获、重抛、两类 jump、mask、0→1、env 复用、递归、相邻调用、旧 Inline 子调用、预算与取消；组合用例每次内部恢复后有十个实际 after PC。强制模式每台真实恢复 531 次，保留快手已有 task handler，RootHide 的 PAC 路径通过。另在已安装关闭 private 入口、已校准控制模式并准备真实签名 root 的状态下，通过 Swift 81 生命周期／4 error future／5 MCP、39 flow、7 timer、2 诊断、10 原生／4 MCP operation、6 原生／4 MCP unwind、native／PAC／ABI／live 7 与 private 4／5 MCP 原回归。
+- 真实 `createSig3WithSig:path:` 每台六次原调用，90 对结构化调用、六个 HTTP 精确签名，独立 HMAC／白盒／CRC 为 6／18／6 全部一致；278 个不同实际主程序 PC 均现场解析到原镜像，无恢复缺口或事件丢失。每台五次完整记录 384 条指令，另一次只记录一条仍完成原请求。业务窗口不主动制造异常；异常语义由独立原生夹具验证，没有用重放或入口拒绝代替实现。
+- 最终普通分析窗口：Rootless 27 棵／405 对，RootHide 25 棵／375 对完整签名树；15 参数、HTTP 和独立原语分别 27／81／27、25／75／25 一致。7／6 条精确 GCD→native→HTTP 链，256／246 任务完成，展开不足增量 0。没有新 App Swift Task 或 private→sig3 证据，不补造这些父边。Rootless 在本轮系统自动更新为快手 14.10.20(10097)，所有 Method 与实际地址重新解析；RootHide 为 14.10.10(10089)。
+- 240 个源码／测试／工具／构建／新 CI 文件与 v52 构建归档 LF 归一后完全相同，另保留 SDK MIG 哈希。两种完整 deb 的安装 hash 与 Mac 原包相同；Rootless 的 Agent／Swift／两个控制资源每字节相同，RootHide 四文件各仅合法品牌字段和对应页 hash 的 40 字节变化，UUID 及其它字节相同。两台已新代重启、暂停，临时 Hook／窗口／任务／recipe／控制恢复点与 Mach server 均为 0，scope 保留。
+
+操作与精确边界见 [NATIVE_CONTROL_TRACE.md](NATIVE_CONTROL_TRACE.md)：标准固定 GPR C／C++／ObjC，原生系统 helper 保持 opaque；任意异步 signal 在运行 VM 内跳出、特殊 Swift／SVE ABI、跨线程 longjmp 和不稳定异常端口没有因此获得支持。CI 终态以本提交的 Actions 记录为准；本轮没有发布 Release／APT。
+
+1.28.49 最终复核：`2611e66` 原完整包 CI [44111775941](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44111775941) 成功；以下对应章节“继续核对”为当时快照。
+
 ## 2026-11-17：1.28.49 真实私有 dispatch callback 入口（研发包）
 
 - 从实际快手 source 栈定位未导出的两指针 libdispatch callout；自有公开 source `_f` 回调的原返回地址、当前 unwind 函数边界、镜像、完整识别的 A64/PAC 调用/返回序列与再次真实执行校准。原型与 Apple 官方声明一致，原 context/function、原系统异常处理和执行次数保持；不读私有 source/continuation 字段，不用最近符号或固定偏移。

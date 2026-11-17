@@ -18,17 +18,31 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.49
+VERSION := 1.28.50
 TARGET  := decrypt_helper.dylib
 .DEFAULT_GOAL := all
 .PHONY: test-hook-runtime test-hook-ios-build test-unwind-runtime test-flow-runtime
 .PHONY: test-operation-runtime test-unwind-recipes test-unwind-recipes-ios-build
 .PHONY: test-swift-runtime test-dispatch-entry-runtime
+.PHONY: test-control-runtime test-control-breakpoint-forward
+
+CONTROL_MIG_SRC := build/control-mig/dh_control_mach.c
+CONTROL_MIG_CLIENT_SRC := build/control-mig/dh_control_mach_client.c build/control-mig/dh_control_exc_client.c
+$(CONTROL_MIG_SRC): tools/gen_control_mig.py
+	python3 tools/gen_control_mig.py
+$(CONTROL_MIG_CLIENT_SRC): $(CONTROL_MIG_SRC)
+	@test -f "$@" || python3 tools/gen_control_mig.py
+build/control-mig/dh_fixture64_mach.c: tools/gen_control_mig.py
+	python3 tools/gen_control_mig.py --prefix dh_fixture64
+build/control-mig/dh_fixture32_mach.c: tools/gen_control_mig.py
+	python3 tools/gen_control_mig.py --prefix dh_fixture32 --protocol exc
+
+test-hook-runtime test-hook-ios-build test-unwind-runtime test-flow-runtime test-operation-runtime test-unwind-recipes test-unwind-recipes-ios-build test-swift-runtime test-dispatch-entry-runtime test-control-runtime: $(CONTROL_MIG_SRC) $(CONTROL_MIG_CLIENT_SRC)
 
 HOOK_TEST_SRC := tests/hook_runtime_test.m src/core/dh_thunk.m src/core/dh_call_context.c src/core/dh_event.m src/core/dh_flow_swift.m src/core/dh_flow_dispatch.m \
-    src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_operations.m src/core/dh_flow_operation_selftest.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
+    src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/trace/qbdi_control.m src/trace/qbdi_control_selftest.mm src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_operations.m src/core/dh_flow_operation_selftest.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
     src/core/log_store.m src/core/dh_capture.c src/core/dh_noise.m src/core/dh_health.c src/core/dh_capability.c \
-    src/core/fishhook.c src/server/dh_log_json.m
+    src/core/fishhook.c src/server/dh_log_json.m src/trace/dh_control_breakpoint.m $(CONTROL_MIG_SRC) $(CONTROL_MIG_CLIENT_SRC)
 
 # 按扩展名区分 C / ObjC / ObjC++；全局 -ObjC 会把 C++ 异常 fixture 误编为 ObjC。
 
@@ -96,6 +110,22 @@ test-flow-runtime:
 	clang -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation tests/flow_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) -lc++ -o build/flow_runtime_test
 	python3 tests/run_unwind_runtime_test.py build/flow_runtime_test
 
+# Separate native dependencies; never substitute a host archive into iOS.
+test-control-runtime:
+	@if [ "$$(uname -m)" != arm64 ] || [ ! -f vendor/dobby/lib/macos-arm64/libdobby.a ] || [ ! -f vendor/qbdi/macos-arm64/lib/libQBDI.a ]; then \
+		echo "SKIP: native macOS Dobby/QBDI unavailable; run tools/build_dobby_macos.sh and tools/build_qbdi_macos.sh"; \
+	else \
+		mkdir -p build && \
+		clang -arch arm64 -dynamiclib -fobjc-arc -O1 -g -Isrc/trace tests/fixtures/IDHControlNativeFixtures.mm -lc++ -Wl,-install_name,@loader_path/IDHControlNativeFixtures.dylib -o build/IDHControlNativeFixtures.dylib && \
+		clang -arch arm64 -dynamiclib -fobjc-arc -O1 -g -Isrc/trace -framework Foundation tests/fixtures/IDHControlFixtures.mm build/IDHControlNativeFixtures.dylib -lc++ -Wl,-install_name,@loader_path/IDHControlFixtures.dylib -o build/IDHControlFixtures.dylib && \
+		clang -arch arm64 -fobjc-arc -O1 -g -DDH_HAVE_INLINE=1 -DDH_HAVE_QBDI=1 -Isrc/core -Isrc/server -Isrc/trace -Ivendor/dobby/include -Ivendor/qbdi/macos-arm64/include -framework Foundation tests/control_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) src/trace/qbdi_trace.m vendor/dobby/lib/macos-arm64/libdobby.a vendor/qbdi/macos-arm64/lib/libQBDI.a -lc++ -o build/control_runtime_test && \
+		python3 tests/run_control_runtime_test.py build/control_runtime_test && $(MAKE) test-control-breakpoint-forward; \
+	fi
+
+test-control-breakpoint-forward: $(CONTROL_MIG_SRC) $(CONTROL_MIG_CLIENT_SRC) build/control-mig/dh_fixture64_mach.c build/control-mig/dh_fixture32_mach.c
+	clang -arch arm64 -fobjc-arc -O1 -g -Isrc/core -Isrc/trace -framework Foundation tests/control_breakpoint_forward_test.m src/trace/dh_control_breakpoint.m $(CONTROL_MIG_SRC) $(CONTROL_MIG_CLIENT_SRC) build/control-mig/dh_fixture64_mach.c build/control-mig/dh_fixture32_mach.c -o build/control_breakpoint_forward_test
+	python3 tests/run_control_breakpoint_forward_test.py build/control_breakpoint_forward_test
+
 # Capstone 反汇编库源文件（仅 ARM/ARM64 架构）
 CAPSTONE_SRC := src/core/capstone/cs.c \
                 src/core/capstone/utils.c \
@@ -114,7 +144,7 @@ CAPSTONE_SRC := src/core/capstone/cs.c \
                 src/core/capstone/arch/AArch64/AArch64Mapping.c \
                 src/core/capstone/arch/AArch64/AArch64Module.c
 
-SRC     := src/core/fishhook.c \
+SRC     := src/trace/dh_control_breakpoint.m $(CONTROL_MIG_SRC) $(CONTROL_MIG_CLIENT_SRC) src/core/fishhook.c \
            src/core/dh_health.c \
            src/core/dh_capture.c \
            src/core/dh_capability.c \
@@ -122,7 +152,7 @@ SRC     := src/core/fishhook.c \
            src/core/dh_call_context.c \
            src/core/dh_event.m \
            src/core/dh_flow_swift.m src/core/dh_flow_dispatch.m \
-           src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_operations.m src/core/dh_flow_operation_selftest.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
+           src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/trace/qbdi_control.m src/trace/qbdi_control_selftest.mm src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_timers.m src/core/dh_flow_operations.m src/core/dh_flow_operation_selftest.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
            src/core/dh_noise.m \
            src/core/dh_spoof.m \
            src/core/dh_symtab.c \

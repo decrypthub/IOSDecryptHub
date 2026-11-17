@@ -16,6 +16,8 @@ git -C "$SRC" fetch --depth 1 origin "$REV"
 git -C "$SRC" checkout -q --detach FETCH_HEAD
 git -C "$SRC" apply --check "$REPO/tools/patches/qbdi-ios-arm64e-asm.patch"
 git -C "$SRC" apply "$REPO/tools/patches/qbdi-ios-arm64e-asm.patch"
+git -C "$SRC" apply --check "$REPO/tools/patches/qbdi-controlled-native-boundary.patch"
+git -C "$SRC" apply "$REPO/tools/patches/qbdi-controlled-native-boundary.patch"
 mkdir -p "$REPO/vendor/qbdi/lib" "$REPO/vendor/qbdi/include/QBDI"
 for ARCH in arm64 arm64e; do
 BUILD="$RUN/build-$ARCH"

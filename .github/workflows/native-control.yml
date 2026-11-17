@@ -1,0 +1,36 @@
+name: Native control flow
+on:
+  push:
+    branches: [main]
+    paths: ['src/core/**', 'src/trace/**', 'tests/**', 'tools/**', 'Makefile', '.github/workflows/native-control.yml']
+  pull_request:
+    paths: ['src/core/**', 'src/trace/**', 'tests/**', 'tools/**', 'Makefile', '.github/workflows/native-control.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  original-call-control:
+    # Current standard Apple-silicon label:
+    # https://docs.github.com/en/actions/reference/runners/github-hosted-runners
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check native prerequisites
+        run: |
+          test "$(uname -m)" = arm64
+          command -v cmake >/dev/null || brew install cmake
+          command -v ninja >/dev/null || brew install ninja
+      - name: Build pinned host dependencies
+        run: |
+          bash tools/build_dobby_macos.sh
+          bash tools/build_qbdi_macos.sh
+      - name: Check native exceptions and nonlocal continuations
+        run: make test-control-runtime
+      - name: Retain owned fixture diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-control-owned-fixtures
+          path: build/control-test-results/
+          if-no-files-found: ignore
