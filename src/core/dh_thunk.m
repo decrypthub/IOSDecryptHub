@@ -22,6 +22,7 @@
 #include "dh_call_context.h"
 #import "dh_unwind.h"
 #import "dh_flow.h"
+#import "dh_flow_swift.h"
 #import "../trace/qbdi_live.h"
 #include <errno.h>
 
@@ -705,6 +706,11 @@ static NSDictionary *dh_function_context(DHLogEntry *e, int slot, DHCallContext 
     c[@"kind"] = @"function"; c[@"phase"] = phase;
     c[@"callId"] = DHCallID(call.id); c[@"parentCallId"] = DHCallID(call.parent);
     [c addEntriesFromDictionary:DHFlowFields(call.async_task)];
+    // Leave/abort can be emitted after a runtime task switch. Preserve the
+    // entry's exact lifetime token rather than stamping the current task.
+    for(NSString *key in [c.allKeys copy])if([key hasPrefix:@"swift"])[c removeObjectForKey:key];
+    [c addEntriesFromDictionary:DHSwiftFieldsForToken(call.runtime_task)];
+    if(call.runtime_domain && !call.runtime_task){c[@"swiftAssociationResolved"]=@NO;c[@"swiftIdentityBasis"]=@"runtime Task present; creation lifetime unobserved at paired call entry";}
     c[@"hookId"] = [NSString stringWithFormat:@"%@:hook:%d", DHProcessGeneration(), slot];
     c[@"slot"] = @(slot); c[@"depth"] = @(call.depth);
     c[@"mechanism"] = g_slots[slot].kind == DH_HOOK_METHOD ? @"objc" : g_slots[slot].kind == DH_HOOK_INLINE ? @"inline" : @"import";
@@ -733,6 +739,7 @@ uint64_t dh_thunk_handler(uint64_t slot, uint64_t *gpr, uint64_t caller_sp, uint
     g_in_thunk = 1;
     if ([DHLogStore shared].paused) { dh_in_hook=savedInternal; g_in_thunk = 0; errno=savedErrno; return guard; }
     DHCallContext call = dh_call_begin(g_dh_thunk_post[slot], DHMonotonicNS());
+    dh_call_bind_runtime_task(&call,DHSwiftCurrentToken());
     if(guard)DHFlowGuardBind(guard,&call);
     @autoreleasepool {
         const dh_hook_options *o = &g_slot_options[slot];

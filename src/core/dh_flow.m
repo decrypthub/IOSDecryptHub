@@ -24,7 +24,7 @@ enum { FLOW_CAP=1024,FLOW_PENDING=64,FLOW_DEPTH=8 };
 typedef struct {int slot;uint64_t token,sp;DHCallContext saved;} FlowGuard;
 typedef struct FlowTask {
     uint64_t id,parent,call,submitted,started,finished,submitThread,thread,caller,callback,creationCaller;
-    uint64_t scopeSP,*cookie; struct FlowTask *previous;
+    uint64_t runtimeDomain,scopeSP,*cookie; struct FlowTask *previous;
     void *context;dispatch_function_t function;
     int state,depth;unsigned associationGaps; // 1 pending, 2 running, 3 completed, 4 aborted
     char api[64],queue[128],terminal[64],callbackLabel[192];DHRawStack stack;
@@ -184,7 +184,7 @@ void DHFlowCheck(const DHRawStack *stack) {
         for(unsigned i=0;i<stack->count;i++)if(stack->pc[i]>=bodyStart && stack->pc[i]<bodyEnd){task->checkedBodyPC=stack->pc[i];task->checkedBodySP=stack->sp[i];break;}
         current=task->previous;task_end(task,NO,task->checkedCookie!=task->id?"scope-cookie-replaced-at-boundary":"wrapper-frame-absent-at-complete-boundary");
     }
-    mirror();dh_call_set_async(current?current->id:0);busy--;errno=saved;
+    mirror();dh_call_set_async_for_domain(current?current->id:0,current?current->runtimeDomain:0);busy--;errno=saved;
 }
 void DHFlowBoundary(void) {
     if (busy || dh_thunk_in_handler() || dh_live_current() || (!guardCount && !current)) return;
@@ -219,10 +219,10 @@ __attribute__((noinline,optnone)) void DHAsyncExecute(FlowTask *task,dispatch_bl
     for (unsigned i=0;i<stack.count;i++) if(stack.pc[i]>=bodyStart && stack.pc[i]<bodyEnd) {sp=stack.sp[i];break;}
     pthread_mutex_lock(&flowLock);task->scopeSP=sp;task->cookie=(uint64_t *)&cookie;task->previous=current;task->state=2;
     if(!task->started)task->started=DHMonotonicNS();pthread_threadid_np(NULL,&task->thread);pthread_mutex_unlock(&flowLock);
-    current=task;mirror();dh_call_set_async(task->id);task_event(task,@"start");BOOL normal=NO;errno=entryErrno;
+    task->runtimeDomain=dh_call_runtime_domain();current=task;mirror();dh_call_set_async_for_domain(task->id,task->runtimeDomain);task_event(task,@"start");BOOL normal=NO;errno=entryErrno;
     @try {body();normal=YES;}
     @finally {
-        int finalErrno=errno;DHFlowBoundary();current=task->previous;mirror();dh_call_set_async(current?current->id:0);task_end(task,normal,normal?"normal-return":"exception-unwinding-wrapper");errno=finalErrno;
+        int finalErrno=errno;DHFlowBoundary();current=task->previous;mirror();dh_call_set_async_for_domain(current?current->id:0,current?current->runtimeDomain:0);task_end(task,normal,normal?"normal-return":"exception-unwinding-wrapper");errno=finalErrno;
     }
 }
 static BOOL prepare_origin(const char *api,const char *label,void *caller,void *callback,uintptr_t creationCaller,BOOL runtimeEntry,const char *callbackLabel,FlowOrigin *out) {
@@ -501,7 +501,7 @@ NSDictionary *DHFlowConfigureWithCallbacks(BOOL on,BOOL roots,unsigned budget,un
     rootAPICount=(unsigned)apis.count;for(unsigned i=0;i<rootAPICount;i++)strlcpy(rootAPIs[i],[apis[i] UTF8String],128);
     rootCallbackCount=(unsigned)callbacks.count;for(unsigned i=0;i<rootCallbackCount;i++)strlcpy(rootCallbacks[i],[callbacks[i] UTF8String],128);
     windowStarted=DHMonotonicNS();deadline=windowStarted+(uint64_t)ms*1000000;strlcpy(stopReason,on?"capturing":"disabled",sizeof(stopReason));atomic_store(&gateOn,on && taskCount<FLOW_CAP);if(on && taskCount==FLOW_CAP)strlcpy(stopReason,"record-capacity",sizeof(stopReason));pthread_mutex_unlock(&flowLock);
-    return @{@"ok":@YES,@"state":DHFlowState(),@"coverage":@"six public GCD submission imports, three group/block notification imports, two public block constructors and bounded dispatch source/RunLoop timer adapters; selected plain App blocks/function callbacks and uniquely observed first submissions of blocks created during capture; original dispatch-block metadata preserved; unknown/preexisting/reused blocks have no guessed execution edge; no Swift/NSOperation/private scheduling coverage"};
+    return @{@"ok":@YES,@"state":DHFlowState(),@"coverage":@"six public GCD submission imports, three group/block notification imports, two public block constructors and bounded dispatch source/RunLoop timer adapters; selected plain App blocks/function callbacks and uniquely observed first submissions of blocks created during capture; original dispatch-block metadata preserved; unknown/preexisting/reused blocks have no guessed execution edge; NSOperation uses typed public Method adapters; Swift Task observation is enabled separately with configure_swift_capture; other private schedulers are not inferred"};
 }
 NSDictionary *DHFlowRead(unsigned offset,unsigned limit,uint64_t token) {
     NSMutableArray *out=[NSMutableArray array];pthread_mutex_lock(&flowLock);unsigned total=taskCount;

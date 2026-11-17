@@ -1,6 +1,7 @@
 #import "dh_event.h"
 #import "dh_call_context.h"
 #import "dh_flow.h"
+#import "dh_flow_swift.h"
 #import "log_store.h"
 #include <dlfcn.h>
 #include <mach/mach_time.h>
@@ -37,7 +38,8 @@ void DHStampEvent(DHLogEntry *event) {
         @"processGeneration": DHProcessGeneration(), @"pid": @(getpid()),
         @"agentBuild": @DH_VERSION_STR, @"monotonicNs": [NSString stringWithFormat:@"%llu", DHMonotonicNS()],
         @"parentCallId": DHCallID(dh_call_parent()), @"parentScope": @"active-paired-synchronous-functions"} mutableCopy];
-    [context addEntriesFromDictionary:DHFlowFields(dh_call_async())];event.eventContext=context;
+    [context addEntriesFromDictionary:DHFlowFields(dh_call_async())];
+    [context addEntriesFromDictionary:DHSwiftFieldsCurrent()];event.eventContext=context;
 }
 
 NSDictionary *DHTargetIdentity(const void *address) {

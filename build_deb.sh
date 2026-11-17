@@ -123,6 +123,22 @@ compile_daemon() {
         "$DAEMON_SRC" -o "$OUT"
 }
 
+compile_swift_fixture() {
+    local ARCHS="$1" OUT="$2" ARCH
+    local SLICES=()
+    mkdir -p "$(dirname "$OUT")"
+    for ARCH in $ARCHS; do
+        local SLICE="${OUT%.dylib}-$ARCH.dylib"
+        xcrun swiftc -swift-version 5 -parse-as-library -O -emit-library \
+            -sdk "$SDK" -target "$ARCH-apple-ios15.0" \
+            -module-name IDHSwiftFixtures \
+            -Xlinker -install_name -Xlinker @loader_path/IDHSwiftFixtures.dylib \
+            "$SCRIPT_DIR/tests/fixtures/IDHSwiftFixtures.swift" -o "$SLICE"
+        SLICES+=( "$SLICE" )
+    done
+    xcrun lipo -create "${SLICES[@]}" -output "$OUT"
+}
+
 verify_macho_arch() {
     local PATH_TO_VERIFY="$1"
     local EXPECTED_ARCH="$2"
@@ -159,12 +175,16 @@ build_variant() {
     local LOADER_OUT="$BUILD_DIR/_loader-${VARIANT}/IOSDecryptHubLoader.dylib"
     local APP_EXEC="$BUILD_DIR/_app-${VARIANT}/$APP_NAME"
     local DAEMON_OUT="$BUILD_DIR/_daemon-${VARIANT}/$DAEMON_BIN"
+    local SWIFT_FIXTURE_OUT="$BUILD_DIR/_swift-${VARIANT}/IDHSwiftFixtures.dylib"
     local ENGINE_DYLIB
 
     ENGINE_DYLIB=$(require_vendor_dylib "$VARIANT" "$MACHO_ARCHS")
     compile_loader "$MACHO_ARCHS" "$LOADER_OUT"
     compile_app "$APP_MACHO_ARCHS" "$APP_EXEC" "$ARCHITECTURE"
     compile_daemon "$APP_MACHO_ARCHS" "$DAEMON_OUT" "$ARCHITECTURE"
+    # Loaded only by the explicit Swift selftest on iOS 15+. The Agent has no
+    # Swift dependency and keeps its existing iOS 14 loading compatibility.
+    compile_swift_fixture "$MACHO_ARCHS" "$SWIFT_FIXTURE_OUT"
 
     info "打包 $VARIANT (arch=$ARCHITECTURE, prefix=${PREFIX:-/})..."
     rm -rf "$STAGE"
@@ -196,6 +216,7 @@ CTRL
     cp "$SCRIPT_DIR/Filter.plist" "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.plist"
 
     cp "$ENGINE_DYLIB" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
+    cp "$SWIFT_FIXTURE_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/IDHSwiftFixtures.dylib"
     cp "$SCRIPT_DIR/enabledBundles.default.plist" \
         "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/enabledBundles.default.plist"
     cp "$DAEMON_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
@@ -379,6 +400,8 @@ POSTRM
 
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.dylib"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
+    verify_macho_arch "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/IDHSwiftFixtures.dylib" "$MACHO_ARCHS" "$VARIANT owned Swift fixture"
+    ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/IDHSwiftFixtures.dylib"
     ldid -S"$APP_ENTITLEMENTS" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
 

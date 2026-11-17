@@ -27,6 +27,7 @@
 #include "dh_flow.h"
 #include "dh_flow_timers.h"
 #include "dh_flow_operations.h"
+#include "dh_flow_swift.h"
 #include "dh_noise.h"
 #include "dh_spoof.h"
 #include "dh_files.h"
@@ -1714,7 +1715,7 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
             @"unpack":        (bits & DH_CAPBIT_UNPACK)        ? @YES : @NO,   // 脱壳
             @"hook_inline":   @(inlineAvailable),
             @"trace_function": @(traceAvailable),
-            @"trace_live": @(DHLiveAvailable() && inlineAvailable), @"native_stack_unwind": @(dh_unwind_available()),@"native_stack_recipes":@((BOOL)dh_unwind_recipe_available()),@"operation_flow":@YES,
+            @"trace_live": @(DHLiveAvailable() && inlineAvailable), @"native_stack_unwind": @(dh_unwind_available()),@"native_stack_recipes":@((BOOL)dh_unwind_recipe_available()),@"operation_flow":@YES,@"swift_task_flow":@(inlineAvailable),
         },
         @"capabilityBits": @(bits),
         @"process":        [[DHLogStore shared] processInfo] ?: @{},
@@ -2045,7 +2046,7 @@ static BOOL event_passes_extra(DHLogEntry *e,
 
 static BOOL event_passes_context(DHLogEntry *event, NSDictionary *args) {
     NSDictionary *keys = @{@"process_generation": @"processGeneration", @"call_id": @"callId",
-        @"parent_call_id": @"parentCallId", @"hook_id": @"hookId", @"phase": @"phase",@"async_task_id":@"asyncTaskId"};
+        @"parent_call_id": @"parentCallId", @"hook_id": @"hookId", @"phase": @"phase",@"async_task_id":@"asyncTaskId",@"swift_task_id":@"swiftTaskId"};
     for (NSString *key in keys) {
         id value = args[key];
         if (value && (![value isKindOfClass:NSString.class] || ![value isEqual:event.eventContext[keys[key]]])) return NO;
@@ -3418,7 +3419,7 @@ static NSArray *tool_definitions(void) {
                 @"description": @"Required for post capture: caller confirms fixed nonvariadic prototype; Objective-C metadata alone cannot detect ... methods"};
         }
         if ([name isEqualToString:@"query_events"]) {
-            for (NSString *key in @[@"process_generation", @"call_id", @"parent_call_id", @"hook_id", @"phase",@"async_task_id"])
+            for (NSString *key in @[@"process_generation", @"call_id", @"parent_call_id", @"hook_id", @"phase",@"async_task_id",@"swift_task_id"])
                 properties[key] = @{@"type": @"string", @"description": @"Exact structured event-context filter; legacy records without the field do not match"};
         }
         if ([name isEqualToString:@"trace_function"])
@@ -3466,6 +3467,11 @@ static NSArray *tool_definitions(void) {
           @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
     ]];
     [tools addObjectsFromArray:@[
+      @{@"name":@"get_swift_events",@"description":@"Read the bounded native Swift scheduler event ring: exact creation lifetime, enqueue, native job entry/return, authoritative current Task, completion and retrospective completion recovery. schedulerSeq belongs to this ring, independently of query_events seq. Reports overwritten entries; a job container is separate from Swift parenthood. Live generation only.",@"inputSchema":@{@"type":@"object",@"properties":@{@"after_seq":@{@"type":@"integer",@"minimum":@0,@"maximum":@9007199254740991LL},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@64},@"swift_task_id":@{@"type":@"string"}}}},
+      @{@"name":@"get_swift_state",@"description":@"Read Swift runtime preparation and bounded task lifetime counters. Default off. Native job return, runtime completion entry and task identity observations are distinct; no Job/TaskLocal private layout is read.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
+      @{@"name":@"get_swift_tasks",@"description":@"Read observed Swift task creation lifetimes, authoritative current-task observations, selected native scheduler entries and calibrated runtime completion evidence. Creation source is separate from Swift structured parenthood. Old task addresses are never identities.",@"inputSchema":@{@"type":@"object",@"properties":@{@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@512},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@16}}}},
+      @{@"name":@"configure_swift_capture",@"description":@"Explicit bounded Swift task observation. First enable runs owned compiler-generated ABI/TaskLocal calibration and retains typed runtime forwarding adapters until restart. No task, executor, priority, TaskLocal value or closure is replaced. Existing recorded lifetimes continue to observe completion after disable.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"enabled"],@"properties":@{@"process_generation":@{@"type":@"string"},@"enabled":@{@"type":@"boolean"},@"max_tasks":@{@"type":@"integer",@"minimum":@1,@"maximum":@128},@"max_ms":@{@"type":@"integer",@"minimum":@1,@"maximum":@60000}}}},
+      @{@"name":@"run_swift_selftest",@"description":@"Run owned compiler-generated Swift Tasks through sleep/yield, MainActor and async-let; verify inherited/detached TaskLocal values, identity lifetimes, original results and runtime final continuations. Refuses to replace an active Swift capture; retains native adapters until restart.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}},
       @{@"name":@"get_operation_state",@"description":@"Read bounded operation submission/execution identities and separately sampled public lifecycle. Original operation, dependencies and cancellation are preserved. A start callback return does not imply asynchronous operation completion. Ordinary executionBlocks may contain forwarding wrappers; actual worker invokers are calibrated per process.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
       @{@"name":@"run_operation_selftest",@"description":@"Run owned NSOperation/NSBlockOperation dependency, distinct worker identity, asynchronous lifecycle, cancellation, pending-disable and budget tests on isolated queues. Installs bounded typed scheduler adapters until process restart and disables the capture window on exit.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}},
       @{@"name":@"get_unwind_state",@"description":@"Read bounded canonical frame recipes, verified code identity and recovery/refusal counters. No App CFI or code is patched; disabled slots are never reused.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
@@ -3475,7 +3481,7 @@ static NSArray *tool_definitions(void) {
       @{@"name":@"get_timer_state",@"description":@"Read bounded RunLoop timer bindings and independently calibrated Foundation callback entry support. An unregistered timer entry is not a measured enqueue or recovered registration.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
       @{@"name":@"get_async_registrations",@"description":@"Read bounded callback registrations separately from individual deliveries. A registered-handler edge is not a measured enqueue. Registrations and task IDs are process-local; inactive, unobserved and outside-window callbacks continue unchanged.",@"inputSchema":@{@"type":@"object",@"properties":@{@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@128},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@8}}}},
       @{@"name":@"get_flow_diagnostics",@"description":@"Read a bounded ring of uncertain stack boundaries with precise stop reason and last native PC/SP/FP. CandidateTaskId is diagnostic only, not an established parent. Raw stacks are resolved on this reader thread.",@"inputSchema":@{@"type":@"object",@"properties":@{@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@16},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@4}}}},
-      @{@"name":@"configure_async_capture",@"description":@"Opt-in bounded scheduler correlation, including RunLoop timers with calibrated native entry. Real registration/delivery, unknown-registration callback entry and true submission remain separate. Six public async/after/group submission imports, three group/block notification imports, two public block constructors and bounded dispatch source adapters. Source registrations and repeated deliveries have separate identities; source function handlers retain the original libdispatch-supplied context. Selected first submissions of blocks created during capture preserve their original outer metadata and track the inner callback; reused-before-start is unresolved. Preexisting/unknown blocks pass through. Existing pending work keeps its identity after capture is disabled. No Swift/NSOperation/private scheduler coverage. Restart clears retained forwarding patches.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"enabled"],@"properties":@{@"process_generation":@{@"type":@"string"},@"enabled":@{@"type":@"boolean"},@"capture_roots":@{@"type":@"boolean"},@"queue_exclude":@{@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"root_queue_include":@{@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"root_callback_include":@{@"description":@"Optional root callback labels, at most eight case-insensitive substrings. NSTimer factories label the observed target class/selector or NSTimer.block; unknown labels do not match. Descendants retain propagation; this does not infer the executed IMP or an old timer target.",@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"root_api_include":@{@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"max_tasks":@{@"type":@"integer",@"minimum":@1,@"maximum":@256},@"max_ms":@{@"type":@"integer",@"minimum":@1,@"maximum":@60000}}}},
+      @{@"name":@"configure_async_capture",@"description":@"Opt-in bounded scheduler correlation, including RunLoop timers with calibrated native entry. Real registration/delivery, unknown-registration callback entry and true submission remain separate. Six public async/after/group submission imports, three group/block notification imports, two public block constructors and bounded dispatch source adapters. Source registrations and repeated deliveries have separate identities; source function handlers retain the original libdispatch-supplied context. Selected first submissions of blocks created during capture preserve their original outer metadata and track the inner callback; reused-before-start is unresolved. Preexisting/unknown blocks pass through. Existing pending work keeps its identity after capture is disabled. NSOperation uses typed public Method adapters. Swift Task observation is enabled separately with configure_swift_capture; other private schedulers are not inferred. Restart clears retained forwarding patches.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"enabled"],@"properties":@{@"process_generation":@{@"type":@"string"},@"enabled":@{@"type":@"boolean"},@"capture_roots":@{@"type":@"boolean"},@"queue_exclude":@{@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"root_queue_include":@{@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"root_callback_include":@{@"description":@"Optional root callback labels, at most eight case-insensitive substrings. NSTimer factories label the observed target class/selector or NSTimer.block; unknown labels do not match. Descendants retain propagation; this does not infer the executed IMP or an old timer target.",@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"root_api_include":@{@"type":@"array",@"maxItems":@8,@"items":@{@"type":@"string"}},@"max_tasks":@{@"type":@"integer",@"minimum":@1,@"maximum":@256},@"max_ms":@{@"type":@"integer",@"minimum":@1,@"maximum":@60000}}}},
       @{@"name":@"get_async_tasks",@"description":@"Read bounded observed GCD causal edges, submitter call/task and execution TID. Async edges are separate from native stacks and synchronous parentCallId. Pending is not completion; no guessed edges.",@"inputSchema":@{@"type":@"object",@"properties":@{@"task_id":@{@"type":@"string"},@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@1024},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@128}}}},
       @{@"name":@"get_flow_state",@"description":@"Read bounded async and nonlocal-exit protection counters. Thread-local counters refer to the handling thread; no arbitrary thread state mutation.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
       @{@"name":@"run_flow_selftest",@"description":@"Explicit IDH-owned exception/longjmp cleanup, caught exception, GCD context propagation, bounded budget and worker-reuse fixtures. Does not run business signing functions; restart target after testing.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
@@ -3583,7 +3589,37 @@ static NSDictionary *tool_set_webkit_probe(NSDictionary *args) {
 }
 
 static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
-    if([@[@"register_unwind_recipe",@"set_unwind_recipe_enabled",@"run_unwind_selftest",@"run_operation_selftest"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
+    if([@[@"register_unwind_recipe",@"set_unwind_recipe_enabled",@"run_unwind_selftest",@"run_operation_selftest",@"run_swift_selftest",@"configure_swift_capture"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
+    if([name isEqual:@"get_swift_state"])return tool_ok(DHSwiftState());
+    if([name isEqual:@"get_swift_events"]) {
+        for(NSString *key in @[@"after_seq",@"limit"])
+            if(args[key] && (![args[key] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)args[key])==CFBooleanGetTypeID() || !isfinite([args[key] doubleValue]) || floor([args[key] doubleValue])!=[args[key] doubleValue]))return tool_err(@"Swift event cursor and limit must be finite integers");
+        if((args[@"after_seq"] && ([args[@"after_seq"] doubleValue]<0 || [args[@"after_seq"] doubleValue]>9007199254740991.0)) || (args[@"limit"] && ([args[@"limit"] doubleValue]<1 || [args[@"limit"] doubleValue]>64)))return tool_err(@"Swift event cursor/limit out of range");
+        uint64_t task=0;
+        if(args[@"swift_task_id"]) {
+            id raw=args[@"swift_task_id"];NSString *prefix=[DHProcessGeneration() stringByAppendingString:@":swift:"];
+            if(![raw isKindOfClass:NSString.class] || ![raw hasPrefix:prefix] || [raw length]<=prefix.length || [raw length]>prefix.length+3)return tool_err(@"Swift task filter requires a current-generation task ID");
+            NSString *number=[raw substringFromIndex:prefix.length];const char *digits=number.UTF8String;
+            if(strspn(digits,"0123456789")!=strlen(digits))return tool_err(@"invalid Swift task ID");
+            task=strtoull(digits,NULL,10);
+            if(!task || task>512 || ![raw isEqual:[prefix stringByAppendingFormat:@"%llu",task]])return tool_err(@"invalid Swift task ID");
+        }
+        return tool_ok(DHSwiftEvents([args[@"after_seq"] unsignedLongLongValue],args[@"limit"]?[args[@"limit"] unsignedIntValue]:32,task));
+    }
+    if([name isEqual:@"run_swift_selftest"])return tool_ok(DHSwiftSelfTest());
+    if([name isEqual:@"get_swift_tasks"] || [name isEqual:@"configure_swift_capture"]) {
+        for(NSString *key in @[@"offset",@"limit",@"max_tasks",@"max_ms"])
+            if(args[key] && (![args[key] isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)args[key])==CFBooleanGetTypeID() || !isfinite([args[key] doubleValue]) || floor([args[key] doubleValue])!=[args[key] doubleValue]))return tool_err(@"Swift page and budgets must be finite integers");
+        if([name isEqual:@"get_swift_tasks"]) {
+            if((args[@"offset"] && ([args[@"offset"] doubleValue]<0 || [args[@"offset"] doubleValue]>512)) || (args[@"limit"] && ([args[@"limit"] doubleValue]<1 || [args[@"limit"] doubleValue]>16)))return tool_err(@"Swift offset 0..512; limit 1..16");
+            return tool_ok(DHSwiftRead([args[@"offset"] unsignedIntValue],args[@"limit"]?[args[@"limit"] unsignedIntValue]:16));
+        }
+        id on=args[@"enabled"];
+        if(!on || CFGetTypeID((__bridge CFTypeRef)on)!=CFBooleanGetTypeID())return tool_err(@"Swift enabled must be a boolean");
+        if((args[@"max_tasks"] && ([args[@"max_tasks"] doubleValue]<1 || [args[@"max_tasks"] doubleValue]>128)) || (args[@"max_ms"] && ([args[@"max_ms"] doubleValue]<1 || [args[@"max_ms"] doubleValue]>60000)))return tool_err(@"Swift budgets out of range");
+        NSDictionary *result=DHSwiftConfigure([on boolValue],args[@"max_tasks"]?[args[@"max_tasks"] unsignedIntValue]:128,args[@"max_ms"]?[args[@"max_ms"] unsignedIntValue]:30000);
+        return [result[@"ok"] boolValue]?tool_ok(result):tool_err(result[@"reason"]?:@"Swift capture preparation failed");
+    }
     if([name isEqual:@"get_operation_state"])return tool_ok(DHFlowOperationState());
     if([name isEqual:@"run_operation_selftest"])return tool_ok(DHFlowOperationSelfTest());
     if([name isEqual:@"get_unwind_state"])return tool_ok(DHUnwindRecipeState());
@@ -3758,7 +3794,7 @@ static BOOL tool_is_heavy(NSString *name) {
                                       @"find_selector_refs", @"find_function_refs",
                                       @"analyze_function", @"disassemble_function",
                                       @"find_objc_methods", @"export_events", @"start_dump",
-                                      @"trace_function", @"run_hook_selftest", @"run_live_selftest", @"trace_live_arm", @"trace_live_cancel",@"configure_async_capture",@"run_flow_selftest"]];
+                                      @"trace_function", @"run_hook_selftest", @"run_live_selftest", @"trace_live_arm", @"trace_live_cancel",@"configure_async_capture",@"run_flow_selftest",@"configure_swift_capture",@"run_swift_selftest"]];
     });
     return [heavy containsObject:name];
 }

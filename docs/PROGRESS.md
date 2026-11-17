@@ -1,5 +1,15 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.48 Swift Task 原生身份与生命周期（研发包）
+
+- 独立默认关闭的 `configure_swift_capture` 与状态/任务/调度事件/自检五项工具。public Swift 5.5/5.7 runtime 的 typed swiftcall 创建、job、global/main/delay/deadline 入队与 swiftasync 最终回调保持原参数、executor、closure、TaskLocal 和实际任务对象；Rootless 缺少 deadline 导出时明确报告。最终回调必须尾调用原函数，runtime 镜像、真实函数指针和可执行映射逐项校准，不从弱 unwind 范围猜入口，不读取私有 Task/Job 布局。
+- 每次原创建调用的 ticket 与实际初始 enqueue 指针证明生命周期；提前完成还须匹配 ticket/Task/初始 context/最终函数。512 历史不复用、128 单窗/60 秒、128 初始入队/128 提前完成证据及 1024 POD 事件环有界。创建记录发布前的真实结束竞态先红后绿；未知入口/未见入队/丢失明确 unresolved。runtime completion 进入与原 native job 返回确认分开，future 错误不是异常中止。
+- 通用事件增加 TaskID/创建来源，成对调用保存入口的身份；同一物理线程上不同 runtime Task 的同步 parent/depth/GCD 身份隔离，恢复嵌套 GCD 范围保留原域。creator 关系不冒充 Swift structured parent，原生 job 容器不冒充 Task 父级。
+- 最终 Mac v38 的新真实 Swift native 门禁和全部原门禁、arm64/arm64e 完整包通过。独立 Swift 资源随整包编译/架构验证/签名，仅显式自检加载；Agent 仍保持 iOS14 链接范围。两台各通过 81 自有生命周期、4 错误 future、MainActor/TaskLocal/async-let/sleep/yield/取消/关闭后 pending/预算与 65 快任务，5 项 MCP，以及原 39 flow、7 timer、2 诊断、10 原生/4 MCP operation、6 原生/4 MCP unwind、native/PAC/ABI/live7 与接口回归。真实提前结束补记 7/11 个。Rootless 启动繁忙期 MainActor 延至 11.8 秒触发原 10 秒失败，事件确认七任务最终正常结束；稳定启动后同包重跑通过，门禁未延长。
+- 最终真实快手网络：Rootless 21 棵/315 对、RootHide 23 棵/345 对完整调用，核心 15 参数、sig3/HTTP 和独立 HMAC/白盒/CRC 分别 21/63/21、23/69/23 一致；7/6 条 GCD/native/HTTP 链，256/246 任务均完成，展开不足增量 0。Rootless 无新 App Swift Task；RootHide 实际捕获 5 次 App Task 创建和四个 job 入口/返回，初始 enqueue 身份有效、读取时任务未结束，不伪称 completed。没有观测到 Swift→sig3。
+
+协议见 [SWIFT_TASK_FLOW.md](SWIFT_TASK_FLOW.md)。同源/安装字节与原 CI 核对继续；其它实际私有调度、source 实际路径、QBDI 异常/longjmp 透明执行及最终最高版本集成仍继续。没有发布 Release/APT。
+
 ## 2026-11-17：1.28.47 NSOperation 实际执行与生命周期（研发包）
 
 - 五个固定 ABI 公开 Method 适配器及每具体类的 start/main 入口共用原 Hook 归属检查；原 operation、依赖、取消、并发上限、BOOL wait 和队列负责执行。普通 block 每执行体独立 token，Foundation 实际 invoker 校准后才领取身份；直接调用 executionBlocks 不抢队列任务。64 元数据记录、32 执行 Method、128 block 包装器有界且不复用，达限继续原工作并明确 unresolved。
@@ -10,6 +20,8 @@
 - 换新代后的最终普通网络窗口：Rootless 31 棵/465 对，RootHide 23 棵/345 对，全部核心参数、HTTP 与独立 HMAC/白盒/CRC 分别 31/93/31、23/69/23 一致；4/6 条精确 GCD/native/HTTP 链。164/246 任务全部完成，两窗口展开不足增量均 0。根队列定向保持原 256 预算，没有据此声称所有请求都有完整异步图。
 
 协议与边界见 [OPERATION_FLOW.md](OPERATION_FLOW.md)。本切片的同源、安装字节和 CI 继续核对；Swift Task、其它实际调度、source 实际注册与 QBDI 异常/longjmp 透明执行及最终集成仍继续。没有发布 Release/APT。
+
+1.28.47 最终复核：`f4298a3` 原完整包 CI [44077317216](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44077317216) 成功；209 文件与 Mac v33 构建同源，Rootless 安装每字节一致，RootHide 仅合法品牌/对应页 hash 40 字节变化。两台已清临时 Hook/窗口/规则并暂停，scope 保留。
 
 ## 2026-11-17：1.28.46 原生缺失元数据的有界恢复（研发包）
 
