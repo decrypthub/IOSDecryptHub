@@ -1,9 +1,20 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.44 source 注册/delivery 与根 API 定向（研发包）
+
+- 新有界注册层把来源注册与每次回调分开，提供 get_async_registrations、registrationId/asyncRegistrationId、deliveryObservedNs 和明确的 registered-handler-to-callback 边。128 个注册不复用、每页最多 8 条；source 生命周期创建绑定最多 64 个，原任务预算不扩大。新 root_api_include 选择根入口，后代保留传播。
+- source 九项公开导入与原十一项一起检查/预留所有权。普通已识别 block、event/cancel/registration 的固定 `_f` 类型入口保留原 context；不替换 do_ctxt、不读私有 source 布局。重复事件独立任务、替换/NULL 移除/释放退休、取消请求与实际回调分开，队列变化保留原参数和两种时间位置。未知旧对象与特殊/未知 block 明确放行而不猜边。
+- 新九组语义夹具使 flow 自检增至 30 组，Mac 与两台最终 v6 整包均通过。原 runtime/ABI/unwind/iOS、updater、两份完整 deb 构建通过；双机新注册分页/非法请求/Import 所有权、原 flow/diagnostics/native/PAC/live 与接口回归通过。原门禁未改，scope 保留。
+- 实际 source 定向窗口：Rootless 29 棵、RootHide 32 棵完整签名树分别与 HTTP 和独立 HMAC/白盒/CRC 一致；该窗口没有捕获到支持范围内的新 source 注册或 delivery，不能称作 source 业务链通过。普通网络窗口另为 Rootless 18 棵 / 270 对与 RootHide 20 棵 / 300 对，各全部与 HTTP 和独立原语一致，其中 4/5 条有完整实际 GCD 任务链、原 callback native 栈和精确 HTTP。
+- 未关联样本中实际观察到 Rootless 5 条、RootHide 6 条 __NSFireTimer 路径；两台都以当前代符号化、函数边界和反汇编核对 Foundation 的真实入口，dlsym 也匹配。RootHide 入口含 PACIBSP。这里只完成定位；RunLoop/NSTimer 适配与固定 ABI 校准继续实施，不据此伪造注册或父边。
+
+当前只完成本切片，整体后续清单仍继续。协议及准确边界见 [CALLBACK_REGISTRATIONS.md](CALLBACK_REGISTRATIONS.md)，未发布 Release/APT。
+
 ## 2026-11-17：1.28.43 GCD group/block notify（后续调度适配之一）
 
 - 在原六种提交和两个 block 构造器上补 `dispatch_group_notify`、`dispatch_group_notify_f`、`dispatch_block_notify`，十一项导入统一管理所有权。保留原 group/依赖 block、queue、context/function 和特殊 notification 的原外层对象；不会将登记通知当作依赖已结束或 callback 已执行。关闭窗口后，已登记的 pending 通知仍实际执行并保留原任务身份。
 - 新三组真实运行时夹具验证 block/function 通知在依赖完成后各执行一次、原 `_f` context、被取消依赖仍触发通知、特殊 notification 的 QoS/等待与关闭窗口后的 pending 语义；Mac 与双机 21 组 flow 通过。既有 Mac ABI/unwind/iOS、更新策略和两种完整 deb 构建通过。1.28.43 整包已刷入两台且保留 scope，扩展的 Import 所有权 MCP 回归通过。
+- 原完整包 CI [44021120704](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44021120704) 在 `47a7815` 成功，门禁保持不变。
 - 快手最终网络窗口：Rootless 29 棵 / 435 对，RootHide 24 棵 / 360 对；核心 15 参数、返回 sig3/HTTP、独立 HMAC/白盒/CRC 分别为 29/87/29 和 24/72/24 一致。Rootless 5 条、RootHide 4 条同时具备真实任务链、原 callback 的 native 栈证据和精确 HTTP 匹配。Rootless 另实际观察到 1 个已正常完成的 group notify；RootHide 该实际窗口未观察到 notify，三类通知的双机语义证据来自自有夹具。
 - 先期 RootHide 窗口有签名调用在窗口内找不到对应 HTTP，未将其当作完整链；收紧队列并回到首页后重新验证上述最终样本。先期另复现 176 次已知栈锚之前的元数据终止；最终定向窗口该计数增量为 0，两类窗口分别保留，不能据此称元数据缺口已修复。
 
@@ -15,6 +26,7 @@ dispatch source、RunLoop/NSTimer、NSOperation、Swift Task、私有调度以�
 - `get_flow_state` 按六类原因统计证据不足；新只读 `get_flow_diagnostics` 保留最近 16 条原始边界、每页最多 4 条，由读取线程符号化。`candidateTaskId` 仅用于诊断，不建立父边；命中线程只保存有界快照。活跃环形缓冲区可能在两页之间变化，读取者应检查 total/overwritten 和记录 ID。
 - 局部栈已实际包含所有已登记 post 桥与当前异步包装帧的准确 PC/SP/cookie 时，保留已证实的关联；不会因更高层截断而丢掉该父关系。局部栈中没看到某帧仍不证明退出，不据此退休调用或任务。新增第 18 组真实活动桥夹具，旧缺口/异常/longjmp 状态保护回归继续通过。
 - Mac 原运行时、unwind、iOS 编译、更新策略与两种完整 deb 构建通过；同一源码 1.28.42 整包已刷入两台授权设备且 scope 保留。两台各通过 18 组状态/GCD 自检、新诊断 MCP 的分页/非法参数/只读验证，以及既有 native/PAC/ABI 和 7 组 live 自检及 MCP 回归。
+- 原完整包 CI [44019080374](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44019080374) 在 `23e1299` 成功，依赖/更新/整包验证步骤保持不变。
 - 快手实际请求独立复核：Rootless 36 棵完整调用树、540 对调用，RootHide 25 棵、375 对调用；核心 15 参数 ABI、返回 sig3 与对应 HTTP 精确匹配，HMAC/白盒块/CRC 分别为 36/108/36 和 25/75/25 组一致。
 - 该真实窗口 Rootless 另有 15 次 `stopped-before-async-scope`：libunwind 在 App RVA `0xda476b4` 正常停止，但还未到已知包装锚。已记录真实缺口并抑制关联，没有伪造业务 aborted，也没有盲目扫描 FP 补帧。RootHide 本窗口未复现同类缺口，不代表任意路径都可完整展开。
 

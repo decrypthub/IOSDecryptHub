@@ -18,13 +18,13 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.43
+VERSION := 1.28.44
 TARGET  := decrypt_helper.dylib
 .DEFAULT_GOAL := all
 .PHONY: test-hook-runtime test-hook-ios-build test-unwind-runtime test-flow-runtime
 
 HOOK_TEST_SRC := tests/hook_runtime_test.m src/core/dh_thunk.m src/core/dh_call_context.c src/core/dh_event.m \
-    src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
+    src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
     src/core/log_store.m src/core/dh_capture.c src/core/dh_noise.m src/core/dh_health.c src/core/dh_capability.c \
     src/core/fishhook.c src/server/dh_log_json.m
 
@@ -78,7 +78,7 @@ SRC     := src/core/fishhook.c \
            src/core/dh_thunk.m \
            src/core/dh_call_context.c \
            src/core/dh_event.m \
-           src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
+           src/core/dh_hook_selftest.m src/core/dh_live_selftest.m src/core/dh_unwind.m src/trace/qbdi_live.m src/core/dh_flow.m src/core/dh_flow_sources.m src/core/dh_flow_selftest.m src/core/dh_flow_cxx.mm \
            src/core/dh_noise.m \
            src/core/dh_spoof.m \
            src/core/dh_symtab.c \

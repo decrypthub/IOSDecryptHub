@@ -12,6 +12,40 @@ extern int DHFlowCatchCXX(void (*body)(void *),void *context);
 extern int dh_thunk_post_frame(uint64_t pc,uint64_t sp,uint64_t callerSP);
 static __thread jmp_buf *jumpTarget;
 static void require(BOOL good,NSString *message);
+@interface DHFlowSourceFixtureRun:NSObject
+@property(strong) NSMutableArray *rows;
+@property(strong) dispatch_group_t done;
+@property uintptr_t source;
+@property unsigned events;
+@property BOOL spawnChild;
+@property(strong) dispatch_queue_t childQueue;
+@end
+@implementation DHFlowSourceFixtureRun
+@end
+@interface DHFlowSourceFixtureContext:NSObject
+@property(strong) DHFlowSourceFixtureRun *run;
+@property(strong) DHFlowSourceFixtureContext *previous;
+@property unsigned tag;
+@end
+@implementation DHFlowSourceFixtureContext
+@end
+static const char sourceTargetKey;
+static void source_record(DHFlowSourceFixtureRun *run,NSString *kind,unsigned tag) {
+    @synchronized(run) {[run.rows addObject:@{@"kind":kind,@"tag":@(tag),@"task":DHFlowFields(dh_call_async())[@"asyncTaskId"],@"target":@((uintptr_t)dispatch_get_specific(&sourceTargetKey))}];}
+}
+static void source_event(DHFlowSourceFixtureRun *run,unsigned tag) {
+    source_record(run,@"event",tag);dispatch_source_t source=(__bridge dispatch_source_t)(void *)run.source;
+    (void)dispatch_source_get_data(source);
+    if(++run.events==1) {
+        if(run.spawnChild){dispatch_group_enter(run.done);dispatch_async(run.childQueue,^{source_record(run,@"child",tag);dispatch_group_leave(run.done);});}
+        dispatch_source_merge_data(source,2);
+    } else dispatch_source_cancel(source);
+}
+static void source_event_f(void *opaque) {DHFlowSourceFixtureContext *context=(__bridge id)opaque;source_event(context.run,context.tag);}
+static void source_cancel_f(void *opaque) {DHFlowSourceFixtureContext *context=(__bridge id)opaque;source_record(context.run,@"cancel",context.tag);dispatch_group_leave(context.run.done);}
+static void source_registration_f(void *opaque) {DHFlowSourceFixtureContext *context=(__bridge id)opaque;source_record(context.run,@"registration",context.tag);}
+static void source_old_f(void *opaque) {DHFlowSourceFixtureContext *context=(__bridge id)opaque;source_record(context.run,@"replaced-handler-ran",context.tag);}
+static void source_finalize_f(void *opaque) {id released=CFBridgingRelease(opaque);(void)released;}
 @interface IDHFlowProbe:NSObject
 @property(strong) NSException *marker;
 @property(strong) NSMutableArray *observations;
@@ -29,6 +63,7 @@ static void require(BOOL good,NSString *message);
 - (uint64_t)exitOut;
 - (uint64_t)unverified;
 - (uint64_t)partial;
+- (NSArray *)sourceMode:(uint64_t)mode;
 @end
 static void cpp_body(void *p) {[( __bridge IDHFlowProbe *)p cppOut];}
 static void *exit_body(void *p) {[( __bridge IDHFlowProbe *)p exitOut];return NULL;}
@@ -58,6 +93,44 @@ static void function_body(void *p) {IDHFlowProbe *probe=CFBridgingRelease(p);[pr
     return 42;
 }
 - (uint64_t)catchInside {@try {@throw self.marker;}@catch(NSException *e) {return [self normal:8];}}
+- (NSArray *)sourceMode:(uint64_t)mode {
+    DHFlowSourceFixtureRun *run=[DHFlowSourceFixtureRun new];run.rows=[NSMutableArray array];run.done=dispatch_group_create();dispatch_group_enter(run.done);
+    run.spawnChild=(mode==21);run.childQueue=self.queue;
+    if(mode==16)DHFlowConfigure(NO,NO,1,1,nil,nil);
+    dispatch_source_t source=dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_ADD,0,0,self.queue);
+    require(source!=nil,@"source fixture creation failed");run.source=(uintptr_t)(__bridge void *)source;
+    if(mode==16)DHFlowConfigure(YES,NO,32,10000,nil,nil);
+    if(mode==11 || mode==12 || mode==13 || mode==19) {
+        DHFlowSourceFixtureContext *first=[DHFlowSourceFixtureContext new];first.run=run;first.tag=1;
+        DHFlowSourceFixtureContext *second=[DHFlowSourceFixtureContext new];second.run=run;second.tag=2;second.previous=first;
+        dispatch_set_context(source,(__bridge void *)first);
+        if(mode==13 || mode==19)dispatch_source_set_event_handler_f(source,source_old_f);
+        if(mode==19)dispatch_source_set_event_handler_f(source,NULL);
+        dispatch_source_set_event_handler_f(source,source_event_f);
+        dispatch_source_set_cancel_handler_f(source,source_cancel_f);
+        dispatch_source_set_registration_handler_f(source,source_registration_f);
+        // Compare the same sequence with capture off/on. The forwarding slot
+        // receives libdispatch's actual context instead of interpreting it.
+        dispatch_set_context(source,CFBridgingRetain(second));dispatch_set_finalizer_f(source,source_finalize_f);
+    } else {
+        dispatch_block_t event=^{source_event(run,3);};
+        if(mode==14)event=dispatch_block_create_with_qos_class(DISPATCH_BLOCK_ENFORCE_QOS_CLASS,QOS_CLASS_UTILITY,0,event);
+        dispatch_source_set_event_handler(source,event);
+        dispatch_source_set_cancel_handler(source,^{source_record(run,@"cancel",3);dispatch_group_leave(run.done);});
+        dispatch_source_set_registration_handler(source,^{source_record(run,@"registration",3);});
+    }
+    if(mode==15) {
+        dispatch_queue_t target=dispatch_queue_create("com.iosdecrypthub.flow.fixture.target",DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_set_specific(target,&sourceTargetKey,(void *)0x345,NULL);dispatch_set_target_queue(source,target);
+    }
+    if(mode==18)DHFlowConfigure(NO,NO,1,1,nil,nil);
+    dispatch_resume(source);dispatch_source_merge_data(source,1);
+    long timedOut=dispatch_group_wait(run.done,dispatch_time(DISPATCH_TIME_NOW,5000000000));
+    if(timedOut)dispatch_source_cancel(source);
+    require(!timedOut,@"source callbacks timed out; cancellation requested, callback storage remains lifetime-owned");
+    for(unsigned i=0;i<100 && [DHFlowState()[@"pendingOrRunning"] unsignedIntValue];i++)usleep(10000);
+    return [run.rows copy];
+}
 - (uint64_t)schedule {
     dispatch_group_t group=self.group;dispatch_queue_t queue=self.queue;
     if(self.mode==1) {dispatch_group_enter(group);dispatch_after(dispatch_time(DISPATCH_TIME_NOW,50000000),queue,^{[self normal:9];dispatch_group_leave(group);});return 1;}
@@ -116,6 +189,22 @@ static void drain(IDHFlowProbe *probe) {
     for(unsigned i=0;i<100 && [DHFlowState()[@"pendingOrRunning"] unsignedIntValue];i++)usleep(10000);
     require([DHFlowState()[@"pendingOrRunning"] unsignedIntValue]==0,@"pending task accounting leaked");
 }
+static void check_source_rows(NSArray *rows,unsigned captured) {
+    unsigned events=0,cancel=0,registration=0,identified=0;NSMutableSet *ids=[NSMutableSet set];
+    for(NSDictionary *row in rows) {
+        if([row[@"kind"] isEqual:@"event"])events++;
+        if([row[@"kind"] isEqual:@"cancel"])cancel++;
+        if([row[@"kind"] isEqual:@"registration"])registration++;
+        if([row[@"task"] length]){identified++;[ids addObject:row[@"task"]];}
+    }
+    require(rows.count==4 && events==2 && cancel==1 && registration==1,@"source callback kinds/counts changed");
+    require(identified==captured && ids.count==captured,@"source deliveries lost identity, were conflated or falsely associated");
+}
+static NSDictionary *source_context_tags(NSArray *rows) {
+    NSMutableDictionary *result=[NSMutableDictionary dictionary];for(NSDictionary *row in rows) {
+        NSMutableArray *values=result[row[@"kind"]];if(!values)result[row[@"kind"]]=values=[NSMutableArray array];[values addObject:row[@"tag"]];
+    }return result;
+}
 NSDictionary *DHFlowSelfTest(void) {
     NSMutableArray *passed=[NSMutableArray array],*slots=[NSMutableArray array];NSMutableDictionary *result=[@{@"pass":@NO,@"restartRequired":@YES} mutableCopy];
     IDHFlowProbe *probe=[IDHFlowProbe new];probe.marker=[NSException exceptionWithName:@"IDH-original-marker" reason:@"fixture" userInfo:nil];probe.observations=[NSMutableArray array];
@@ -123,7 +212,7 @@ NSDictionary *DHFlowSelfTest(void) {
     @try {
         require(![DHLogStore shared].paused && ![[DHLogStore shared] isPausedForCategory:DHCategoryOther],@"resume all/other before selftest");
         dh_hook_options options;dh_thunk_options_default(&options);options.fixed_abi=1;options.capture_return=1;char error[512]={0};
-        for(NSString *name in @[@"normal:",@"throwOut",@"jumpOut",@"cppOut",@"catchInside",@"schedule",@"exitOut",@"unverified",@"partial"]) {
+        for(NSString *name in @[@"normal:",@"throwOut",@"jumpOut",@"cppOut",@"catchInside",@"schedule",@"exitOut",@"unverified",@"partial",@"sourceMode:"]) {
             int slot=dh_thunk_install_configured(DH_HOOK_METHOD,"IDHFlowProbe",name.UTF8String,0,0,NULL,&options,error,sizeof(error));require(slot>=0,@(error));[slots addObject:@(slot)];
         }
         uint64_t initial=[DHFlowState()[@"abandonedCalls"] unsignedLongLongValue];
@@ -176,6 +265,55 @@ NSDictionary *DHFlowSelfTest(void) {
         notifyTasks=DHFlowRead(notifyBefore,16,0)[@"tasks"];require(notifyTasks.count==2 && probe.observations.count==2,@"disabling capture dropped pending notifications");
         for(NSDictionary *o in probe.observations)require([o[@"asyncTaskId"] length]>0,@"pending notification lost previously observed submission");
         [passed addObject:@"disable-retains-pending-notify-identity-until-original-dependency-completes"];
+        unsigned sourceBefore=[DHFlowState()[@"retained"] unsignedIntValue],registrationBefore=[DHFlowState()[@"retainedRegistrations"] unsignedIntValue];
+        DHFlowConfigure(YES,NO,32,10000,nil,nil);check_source_rows([probe sourceMode:10],4);
+        NSArray *sourceTasks=DHFlowRead(sourceBefore,32,0)[@"tasks"],*sourceRegistrations=DHFlowRegistrations(registrationBefore,8)[@"registrations"];
+        require(sourceTasks.count==4 && sourceRegistrations.count==3,@"source registration was confused with enqueue/delivery");
+        unsigned repeated=0;for(NSDictionary *r in sourceRegistrations)if([r[@"capturedInvocations"] unsignedIntValue]==2)repeated++;
+        require(repeated==1,@"repeated source events did not share exactly one registration");
+        for(NSDictionary *t in sourceTasks)require([t[@"edge"] isEqual:@"registered-handler-to-callback"] && [t[@"registrationId"] length]>0 && [t[@"state"] isEqual:@"completed"],@"source callback invented a submit edge or failed to complete");
+        [passed addObject:@"source-block-registration-two-events-and-cancel-have-distinct-delivery-identities"];
+        DHFlowConfigure(NO,NO,1,1,nil,nil);NSArray *sourceBaseline=[probe sourceMode:11];check_source_rows(sourceBaseline,0);
+        DHFlowConfigure(YES,NO,32,10000,nil,nil);NSArray *sourceObserved=[probe sourceMode:12];check_source_rows(sourceObserved,4);
+        require([source_context_tags(sourceBaseline) isEqual:source_context_tags(sourceObserved)],@"source function adapter changed the context libdispatch supplied");
+        [passed addObject:@"source-function-context-matches-uninstrumented-registration-event-and-cancel"];
+        for(NSNumber *mode in @[@13,@19]) {
+            registrationBefore=[DHFlowState()[@"retainedRegistrations"] unsignedIntValue];DHFlowConfigure(YES,NO,32,10000,nil,nil);
+            check_source_rows([probe sourceMode:mode.unsignedLongLongValue],4);sourceRegistrations=DHFlowRegistrations(registrationBefore,8)[@"registrations"];
+            NSDictionary *retired=sourceRegistrations.firstObject;
+            require(![retired[@"active"] boolValue] && ![retired[@"observedInvocations"] unsignedIntValue] && [retired[@"terminalReason"] hasPrefix:@"source-handler-"],@"replaced/removed source handler remained active or ran");
+        }
+        [passed addObject:@"source-function-replacement-and-null-removal-retire-original-registration"];
+        sourceBefore=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,32,10000,nil,nil);check_source_rows([probe sourceMode:14],2);
+        require([DHFlowState()[@"retained"] unsignedIntValue]==sourceBefore+2,@"special source handler metadata was wrapped or given a guessed edge");
+        [passed addObject:@"source-special-event-block-keeps-original-metadata-and-explicitly-unobserved-edge"];
+        sourceBefore=[DHFlowState()[@"retained"] unsignedIntValue];registrationBefore=[DHFlowState()[@"retainedRegistrations"] unsignedIntValue];DHFlowConfigure(YES,NO,32,10000,nil,nil);
+        sourceObserved=[probe sourceMode:15];check_source_rows(sourceObserved,4);
+        for(NSDictionary *row in sourceObserved)require([row[@"target"] unsignedLongLongValue]==0x345,@"source target queue behavior changed");
+        for(NSDictionary *t in DHFlowRead(sourceBefore,32,0)[@"tasks"])require([t[@"queue"] isEqual:@"com.iosdecrypthub.flow.fixture.target"],@"source delivery retained stale target queue metadata");
+        for(NSDictionary *r in DHFlowRegistrations(registrationBefore,8)[@"registrations"])require([r[@"queueAtRegistration"] isEqual:@"com.iosdecrypthub.flow.fixture"] && [r[@"currentKnownQueue"] isEqual:@"com.iosdecrypthub.flow.fixture.target"],@"source registration and updated target were conflated");
+        [passed addObject:@"source-target-change-preserves-original-queue-execution-and-registration-history"];
+        sourceBefore=[DHFlowState()[@"retained"] unsignedIntValue];uint64_t unknownBefore=[DHFlowState()[@"sourceAdapters"][@"unobservedSourceTargets"] unsignedLongLongValue];
+        DHFlowConfigure(YES,NO,32,10000,nil,nil);check_source_rows([probe sourceMode:16],0);
+        require([DHFlowState()[@"retained"] unsignedIntValue]==sourceBefore && [DHFlowState()[@"sourceAdapters"][@"unobservedSourceTargets"] unsignedLongLongValue]>unknownBefore,@"preexisting source target was guessed or original callbacks changed");
+        [passed addObject:@"source-created-before-observation-forwards-without-guessed-target-or-parent"];
+        sourceBefore=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,1,10000,nil,nil);check_source_rows([probe sourceMode:17],1);
+        require([DHFlowState()[@"retained"] unsignedIntValue]==sourceBefore+1,@"source repeated delivery exceeded task budget");
+        [passed addObject:@"source-budget-forwards-all-events-and-cancellation-without-unbounded-tasks"];
+        sourceBefore=[DHFlowState()[@"retained"] unsignedIntValue];DHFlowConfigure(YES,NO,32,10000,nil,nil);check_source_rows([probe sourceMode:18],0);
+        require([DHFlowState()[@"retained"] unsignedIntValue]==sourceBefore,@"disabled source registration falsely became a queued task");
+        [passed addObject:@"disabled-source-capture-keeps-original-callbacks-without-fake-pending-tasks"];
+        sourceBefore=[DHFlowState()[@"retained"] unsignedIntValue];
+        DHFlowConfigureWithAPIs(YES,NO,32,10000,nil,nil,@[@"SOURCE_SET_EVENT"]);
+        sourceObserved=[probe sourceMode:21];NSMutableArray *sourceOnly=[NSMutableArray array];NSDictionary *childRow=nil;
+        for(NSDictionary *row in sourceObserved)if([row[@"kind"] isEqual:@"child"])childRow=row;else [sourceOnly addObject:row];
+        check_source_rows(sourceOnly,2);require(sourceObserved.count==5 && [childRow[@"task"] length]>0,@"root API filter changed source callbacks or severed a GCD descendant");
+        sourceTasks=DHFlowRead(sourceBefore,8,0)[@"tasks"];require(sourceTasks.count==3,@"root API filter captured unrelated source registration/cancel roots");
+        for(NSDictionary *t in sourceTasks)if([t[@"api"] isEqual:@"dispatch_async"])require([t[@"asyncParentTaskId"] length]>0,@"API-selected source lost actual child task edge");
+        sourceBefore=[DHFlowState()[@"retained"] unsignedIntValue];NSUInteger apiObserved=probe.observations.count;
+        [probe schedule];drain(probe);
+        require([DHFlowState()[@"retained"] unsignedIntValue]==sourceBefore && probe.observations.count==apiObserved+7 && [DHFlowState()[@"rootAPIMisses"] unsignedLongLongValue]>0,@"root API filter captured unrelated GCD roots or changed their original execution");
+        [passed addObject:@"root-API-filter-is-case-insensitive-keeps-source-descendants-and-forwards-unmatched-roots"];
         unsigned filteredBefore=[DHFlowState()[@"retained"] unsignedIntValue];NSUInteger observedBefore=probe.observations.count;
         DHFlowConfigure(YES,NO,8,10000,nil,@[@"nonmatching-root"]);[probe schedule];drain(probe);
         require([DHFlowState()[@"retained"] unsignedIntValue]==filteredBefore && probe.observations.count==observedBefore+7,@"root filter changed original callbacks or accepted unmatched roots");
