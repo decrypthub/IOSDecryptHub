@@ -1713,7 +1713,7 @@ static NSDictionary *tool_get_capabilities(NSDictionary *args) {
             @"unpack":        (bits & DH_CAPBIT_UNPACK)        ? @YES : @NO,   // 脱壳
             @"hook_inline":   @(inlineAvailable),
             @"trace_function": @(traceAvailable),
-            @"trace_live": @(DHLiveAvailable() && inlineAvailable), @"native_stack_unwind": @(dh_unwind_available()),
+            @"trace_live": @(DHLiveAvailable() && inlineAvailable), @"native_stack_unwind": @(dh_unwind_available()),@"native_stack_recipes":@((BOOL)dh_unwind_recipe_available()),
         },
         @"capabilityBits": @(bits),
         @"process":        [[DHLogStore shared] processInfo] ?: @{},
@@ -3465,6 +3465,10 @@ static NSArray *tool_definitions(void) {
           @"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}}
     ]];
     [tools addObjectsFromArray:@[
+      @{@"name":@"get_unwind_state",@"description":@"Read bounded canonical frame recipes, verified code identity and recovery/refusal counters. No App CFI or code is patched; disabled slots are never reused.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
+      @{@"name":@"register_unwind_recipe",@"description":@"Opt in to read-only recovery for a function with independent LC_FUNCTION_STARTS bounds. A bounded A64 CFG/save-state validator rejects unsupported instructions, PAC frames and ambiguous SP/FP state. Capture rechecks code bytes, current stack, saved registers and unsigned LR callsite; an opted-in recipe takes precedence over system metadata, and refusal stops the capture at a reported boundary. Does not scan FP or make arbitrary missing metadata recoverable.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"address"],@"properties":@{@"process_generation":@{@"type":@"string"},@"address":@{@"type":@"string",@"description":@"Current executable address inside the function, strict 0x hex; recipe uses independent exact function bounds, at most 1024 bytes."}}}},
+      @{@"name":@"set_unwind_recipe_enabled",@"description":@"Enable/disable a registered read-only recipe in the current process. No metadata patch is installed or removed; slot identity remains until process restart.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation",@"recipe_slot",@"enabled"],@"properties":@{@"process_generation":@{@"type":@"string"},@"recipe_slot":@{@"type":@"integer",@"minimum":@1,@"maximum":@32},@"enabled":@{@"type":@"boolean"}}}},
+      @{@"name":@"run_unwind_selftest",@"description":@"Run an owned real missing-CFI assembly fixture. Checks saved x19/x20/FP, x19-based DWARF CFA/root, original CPU/return behavior, disabled baseline and V3 provenance. Only its owned recipe slot is temporarily enabled; original configuration is restored.",@"inputSchema":@{@"type":@"object",@"required":@[@"process_generation"],@"properties":@{@"process_generation":@{@"type":@"string"}}}},
       @{@"name":@"get_timer_state",@"description":@"Read bounded RunLoop timer bindings and independently calibrated Foundation callback entry support. An unregistered timer entry is not a measured enqueue or recovered registration.",@"inputSchema":@{@"type":@"object",@"properties":@{}}},
       @{@"name":@"get_async_registrations",@"description":@"Read bounded callback registrations separately from individual deliveries. A registered-handler edge is not a measured enqueue. Registrations and task IDs are process-local; inactive, unobserved and outside-window callbacks continue unchanged.",@"inputSchema":@{@"type":@"object",@"properties":@{@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@128},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@8}}}},
       @{@"name":@"get_flow_diagnostics",@"description":@"Read a bounded ring of uncertain stack boundaries with precise stop reason and last native PC/SP/FP. CandidateTaskId is diagnostic only, not an established parent. Raw stacks are resolved on this reader thread.",@"inputSchema":@{@"type":@"object",@"properties":@{@"offset":@{@"type":@"integer",@"minimum":@0,@"maximum":@16},@"limit":@{@"type":@"integer",@"minimum":@1,@"maximum":@4}}}},
@@ -3576,6 +3580,23 @@ static NSDictionary *tool_set_webkit_probe(NSDictionary *args) {
 }
 
 static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
+    if([@[@"register_unwind_recipe",@"set_unwind_recipe_enabled",@"run_unwind_selftest"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
+    if([name isEqual:@"get_unwind_state"])return tool_ok(DHUnwindRecipeState());
+    if([name isEqual:@"run_unwind_selftest"])return tool_ok(DHUnwindRecipeSelfTest());
+    if([name isEqual:@"set_unwind_recipe_enabled"]) {
+        id slot=args[@"recipe_slot"],on=args[@"enabled"];
+        if(![slot isKindOfClass:NSNumber.class] || CFGetTypeID((__bridge CFTypeRef)slot)==CFBooleanGetTypeID() || !isfinite([slot doubleValue]) || floor([slot doubleValue])!=[slot doubleValue] || [slot doubleValue]<1 || [slot doubleValue]>32 || !on || CFGetTypeID((__bridge CFTypeRef)on)!=CFBooleanGetTypeID())return tool_err(@"recipe_slot must be an integer 1..32 and enabled a boolean");
+        NSDictionary *r=DHUnwindSetRecipeEnabled([slot unsignedIntValue],[on boolValue]);return [r[@"ok"] boolValue]?tool_ok(r):tool_err(r[@"error"]);
+    }
+    if([name isEqual:@"register_unwind_recipe"]) {
+        id raw=args[@"address"];
+        if(![raw isKindOfClass:NSString.class] || [raw length]<3 || [raw length]>18 || !([raw hasPrefix:@"0x"] || [raw hasPrefix:@"0X"]))return tool_err(@"address requires strict 0x hex");
+        const char *text=[raw UTF8String];if(!text || strlen(text)!=[raw lengthOfBytesUsingEncoding:NSUTF8StringEncoding] || strspn(text+2,"0123456789abcdefABCDEF")!=strlen(text+2))return tool_err(@"invalid hex address");
+        uint64_t address=strtoull(text+2,NULL,16);if(!address || address%4 || !dh_vm_address_executable(address))return tool_err(@"address must be a current aligned executable instruction");
+        AnalysisAddressInfo info={0};
+        if(analysis_address_info(address,&info) || !info.has_function || strcmp(info.confidence,"high") || info.function_end<=info.function_start || info.function_end-info.function_start>1024)return tool_err(@"recipe requires independent bounded LC_FUNCTION_STARTS function metadata");
+        NSDictionary *r=DHUnwindRegisterRecipe(info.function_start,info.function_end,@"lc_function_starts");return [r[@"ok"] boolValue]?tool_ok(r):tool_err(r[@"error"]);
+    }
     if([@[@"configure_async_capture",@"run_flow_selftest"] containsObject:name] && ![args[@"process_generation"] isEqual:DHProcessGeneration()])return tool_err(@"missing or stale process_generation");
     if([name isEqual:@"get_flow_state"])return tool_ok(DHFlowState());
     if([name isEqual:@"get_timer_state"])return tool_ok(DHFlowTimerRecords());

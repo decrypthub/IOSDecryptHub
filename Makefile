@@ -18,7 +18,7 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.45
+VERSION := 1.28.46
 TARGET  := decrypt_helper.dylib
 .DEFAULT_GOAL := all
 .PHONY: test-hook-runtime test-hook-ios-build test-unwind-runtime test-flow-runtime
@@ -41,6 +41,18 @@ test-unwind-runtime:
 	@mkdir -p build
 	clang -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation tests/unwind_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) -lc++ -o build/unwind_runtime_test
 	python3 tests/run_unwind_runtime_test.py build/unwind_runtime_test
+
+test-unwind-recipes:
+	@mkdir -p build
+	clang -std=c11 -Wall -Wextra -Werror -Isrc/core tests/unwind_recipe_test.c -o build/unwind_recipe_test
+	./build/unwind_recipe_test
+	clang -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation tests/unwind_recipe_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) -lc++ -o build/unwind_recipe_runtime_test
+	python3 tests/run_unwind_runtime_test.py build/unwind_recipe_runtime_test
+
+test-unwind-recipes-ios-build:
+	@mkdir -p build
+	xcrun --sdk iphoneos clang -arch arm64e -miphoneos-version-min=14.0 -fobjc-arc -O1 -g -DDH_HAVE_INLINE=0 -Isrc/core -Isrc/server -framework Foundation tests/unwind_recipe_runtime_test.m $(filter-out tests/hook_runtime_test.m,$(HOOK_TEST_SRC)) -lc++ -o build/unwind_recipe_runtime_test_ios
+	ldid -S build/unwind_recipe_runtime_test_ios
 
 test-hook-ios-build:
 	@mkdir -p build

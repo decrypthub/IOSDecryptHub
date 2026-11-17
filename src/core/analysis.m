@@ -196,6 +196,7 @@ static void copy_disassembled_insn(csh handle, cs_arch arch,
     uint8_t source_count = 0;
     if (arch == CS_ARCH_ARM64) {
         const cs_arm64 *detail = &insn->detail->arm64;
+        out->writeback = detail->writeback ? 1 : 0;
         source_count = detail->op_count;
         out->writes_flags = detail->update_flags ? 1 : 0;
         out->operand_count = source_count > ANALYSIS_MAX_OPERANDS ? ANALYSIS_MAX_OPERANDS : source_count;
@@ -203,6 +204,7 @@ static void copy_disassembled_insn(csh handle, cs_arch arch,
             copy_arm64_operand(handle, &detail->operands[i], &out->operands[i]);
     } else if (arch == CS_ARCH_ARM) {
         const cs_arm *detail = &insn->detail->arm;
+        out->writeback = detail->writeback ? 1 : 0;
         source_count = detail->op_count;
         out->writes_flags = detail->update_flags ? 1 : 0;
         out->operand_count = source_count > ANALYSIS_MAX_OPERANDS ? ANALYSIS_MAX_OPERANDS : source_count;

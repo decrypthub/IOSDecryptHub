@@ -1,5 +1,16 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.46 原生缺失元数据的有界恢复（研发包）
+
+- 新增显式登记的只读 A64 frame recipe：Reader 按独立 LC_FUNCTION_STARTS 边界验证最多 256 个指令槽、512 字节帧的 CFG、原始 x19–x30 保存状态和精确 SP/FP 关系；命中重查字节、栈界限、所有保存槽、无 PAC 的真实 LR 与 BL/BLR callsite。通过公开 unwind API 重建 caller cursor，包括非易失 D8–D15，不改 App CPU、代码或 CFI，不扫描 FP。32 条规则不替换、不复用，默认没有规则，开关与登记均检查本代 generation。
+- 已启用规则优先于该函数的系统 metadata，验证失败报告具体原因并止步。原始栈 V3 保留逐帧规则来源、恢复次数及保存返回地址减 4 的地址语义，兼容 V1/V2；旧代日志不套当前 slot 身份。未知/PAC/动态栈/保存桩/不一致 CFG 等继续拒绝，不承诺任意缺口可恢复。
+- 修复反汇编 STP/LDP 的 writeback 信息：读取 Capstone 架构 detail 中实际填充的字段，恢复 pre/post SP 写入报告。新增 portable 正负例、真实汇编缺口与依赖原 x19 的 caller DWARF 夹具，以及登记/开关/坏参数和 writeback 的 MCP 回归。
+- 首个 arm64e 夹具将 undefined RA 直接设为 0，曾触发 RootHide 系统 unwinder 的指针认证 trap；保留崩溃与反汇编证据。改用独立、正确认证的结束标记后，最终 v21 两类完整包与原 Mac 门禁通过；双机 6 组原生夹具、4 项新 MCP、39 组 flow、Timer MCP 7 项、诊断 2 项及原 ABI/PAC/native/live 7 组和接口回归全部通过，scope 保留。独立 CLI 未能执行，不将其算作通过证据。
+- 快手真实展示日志路径：第一条规则恢复后准确暴露 caller 的第二处 metadata 缺口；按真实 LC 边界另验证并登记第二条规则。最终 Rootless 82 个、RootHide 80 个样本均恢复两层，两个 caller SP 各增加实际帧长 32 字节，继续到原 CFRunLoopRunSpecific 与 UIApplicationMain，error 0 且无截断。关闭两条规则后，双机各 30 个样本重新止于第一处真实弱帧；不是只凭登记或计数称成功。
+- 两条规则恢复后另做正常协议回归：Rootless 22 棵/330 对、RootHide 21 棵/315 对完整调用树，核心 15 参数、返回 sig3/HTTP 及独立 HMAC/白盒/CRC 分别 22/66/22 与 21/63/21 一致；实际异步/native/HTTP 链为 5/4 条，窗口展开不足增量均为 0。样本范围以真实窗口为准，没有声称所有请求都具备异步图。
+
+协议与限制见 [NATIVE_UNWIND_RECOVERY.md](NATIVE_UNWIND_RECOVERY.md)。同源/CI 与本轮最终最高版本集成仍继续核对；NSOperation、Swift Task、其它实际私有调度、source 实际注册路径及 QBDI 异常/longjmp 透明执行仍在全部后续清单中。没有发布 Release/APT。
+
 ## 2026-11-17：1.28.45 RunLoop / NSTimer（研发包）
 
 - 六个公开 CF 导入与既有 20 项调度导入统一管理所有权；CF context/retain/release、原 loop/mode、重复/移除/失效及 PerformBlock 原参数保持。四类 NSTimer 工厂固定原型保留 double、BOOL、target、selector、userInfo/block，不解析私有 info。统一 typed native/Method 后端与动态 Hook 互斥，原 Dobby 发布约束及已补丁 Trace 拒绝继续生效。
