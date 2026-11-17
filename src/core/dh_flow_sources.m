@@ -275,4 +275,3 @@ NSDictionary *DHFlowSourceState(void) {
     pthread_mutex_lock(&sourceLock);unsigned count=sourceObjects;pthread_mutex_unlock(&sourceLock);
     return @{@"sourceBindingsCreated":@(count),@"sourceBindingCapacity":@(SOURCE_OBJECTS),@"unobservedSourceTargets":@(atomic_load(&unknownSources)),@"unwrappedSourceHandlers":@(atomic_load(&unwrappedHandlers))};
 }
-
