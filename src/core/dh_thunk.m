@@ -17,6 +17,7 @@
 #import "dh_health.h"
 #import "fishhook.h"
 #include "dh_method_arg_type.h"
+#include "dh_vm_map.h"
 #import "dh_event.h"
 #include "dh_call_context.h"
 #import "dh_unwind.h"
@@ -1047,22 +1048,7 @@ int dh_thunk_install_method(const char *className, const char *selector, int cla
 // 复用同一张 thunk 表：DobbyHook 把目标函数序言改跳到 thunk[slot]，thunk 记录后尾调用
 // DobbyHook 返回的原函数蹦床。参数寄存器/栈保持原样，所以对目标透明（入口观测）。
 
-static BOOL dh_addr_is_executable(uint64_t addr) {
-    vm_address_t region = (vm_address_t)addr;
-    vm_size_t size = 0;
-    natural_t depth = 0;
-    // Shared-cache code can live inside a submap. Inspect its leaf protection.
-    for (unsigned attempt = 0; attempt < 16; attempt++) {
-        vm_region_submap_info_data_64_t info = {0};
-        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        kern_return_t kr = vm_region_recurse_64(mach_task_self(), &region, &size, &depth,
-            (vm_region_recurse_info_t)&info, &count);
-        if (kr != KERN_SUCCESS || addr < region || addr - region >= size) return NO;
-        if (!info.is_submap) return (info.protection & VM_PROT_EXECUTE) != 0;
-        depth++;
-    }
-    return NO;
-}
+static BOOL dh_addr_is_executable(uint64_t addr) {return dh_vm_address_executable(addr);}
 
 static void *dh_resolve_inline_target(const char *module, const char *symbol,
                                       uint64_t addr, char *err, size_t errsz) {

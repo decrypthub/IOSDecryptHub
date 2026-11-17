@@ -1,5 +1,13 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-17：1.28.41 系统库嵌套映射预检（全部后续项的第一切片）
+
+- 修复 Import 与 QBDI 两处重复的 vm_region_recurse_64 遍历：内核会把 address 改为当前 region 起点，下一层必须恢复原目标地址；不能检查 shared-cache 起点的另一片区域。两入口共用有界叶映射查询，继续要求目标确实位于当前 EXECUTE 叶区，不以 max_protection 或整个镜像范围代替。
+- 新只读 get_memory_mapping，提供每层原查询地址、实际 region、深度、当前/最大权限和内核错误；最多 16 次。非法输入、映射空洞、数据页、查询错误和过深嵌套保持拒绝。新增嵌套映射回归夹具通过，原运行时/ABI/unwind/iOS 编译、更新策略与两种完整 deb 构建通过。
+- 同一 1.28.41 完整包已安装到两台授权手机并保留 scope。两台实际 walk 均见 shared-cache 外层只读 submap 与目标 RX 叶映射；RootHide 旧负例 dispatch_block_create Import 已安装并观察真实配对调用，dispatch_queue_get_label QBDI 正常完成并返回可读队列名。真实数据符号仍为不可执行，畸形地址仍拒绝。
+- 这只完成映射修复；用户本次要求的 native 展开改进、RunLoop/NSOperation/Swift Task/notify/source/私有调度、QBDI 异常/longjmp 透明执行仍继续实施，不以第一切片完成代替整体目标。
+
+
 ## 2026-11-17：1.28.40 RootHide sig3 调度入口与因果链（研发包）
 
 - 先核对真实执行栈、App UUID/RVA、提交 stub/GOT 和运行时入口：普通网络分支经过已有 dispatch_async；额外延迟分支为公开 dispatch_block_create(0, block) → dispatch_after，队列是 com.kuaishou.statistics.serialQueue。旧宽泛排除条件会挡住目标队列；另一窗口的 256 条预算约 286ms 即被日志耗尽，签名在约 3.2s 后才执行。不能据“无 TaskID”断言缺少某种私有调度器。

@@ -16,6 +16,7 @@
 
 #import "qbdi_trace.h"
 #import "dh_thunk.h"
+#include "dh_vm_map.h"
 
 #ifndef DH_HAVE_QBDI
 #define DH_HAVE_QBDI 0
@@ -106,19 +107,7 @@ static void *dh_trace_resolve(NSString *module, NSString *symbol, uint64_t addr,
     return target;
 }
 
-static BOOL dh_trace_executable(uint64_t address) {
-    vm_address_t region = address; vm_size_t size = 0; natural_t depth = 0;
-    for (unsigned i = 0; i < 16; i++) {
-        vm_region_submap_info_data_64_t info = {0};
-        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
-        if (vm_region_recurse_64(mach_task_self(), &region, &size, &depth,
-            (vm_region_recurse_info_t)&info, &count) != KERN_SUCCESS ||
-            address < region || address - region >= size) return NO;
-        if (!info.is_submap) return (info.protection & VM_PROT_EXECUTE) != 0;
-        depth++;
-    }
-    return NO;
-}
+static BOOL dh_trace_executable(uint64_t address) {return dh_vm_address_executable(address);}
 
 static BOOL dh_trace_call(VMInstanceRef vm, rword target, const uint64_t *a, int argc, rword *ret) {
     switch (argc) {

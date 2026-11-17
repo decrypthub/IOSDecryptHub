@@ -23,6 +23,7 @@
 #include "dh_hook_selftest.h"
 #include "dh_health.h"
 #include "dh_unwind.h"
+#include "dh_vm_map.h"
 #include "dh_flow.h"
 #include "dh_noise.h"
 #include "dh_spoof.h"
@@ -539,6 +540,18 @@ static NSDictionary *tool_resolve_symbol(NSDictionary *args) {
         @"address": [NSString stringWithFormat:@"0x%llx", addr],
         @"image": @(img),
     });
+}
+
+static NSDictionary *tool_memory_mapping(NSDictionary *args) {
+    id value=args[@"address"];if(![value isKindOfClass:NSString.class])return tool_err(@"address must be a hexadecimal string");
+    const char *text=[value UTF8String];if(!text)return tool_err(@"address must be UTF8");size_t length=strlen(text);
+    if(length<3 || length>18 || [value length]!=length || strncmp(text,"0x",2))return tool_err(@"address must be a 0x-prefixed 64-bit hexadecimal string");
+    uint64_t address=0;for(size_t i=2;i<length;i++){char c=text[i];unsigned digit=c>='0' && c<='9'?c-'0':c>='a' && c<='f'?c-'a'+10:c>='A' && c<='F'?c-'A'+10:16;if(digit>15)return tool_err(@"invalid hexadecimal address");address=(address<<4)|digit;}
+    DHVMMapping mapping=dh_vm_mapping(address);NSMutableArray *steps=[NSMutableArray array];
+    for(unsigned i=0;i<mapping.count;i++) {DHVMRegion *r=&mapping.steps[i];[steps addObject:@{
+        @"queryAddress":[NSString stringWithFormat:@"0x%llx",r->inputAddress],@"start":[NSString stringWithFormat:@"0x%llx",r->start],@"length":[NSString stringWithFormat:@"0x%llx",r->length],
+        @"requestedDepth":@(r->requestedDepth),@"depth":@(r->depth),@"isSubmap":@(r->isSubmap!=0),@"protection":@(r->protection),@"maxProtection":@(r->maxProtection),@"kernelError":@(r->kernelError)}];}
+    return tool_ok(@{@"processGeneration":DHProcessGeneration(),@"address":value,@"found":@(mapping.found!=0),@"executable":@(dh_vm_executable(&mapping)!=0),@"kernelError":@(mapping.kernelError),@"limitReached":@(mapping.limitReached!=0),@"outsideReturnedRegion":@(mapping.invalidRegion!=0),@"walk":steps,@"maxQueries":@DH_VM_WALK_MAX});
 }
 
 // symbolicate —— 地址 -> 镜像 + 包含函数 + 有来源/置信度的符号标签
@@ -2756,6 +2769,7 @@ static NSArray *tool_definitions(void) {
                 @"anyOf": @[@{@"required": @[@"symbol"]}, @{@"required": @[@"name"]}],
             },
         },
+        @{@"name":@"get_memory_mapping",@"description":@"Read the current process mapping at an address, following nested submaps while retaining the original query. Reports actual leaf protection and bounded raw kernel walk; does not grant permissions or modify mappings.",@"inputSchema":@{@"type":@"object",@"required":@[@"address"],@"properties":@{@"address":@{@"type":@"string"}}}},
         @{
             @"name": @"symbolicate",
             @"description": @"Resolve an address to its image and containing function. LC_FUNCTION_STARTS takes precedence over dladdr so stripped images return a high-confidence synthetic sub_<addr> instead of an unrelated exported symbol with a huge offset. Inspect symbol_source/confidence before treating a label as authoritative.",
@@ -3633,6 +3647,7 @@ static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
     if ([name isEqualToString:@"analyze_function"])      return tool_analyze_function(args);
     if ([name isEqualToString:@"disassemble_function"])  return tool_disassemble_function(args);
     if ([name isEqualToString:@"resolve_symbol"])        return tool_resolve_symbol(args);
+    if ([name isEqualToString:@"get_memory_mapping"])return tool_memory_mapping(args);
     if ([name isEqualToString:@"symbolicate"])           return tool_symbolicate(args);
     if ([name isEqualToString:@"objc_resolve_imp"])      return tool_objc_resolve_imp(args);
     if ([name isEqualToString:@"objc_dump_ivars"])       return tool_objc_dump_ivars(args);
