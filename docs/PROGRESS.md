@@ -1,5 +1,11 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-18：1.28.50 正式发布
+
+[v1.28.50 Release](https://github.com/decrypthub/IOSDecryptHub/releases/tag/v1.28.50) 发布最终 v52 的 Rootless、RootHide 完整 deb 及 SHA256SUMS，标签指向已完成双机验收的 `7398355ccd32c01b1b0e9d46755e34ab72099b59`。原完整包 CI [44166230431](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44166230431) 与新增原生控制流 CI [44166230764](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44166230764) 均成功。本次使用已验收原包，没有重新构建。
+
+完整发布说明见 [.github/release-notes/1.28.50.md](../.github/release-notes/1.28.50.md)。官网与签名 APT 源同步至 1.28.50，沿用原包 ID、公钥及历史包。巨魔版维持独立 1.27.6；旧单引擎 `releases/latest` 兼容入口保留，越狱版通过明确版本的 Release 或 APT 更新。以下“研发包／没有发布”的段落是发布前的验收快照。
+
 ## 2026-11-18：1.28.50 原生异常／跳转现场跟踪与最终集成（研发包）
 
 - 新增显式准备的 `live-native-control`，保留原 `normal_return:true` 模式及共享八会话上限。离开模块前从 QBDI 交还真实 CPU／SP／LR，在原线程执行 native helper；通过真实返回点、公开 personality 安装的 landing pad 和实际观察的 setjmp continuation 恢复同一 VM。内部捕获后确实继续记录指令；外部退出以 POD 脱离准确 root／子 guard，再在读取侧生成原线程的 aborted 事件，没有伪造返回值。不读取私有 `jmp_buf` 或猜 LSDA。
