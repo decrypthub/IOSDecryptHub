@@ -8,13 +8,9 @@
 
 ## 当前版本与使用
 
-[v1.27.6 完整包](https://github.com/decrypthub/IOSDecryptHub/releases/tag/v1.27.6) 基于组织正式 `a94a396` 的完整 v1 源码，包含 Manager、Loader、一次性管理 daemon、引擎与资源。添加源 **https://ios.decrypthub.com**，在 Sileo / Zebra 安装 IOSDecryptHub；rootless / RootHide 请使用对应架构的完整 deb。
+[v1.28.52 完整包](https://github.com/decrypthub/IOSDecryptHub/releases/tag/v1.28.52) 提供 Rootless 与 RootHide 两种架构。添加 [签名 APT 源](https://ios.decrypthub.com/) 并在 Sileo 或 Zebra 安装 IOSDecryptHub。Manager、Loader、daemon、Agent 与资源随整包更新。
 
-打开 Manager → 开启目标应用的注入 → 启动或手动重启目标 → 通过原有 Web / MCP 查看分析。关闭注入影响后续加载；已加载的引擎要在目标退出后才离开进程。
-
-v1.27.6 将版本检查切换到规范 APT 源，按安装包架构选择版本，更新与回退交给系统包管理器。Manager、Loader、daemon 与引擎统一升级；旧单引擎安装/回滚请求会被拒绝，遗留 staging 不再覆盖包内引擎。
-
-**开发主线与正式包分开**：当前 main 为 1.28.37 开发代码，已在两台授权设备验证 Inline/PAC、QBDI 真实现场、同步 native 栈，以及非局部退出状态保护与有界 GCD 关联。验证范围见 [当前进度](./docs/PROGRESS.md)、[真实现场协议](./docs/LIVE_CONTEXT_TRACE.md) 与 [状态保护/GCD](./docs/FLOW_STATE_AND_GCD.md)。1.28.x 当前用于研发整包测试，尚未发布 Release/APT；上面的 v1.27.6 是已发布完整包。常驻分析服务、新 Manager 与 scope 架构继续按路线图推进。
+在 Manager 为应用开启注入后，启动或手动重启应用。应用行的「会话」页可启用设备会话，查看应用退出后保留的摘要。配对后的 PC 可使用 [idh-cli 0.8.0](https://pypi.org/project/ios-decrypt-hub/0.8.0/) 查询记录。见[设备会话说明](./docs/DEVICE_SESSIONS.md)。
 
 源码和问题反馈：[本仓 Issues](https://github.com/decrypthub/IOSDecryptHub/issues)。巨魔设备请使用 [巨魔版下载与说明](https://github.com/decrypthub/IOSDecryptHubTrollStore)。
 

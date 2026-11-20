@@ -1,5 +1,11 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-20：1.28.52 正式发布
+
+- [GitHub Release](https://github.com/decrypthub/IOSDecryptHub/releases/tag/v1.28.52) 指向源码 8c6de3c。Rootless、RootHide 原双机验收包与 SHA256SUMS 已公开并回下载核对。
+- [官网与签名 APT 源](https://ios.decrypthub.com/) 已上线两种架构，公网索引、签名、下载文件及历史包与发布输入一致。保留原签名公钥与旧更新器的 v1.27.5 入口。
+- 完整包与原生控制流 CI 均通过。[完整包 CI](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44673431471) [原生控制流 CI](https://github.com/decrypthub/IOSDecryptHub/actions/runs/44673431450)
+
 ## 2026-11-19：1.28.52 摘要丢失修复与尾部确认（研发包）
 
 - 在 RootHide 读取上一轮自有测试宿主会话的已保存摘要。序号 1–111 中缺失 65–69，前 64 条和后续 42 条在库，源队列丢失为 0。旧版用同一个 64 条上限限制单批和待确认队列，第一批等待发送或确认时丢掉了后续 5 条。现在每批最多 64 条，待确认队列最多 512 条，满批唤醒并在确认后继续发送。
