@@ -40,6 +40,7 @@ Dobby/QBDI 的静态库属于本机构建产物，不纳入 Git。源码签出�
 
 - [产品架构、整包与实施顺序](./docs/PRODUCT_ARCHITECTURE.md)
 - [手机 Manager 页面与交互](./docs/MANAGER_UI.md)
+- [设备会话与只读 MCP](./docs/DEVICE_SESSIONS.md)
 - [Hook / ABI / 事件 / Trace 技术设计](./docs/HOOK_AND_TRACE_DESIGN.md)
 - [项目当前进度](./docs/PROGRESS.md)
 - [开发边界](./AGENTS.md)

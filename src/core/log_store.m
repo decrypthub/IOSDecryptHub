@@ -6,6 +6,7 @@
 #import "dh_noise.h"
 #import "dh_log_json.h"
 #import "dh_event.h"
+#import "dh_session_agent.h"
 #import "dh_unwind.h"
 #include "dh_call_context.h"
 #import <sys/sysctl.h>
@@ -465,7 +466,7 @@ static DHLogEntry *dh_entry_from_journal(NSDictionary *m) {
         rss = info.resident_size;
     return @{
         @"pending":           @(atomic_load_explicit(&_pendingEvents, memory_order_relaxed)),
-        @"dropped":           @(atomic_load_explicit(&_droppedEvents, memory_order_relaxed)),
+        @"dropped":           @([self droppedEventCount]),
         @"droppedByCategory": byCat,
         @"rss":               @(rss),
         @"journalBytes":      @(atomic_load_explicit(&_journalBytes, memory_order_relaxed)),
@@ -476,12 +477,22 @@ static DHLogEntry *dh_entry_from_journal(NSDictionary *m) {
     };
 }
 
+- (uint64_t)droppedEventCount {
+    return atomic_load_explicit(&_droppedEvents, memory_order_relaxed);
+}
+
 // 噪点判定: 仅对该条目所属板块的特征串做匹配。
 static BOOL dh_noise_entry_matches_board(DHLogEntry *entry, DHNoiseBoard board) {
     if (dh_noise_matches_for_board(board, DHUTF8FromData(entry.input))) return YES;
     if (dh_noise_matches_for_board(board, entry.detail)) return YES;
     return NO;
 }
+
+#if DH_DEVICE_SESSIONS
+- (void)enqueueSessionBoundary:(dispatch_block_t)boundary {
+    dispatch_async(_queue, boundary);
+}
+#endif
 
 - (void)append:(DHLogEntry *)entry {
     if (self.paused || entry == nil) return;
@@ -518,6 +529,9 @@ static BOOL dh_noise_entry_matches_board(DHLogEntry *entry, DHNoiseBoard board) 
             if (noisy) self->_noiseCount[board]++;
             else       self->_categoryCounts[ci]++;
             [self _persist:entry noisy:noisy];   // 噪点条目仍照常落盘, 保持「崩溃可闭环取证」承诺
+#if DH_DEVICE_SESSIONS
+            dh_session_record(entry, NO);
+#endif
         } @finally {
             atomic_fetch_sub_explicit(&self->_pendingEvents, 1, memory_order_relaxed);
         }
@@ -567,6 +581,9 @@ static BOOL dh_noise_entry_matches_board(DHLogEntry *entry, DHNoiseBoard board) 
                 newEntry.seq = oldEntry.seq;
                 nb[idx] = newEntry;
                 [self _persist:newEntry noisy:NO];
+#if DH_DEVICE_SESSIONS
+                dh_session_record(newEntry, YES);
+#endif
                 return;
             }
             for (int b = 0; b < DHNoiseBoardCount; b++) {   // 也可能被路由进噪声桶
@@ -575,11 +592,17 @@ static BOOL dh_noise_entry_matches_board(DHLogEntry *entry, DHNoiseBoard board) 
                     newEntry.seq = oldEntry.seq;
                     self->_noiseBuckets[b][ni] = newEntry;
                     [self _persist:newEntry noisy:YES];
+#if DH_DEVICE_SESSIONS
+                    dh_session_record(newEntry, YES);
+#endif
                     return;
                 }
             }
             // 旧条目已被裁剪淘汰: 退化为追加一条完整记录。
             newEntry.seq = ++self->_seqCounter;
+#if DH_DEVICE_SESSIONS
+            dh_session_record(newEntry, YES);
+#endif
             [nb addObject:newEntry];
             if (nb.count > self->_maxPerCategory)
                 [nb removeObjectsInRange:NSMakeRange(0, nb.count - self->_maxPerCategory)];

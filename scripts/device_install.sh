@@ -88,7 +88,7 @@ if [[ "$DO_BUILD" -eq 1 ]]; then
     # 无法用来做验收。沙盒状态差异记在报告里，结论按"平台化 App"口径解读。
     "$CC" -arch arm64 -isysroot "$SDK" -miphoneos-version-min="$MIN_IOS" \
         -fobjc-arc -ObjC -O1 \
-        -framework UIKit -framework Foundation -framework Security -framework AdSupport \
+        -framework UIKit -framework Foundation -framework Security -framework AdSupport -framework WebKit \
         sim_uitest/main.m -o "$APP_BUNDLE/$APP_NAME"
     cp sim_uitest/Info.plist "$APP_BUNDLE/"
     # sim_uitest/Info.plist 是给模拟器用的，里面写着 CFBundleSupportedPlatforms=[iPhoneSimulator]、

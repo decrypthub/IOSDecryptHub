@@ -62,7 +62,7 @@ CC=$(xcrun --find clang)
 LOADER_SRC="$SCRIPT_DIR/src/loader.m"
 APP_ICON="$SCRIPT_DIR/app/Icon.png"
 APP_WECHAT="$SCRIPT_DIR/app/wechat-follow.png"
-APP_SRCS="$SCRIPT_DIR/app/DHManagerAppDelegate.m $SCRIPT_DIR/app/DHRootViewController.m $SCRIPT_DIR/app/DHSettingsViewController.m $SCRIPT_DIR/app/DHVersionsViewController.m $SCRIPT_DIR/app/DHConfigStore.m $SCRIPT_DIR/app/DHAppEnumerator.m"
+APP_SRCS="$SCRIPT_DIR/app/DHManagerAppDelegate.m $SCRIPT_DIR/app/DHRootViewController.m $SCRIPT_DIR/app/DHSettingsViewController.m $SCRIPT_DIR/app/DHVersionsViewController.m $SCRIPT_DIR/app/DHConfigStore.m $SCRIPT_DIR/app/DHAppEnumerator.m $SCRIPT_DIR/app/DHSessionViewController.m $SCRIPT_DIR/src/session/idh_session_ipc.m"
 APP_INFO="$SCRIPT_DIR/app/Info.plist"
 APP_ENTITLEMENTS="$SCRIPT_DIR/app/entitlements.plist"
 DAEMON_SRC="$SCRIPT_DIR/daemon/main.m"
@@ -74,6 +74,9 @@ DAEMON_BIN="IOSDecryptHubUpdated"
 compile_loader() {
     local ARCHS="$1"
     local OUT="$2"
+    local VARIANT="$3"
+    local ROOT_HIDE=0
+    [ "$VARIANT" != "roothide" ] || ROOT_HIDE=1
     local ARCH_FLAGS=()
     local ARCH
     for ARCH in $ARCHS; do
@@ -83,7 +86,7 @@ compile_loader() {
     mkdir -p "$(dirname "$OUT")"
     $CC "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=14.0 \
         -dynamiclib -install_name /usr/lib/IOSDecryptHub/IOSDecryptHubLoader.dylib \
-        -ObjC -fobjc-arc -Wall -O2 \
+        -ObjC -fobjc-arc -Wall -O2 -DIDH_ROOT_HIDE="$ROOT_HIDE" \
         -framework Foundation \
         "$LOADER_SRC" -o "$OUT"
 }
@@ -121,6 +124,20 @@ compile_daemon() {
         -I"$SCRIPT_DIR/src" -DDH_PACKAGE_ARCH=\"${3}\" \
         -framework Foundation \
         "$DAEMON_SRC" -o "$OUT"
+}
+
+compile_session_daemon() {
+    local ARCHS="$1" OUT="$2" VARIANT="$3"
+    local ARCH_FLAGS=() ARCH
+    local ROOT_HIDE=0
+    [ "$VARIANT" != "roothide" ] || ROOT_HIDE=1
+    for ARCH in $ARCHS; do ARCH_FLAGS+=( -arch "$ARCH" ); done
+    mkdir -p "$(dirname "$OUT")"
+    "$CC" "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=14.0 \
+        -fobjc-arc -Wall -O2 -DIDH_ROOT_HIDE="$ROOT_HIDE" -framework Foundation -framework Security -lsqlite3 \
+        "$SCRIPT_DIR/daemon/idhjd.m" "$SCRIPT_DIR/daemon/idh_session_store.m" \
+        "$SCRIPT_DIR/daemon/idh_session_service.m" "$SCRIPT_DIR/daemon/idh_session_http.m" \
+        "$SCRIPT_DIR/src/session/idh_session_ipc.m" -o "$OUT"
 }
 
 compile_swift_fixture() {
@@ -197,14 +214,16 @@ build_variant() {
     local LOADER_OUT="$BUILD_DIR/_loader-${VARIANT}/IOSDecryptHubLoader.dylib"
     local APP_EXEC="$BUILD_DIR/_app-${VARIANT}/$APP_NAME"
     local DAEMON_OUT="$BUILD_DIR/_daemon-${VARIANT}/$DAEMON_BIN"
+    local SESSION_OUT="$BUILD_DIR/_daemon-${VARIANT}/idhjd"
     local SWIFT_FIXTURE_OUT="$BUILD_DIR/_swift-${VARIANT}/IDHSwiftFixtures.dylib"
     local CONTROL_FIXTURE_DIR="$BUILD_DIR/_control-${VARIANT}"
     local ENGINE_DYLIB
 
     ENGINE_DYLIB=$(require_vendor_dylib "$VARIANT" "$MACHO_ARCHS")
-    compile_loader "$MACHO_ARCHS" "$LOADER_OUT"
+    compile_loader "$MACHO_ARCHS" "$LOADER_OUT" "$VARIANT"
     compile_app "$APP_MACHO_ARCHS" "$APP_EXEC" "$ARCHITECTURE"
     compile_daemon "$APP_MACHO_ARCHS" "$DAEMON_OUT" "$ARCHITECTURE"
+    compile_session_daemon "$APP_MACHO_ARCHS" "$SESSION_OUT" "$VARIANT"
     # Loaded only by the explicit Swift selftest on iOS 15+. The Agent has no
     # Swift dependency and keeps its existing iOS 14 loading compatibility.
     compile_swift_fixture "$MACHO_ARCHS" "$SWIFT_FIXTURE_OUT"
@@ -246,6 +265,7 @@ CTRL
         "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/enabledBundles.default.plist"
     cp "$DAEMON_OUT" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
     cp "$SCRIPT_DIR/daemon/updated.sh" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/updated.sh"
+    cp "$SESSION_OUT" "$SCRIPT_DIR/daemon/sessiond.sh" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/"
 
     # 仓库公钥装进 APT 信任链：不然现代 APT 会因 Release 未受信任而报 E:
     # （"is not signed"）并拒绝更新索引 —— 用户就永远看不到新版本。
@@ -269,6 +289,12 @@ VP
 
     sed "s|@PREFIX@|${PREFIX}|g" "$DAEMON_PLIST_TMPL" \
         > "$STAGE/${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.updated.plist"
+    local SESSION_ARGUMENTS="<string>${PREFIX}/usr/lib/IOSDecryptHub/idhjd</string>"
+    if [ "$VARIANT" = "roothide" ]; then
+        SESSION_ARGUMENTS="<string>/bin/sh</string><string>${PREFIX}/usr/lib/IOSDecryptHub/sessiond.sh</string>"
+    fi
+    sed "s|@SESSION_ARGUMENTS@|$SESSION_ARGUMENTS|g" "$SCRIPT_DIR/daemon/com.iosdecrypthub.sessions.plist" \
+        > "$STAGE/${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.sessions.plist"
 
     cp "$APP_EXEC" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
     sed "s/@VERSION@/${VERSION}/g" "$APP_INFO" \
@@ -383,6 +409,10 @@ printf '%s\n' \
 if command -v launchctl >/dev/null 2>&1; then
     launchctl bootout system "\$LAUNCHD_PLIST" 2>/dev/null || true
     launchctl bootstrap system "\$LAUNCHD_PLIST" 2>/dev/null || launchctl load "\$LAUNCHD_PLIST" 2>/dev/null || true
+    SESSION_PLIST="${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.sessions.plist"
+    launchctl bootout system/com.iosdecrypthub.sessions 2>/dev/null || true
+    launchctl bootstrap system "\$SESSION_PLIST" 2>/dev/null || launchctl load "\$SESSION_PLIST" 2>/dev/null \
+        || echo "IOSDecryptHub: could not register the device session service" >&2
 fi
 # 刷新主屏幕图标（失败不阻断安装）
 if command -v uicache >/dev/null 2>&1; then
@@ -399,6 +429,7 @@ if [ "\$1" = "remove" ]; then
     LAUNCHD_PLIST="${PREFIX}/Library/LaunchDaemons/com.iosdecrypthub.updated.plist"
     if command -v launchctl >/dev/null 2>&1; then
         launchctl bootout system "\$LAUNCHD_PLIST" 2>/dev/null || true
+        launchctl bootout system/com.iosdecrypthub.sessions 2>/dev/null || true
     fi
 fi
 if [ "\$1" = "purge" ]; then
@@ -422,6 +453,7 @@ POSTRM
     verify_macho_arch \
         "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN" \
         "$APP_MACHO_ARCHS" "$VARIANT updater daemon"
+    verify_macho_arch "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/idhjd" "$APP_MACHO_ARCHS" "$VARIANT session service"
 
     ldid -S "$STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.dylib"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/decrypt_helper.dylib"
@@ -433,6 +465,7 @@ POSTRM
     done
     ldid -S"$APP_ENTITLEMENTS" "$STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
     ldid -S "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
+    ldid -S"$SCRIPT_DIR/daemon/idhjd-entitlements.plist" "$STAGE/${PREFIX}/usr/lib/IOSDecryptHub/idhjd"
 
     cp -R "$STAGE/." "$PKG_STAGE/"
     find "$PKG_STAGE" -type d -exec chmod 0755 {} +
@@ -442,6 +475,7 @@ POSTRM
     chmod 0755 "$PKG_STAGE/${PREFIX}/Applications/$APP_NAME.app/$APP_NAME"
     chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/$DAEMON_BIN"
     chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/updated.sh"
+    chmod 0755 "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/idhjd" "$PKG_STAGE/${PREFIX}/usr/lib/IOSDecryptHub/sessiond.sh"
     # 两个 dylib 用 0755：与 1.24.8 / 1.24.9（线上已验证可用）的权限完全一致，
     # 不引入任何与已验证产物不同的变量。
     chmod 0755 "$PKG_STAGE/${PREFIX}/Library/MobileSubstrate/DynamicLibraries/IOSDecryptHubLoader.dylib"
@@ -521,6 +555,12 @@ POSTRM
         *"/Library/LaunchDaemons/com.iosdecrypthub.updated.plist"*) ;;
         *) error "$VARIANT 缺少 daemon 启动配置" ;;
     esac
+    for SESSION_FILE in usr/lib/IOSDecryptHub/idhjd usr/lib/IOSDecryptHub/sessiond.sh Library/LaunchDaemons/com.iosdecrypthub.sessions.plist; do
+        case "$PACKAGE_CONTENTS" in
+            *"/$SESSION_FILE"*) ;;
+            *) error "$VARIANT 缺少设备会话组件 $SESSION_FILE" ;;
+        esac
+    done
 
     case "$PACKAGE_CONTENTS" in
         *"/usr/lib/IOSDecryptHub/version.plist"*) ;;

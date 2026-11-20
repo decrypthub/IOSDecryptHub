@@ -18,7 +18,7 @@
 #
 # 依赖: macOS + Xcode (xcrun); 打 deb 另需 dpkg-deb / ldid / install_dylib
 
-VERSION := 1.28.50
+VERSION := 1.28.52
 TARGET  := decrypt_helper.dylib
 .DEFAULT_GOAL := all
 .PHONY: test-hook-runtime test-hook-ios-build test-unwind-runtime test-flow-runtime
@@ -223,6 +223,11 @@ else
     $(error 未知 VARIANT=$(VARIANT); 可选: dev / trollstore / rootless / roothide)
 endif
 
+ifneq ($(filter $(VARIANT),rootless roothide),)
+    SRC += src/core/dh_session_agent.m src/session/idh_session_ipc.m
+    SESSION_DEF := -DDH_DEVICE_SESSIONS=1
+endif
+
 # ---------- 1) iOS 真机 dylib (默认 target) ----------
 SDK     := $(shell xcrun --sdk iphoneos --show-sdk-path 2>/dev/null)
 CC      := $(shell xcrun --find clang)
@@ -251,6 +256,7 @@ CFLAGS  := $(ARCH_FLAGS) \
            $(VERSION_DEF) \
            $(VENDOR_DEF) \
            -DDH_VARIANT=$(DH_VARIANT_NUM) \
+           $(SESSION_DEF) \
            $(FRAMEWORKS)
 
 all: $(TARGET)

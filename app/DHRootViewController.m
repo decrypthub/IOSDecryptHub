@@ -7,6 +7,8 @@
 //   - 提示文案只留一句真正需要用户做动作的
 
 #import "DHRootViewController.h"
+#import "DHSessionViewController.h"
+#import "../src/session/idh_session_ipc.h"
 #import "DHSettingsViewController.h"
 #import "DHConfigStore.h"
 #import "DHAppEnumerator.h"
@@ -130,7 +132,8 @@ typedef NS_ENUM(NSInteger, DHFilter) {
 
 - (void)refreshInjectedStatus {
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSDictionary *found = DHProbeInjectedApps();
+        NSDictionary *found = IDHSessionModeEnabled() ?
+            IDHSessionRequest(@{@"action": @"registrations"})[@"agents"] : DHProbeInjectedApps();
         dispatch_async(dispatch_get_main_queue(), ^{
             self.injected = found;
             [self.tableView reloadData];
@@ -293,7 +296,7 @@ typedef NS_ENUM(NSInteger, DHFilter) {
             initWithString:app.bundleID
                 attributes:@{ NSForegroundColorAttributeName: [UIColor secondaryLabelColor] }];
         [subtitle appendAttributedString:[[NSAttributedString alloc]
-            initWithString:@"　未注入"
+            initWithString:IDHSessionModeEnabled() ? @"　等待 Agent 登记" : @"　未注入"
                 attributes:@{ NSForegroundColorAttributeName: [UIColor systemOrangeColor] }]];
         cell.detailTextLabel.attributedText = subtitle;
     } else {
@@ -340,6 +343,11 @@ typedef NS_ENUM(NSInteger, DHFilter) {
             [weakSelf applyEnabled:YES forApp:app revert:nil];
         }]];
     }
+    [items addObject:[UIAction actionWithTitle:@"会话" image:[UIImage systemImageNamed:@"list.bullet.rectangle"]
+                                    identifier:nil handler:^(__unused UIAction *a) {
+        DHSessionViewController *view = [[DHSessionViewController alloc] initWithBundleId:app.bundleID name:app.name];
+        [weakSelf.navigationController pushViewController:view animated:YES];
+    }]];
     return [UIMenu menuWithChildren:items];
 }
 

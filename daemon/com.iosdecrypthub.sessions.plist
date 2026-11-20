@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.iosdecrypthub.sessions</string>
+    <key>ProgramArguments</key>
+    <array>
+        @SESSION_ARGUMENTS@
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>StandardErrorPath</key>
+    <string>/var/log/iosdecrypthub-sessions.log</string>
+</dict>
+</plist>

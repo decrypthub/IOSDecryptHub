@@ -722,6 +722,11 @@ static NSString *chk_device_info(void) {
     if ([key hasPrefix:@"baseline."]) return [self triggerScenarioById:key];
     if ([key isEqualToString:@"netall"]) { do_net_matrix(); [self flash:@"网络矩阵"]; return YES; }
     if ([key isEqualToString:@"webkit"]) { [self runWebKitSuite]; [self flash:@"WKWebView 全链路"]; return YES; }
+    if ([key isEqualToString:@"sessionburst"]) {
+        for (NSUInteger index = 0; index < 192; index++) do_digest(2);
+        [self flash:@"会话摘要突发"];
+        return YES;
+    }
     UIButton *b = self.btnMap[key.lowercaseString];
     if (!b) return NO;
     [b sendActionsForControlEvents:UIControlEventTouchUpInside];

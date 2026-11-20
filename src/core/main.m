@@ -15,6 +15,7 @@
 #import "dh_spoof.h"
 #import "hook_webkit.h"
 #import "dh_event.h"
+#import "dh_session_agent.h"
 
 extern void dh_install_digest_hooks(void);
 extern void dh_install_hmac_hooks(void);
@@ -72,6 +73,9 @@ static void dh_bootstrap(void) {
     // 本地 HTTP 服务放到后台起: constructor 处在宿主 launch 的看门狗预算里
     // (实测 B站 launch 阶段被 0x8badf00d 杀掉), 起 socket/线程不该抢这段时间。
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+#if DH_DEVICE_SESSIONS
+        if (dh_session_agent_start()) return;
+#endif
         dh_http_start();
     });
 

@@ -75,27 +75,40 @@ static BOOL dh_should_inject(NSString *bundleID) {
     NSArray *enabled = nil;
     const char *source = "none";
     @try {
-        // prefs 读到数组（含空数组=全关）就用。沙盒目标通常读不到这份文件，
-        // 再回退 jb 配置；禁止在宿主进程里 Synchronize 此外域。
-        NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
-        enabled = prefs[PREFS_KEY];
-        if ([enabled isKindOfClass:[NSArray class]]) {
-            source = "prefs";
-        } else {
+#if IDH_ROOT_HIDE
+        // Manager 在 RootHide 把应用名单写入 bootstrap 的 mobile home。
+        // 系统根目录的旧名单可能还存在，权威副本读不到时使用同一 bootstrap 内的镜像。
+        NSArray *preferences = dh_paths_from_loader([PREFS_PATH substringFromIndex:1]);
+#else
+        NSArray *preferences = @[PREFS_PATH];
+#endif
+        for (NSString *path in preferences) {
+            id value = [NSDictionary dictionaryWithContentsOfFile:path][PREFS_KEY];
+            if ([value isKindOfClass:NSArray.class]) {
+                enabled = value;
+                source = "prefs";
+                break;
+            }
+        }
+#if !IDH_ROOT_HIDE
+        if (!enabled) {
             CFPropertyListRef value = CFPreferencesCopyAppValue(
                 (__bridge CFStringRef)PREFS_KEY,
                 (__bridge CFStringRef)PREFS_DOMAIN);
-            enabled = CFBridgingRelease(value);
-            if ([enabled isKindOfClass:[NSArray class]]) {
+            id list = CFBridgingRelease(value);
+            if ([list isKindOfClass:NSArray.class]) {
+                enabled = list;
                 source = "cfprefs";
-            } else {
-                for (NSString *configPath in dh_config_candidates()) {
-                    prefs = [NSDictionary dictionaryWithContentsOfFile:configPath];
-                    enabled = prefs[PREFS_KEY];
-                    if ([enabled isKindOfClass:[NSArray class]]) {
-                        source = "jb";
-                        break;
-                    }
+            }
+        }
+#endif
+        if (!enabled) {
+            for (NSString *configPath in dh_config_candidates()) {
+                id value = [NSDictionary dictionaryWithContentsOfFile:configPath][PREFS_KEY];
+                if ([value isKindOfClass:NSArray.class]) {
+                    enabled = value;
+                    source = "jb";
+                    break;
                 }
             }
         }
