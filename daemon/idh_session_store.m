@@ -1,5 +1,6 @@
 #import "idh_session_store.h"
 #include <sqlite3.h>
+#include <string.h>
 
 @implementation IDHSessionStore {
     sqlite3 *_database;
@@ -14,12 +15,55 @@
     const char *schema =
         "PRAGMA foreign_keys=ON;"
         "CREATE TABLE IF NOT EXISTS sessions("
-        "id TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, value BLOB NOT NULL);"
+        "id TEXT PRIMARY KEY, created_ms INTEGER NOT NULL, bundle_id TEXT, value BLOB NOT NULL);"
         "CREATE TABLE IF NOT EXISTS summaries("
         "session_id TEXT REFERENCES sessions(id) ON DELETE CASCADE,"
         "seq INTEGER NOT NULL, value BLOB NOT NULL, PRIMARY KEY(session_id,seq));";
     if (![self execute:schema]) return nil;
+    if (![self ensureBundleColumn]) return nil;
     return self;
+}
+
+// 旧库的 sessions 表没有 bundle_id 列；补列后从 value JSON 里回填
+- (BOOL)ensureBundleColumn {
+    sqlite3_stmt *statement = NULL;
+    BOOL found = NO;
+    if (sqlite3_prepare_v2(_database, "PRAGMA table_info(sessions);", -1, &statement, NULL) == SQLITE_OK) {
+        while (sqlite3_step(statement) == SQLITE_ROW) {
+            const char *name = (const char *)sqlite3_column_text(statement, 1);
+            if (name && strcmp(name, "bundle_id") == 0) { found = YES; break; }
+        }
+    }
+    sqlite3_finalize(statement);
+    if (!found && ![self execute:"ALTER TABLE sessions ADD COLUMN bundle_id TEXT;"]) return NO;
+    statement = NULL;
+    NSMutableArray<NSArray *> *pending = [NSMutableArray array];
+    if (sqlite3_prepare_v2(_database, "SELECT id,value FROM sessions WHERE bundle_id IS NULL;",
+                           -1, &statement, NULL) != SQLITE_OK) return NO;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const char *identity = (const char *)sqlite3_column_text(statement, 0);
+        NSData *data = [NSData dataWithBytes:sqlite3_column_blob(statement, 1)
+                                     length:sqlite3_column_bytes(statement, 1)];
+        id value = [NSJSONSerialization JSONObjectWithData:data options:0 error:NULL];
+        NSString *bundle = [value isKindOfClass:NSDictionary.class] ? value[@"bundleId"] : nil;
+        if (identity && [bundle isKindOfClass:NSString.class])
+            [pending addObject:@[[NSString stringWithUTF8String:identity], bundle]];
+    }
+    sqlite3_finalize(statement);
+    statement = NULL;
+    if (sqlite3_prepare_v2(_database, "UPDATE sessions SET bundle_id=? WHERE id=?;",
+                           -1, &statement, NULL) != SQLITE_OK) return NO;
+    for (NSArray *row in pending) {
+        sqlite3_bind_text(statement, 1, [row[1] UTF8String], -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(statement, 2, [row[0] UTF8String], -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(statement) != SQLITE_DONE) {
+            sqlite3_finalize(statement);
+            return NO;
+        }
+        sqlite3_reset(statement);
+    }
+    sqlite3_finalize(statement);
+    return YES;
 }
 
 - (void)dealloc {
@@ -42,13 +86,16 @@ static BOOL bindJSON(sqlite3_stmt *statement, int index, NSDictionary *record) {
     if (![self execute:"BEGIN IMMEDIATE"]) return NO;
     sqlite3_stmt *statement = NULL;
     const char *upsert =
-        "INSERT INTO sessions(id,created_ms,value) VALUES(?,?,?) "
-        "ON CONFLICT(id) DO UPDATE SET value=excluded.value;";
+        "INSERT INTO sessions(id,created_ms,bundle_id,value) VALUES(?,?,?,?) "
+        "ON CONFLICT(id) DO UPDATE SET bundle_id=excluded.bundle_id, value=excluded.value;";
     const char *identity = [session[@"sessionId"] UTF8String];
+    const char *bundle = [session[@"bundleId"] UTF8String];
     BOOL saved = sqlite3_prepare_v2(_database, upsert, -1, &statement, NULL) == SQLITE_OK &&
         sqlite3_bind_text(statement, 1, identity, -1, SQLITE_TRANSIENT) == SQLITE_OK &&
         sqlite3_bind_int64(statement, 2, [session[@"createdAtMs"] longLongValue]) == SQLITE_OK &&
-        bindJSON(statement, 3, session) && sqlite3_step(statement) == SQLITE_DONE;
+        (bundle ? sqlite3_bind_text(statement, 3, bundle, -1, SQLITE_TRANSIENT)
+                : sqlite3_bind_null(statement, 3)) == SQLITE_OK &&
+        bindJSON(statement, 4, session) && sqlite3_step(statement) == SQLITE_DONE;
     sqlite3_finalize(statement);
     statement = NULL;
     if (saved && events.count) {
@@ -107,6 +154,36 @@ static BOOL bindJSON(sqlite3_stmt *statement, int index, NSDictionary *record) {
 - (NSArray<NSDictionary *> *)eventsForSession:(NSString *)sessionID after:(uint64_t)cursor limit:(NSUInteger)limit {
     return [self select:"SELECT value FROM summaries WHERE session_id=? AND seq>? ORDER BY seq LIMIT ?;"
                 session:sessionID after:cursor limit:limit];
+}
+
+// 按 App 合并的连续时间线：跨该 bundleId 全部会话，按 summaries.rowid（入库顺序≈时间序）升序。
+// 每条事件附加 appSeq = rowid，作为应用级连续序号与翻页游标。
+- (NSArray<NSDictionary *> *)eventsForBundle:(NSString *)bundle after:(uint64_t)cursor limit:(NSUInteger)limit {
+    sqlite3_stmt *statement = NULL;
+    if (sqlite3_prepare_v2(_database,
+            "SELECT summaries.rowid,summaries.value FROM summaries "
+            "JOIN sessions ON summaries.session_id = sessions.id "
+            "WHERE sessions.bundle_id = ? AND summaries.rowid > ? ORDER BY summaries.rowid LIMIT ?;",
+            -1, &statement, NULL) != SQLITE_OK) return nil;
+    sqlite3_bind_text(statement, 1, bundle.UTF8String, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(statement, 2, (sqlite3_int64)cursor);
+    sqlite3_bind_int64(statement, 3, (sqlite3_int64)limit);
+    NSMutableArray *rows = [NSMutableArray array];
+    int result;
+    while ((result = sqlite3_step(statement)) == SQLITE_ROW) {
+        NSData *data = [NSData dataWithBytes:sqlite3_column_blob(statement, 1)
+                                     length:sqlite3_column_bytes(statement, 1)];
+        id value = [NSJSONSerialization JSONObjectWithData:data
+                                                   options:NSJSONReadingMutableContainers error:NULL];
+        if (![value isKindOfClass:NSMutableDictionary.class]) {
+            sqlite3_finalize(statement);
+            return nil;
+        }
+        ((NSMutableDictionary *)value)[@"appSeq"] = @(sqlite3_column_int64(statement, 0));
+        [rows addObject:value];
+    }
+    sqlite3_finalize(statement);
+    return result == SQLITE_DONE ? rows : nil;
 }
 
 - (BOOL)prune {

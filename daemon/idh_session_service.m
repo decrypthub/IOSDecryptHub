@@ -639,6 +639,20 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
                                [removeList isKindOfClass:NSArray.class] ? removeList : @[]);
     }
     if ([tool isEqualToString:@"relaunch_app"]) return idh_app_relaunch(arguments[@"bundleId"]);
+    if ([tool isEqualToString:@"read_app_events"]) {
+        NSString *bundle = stringValue(arguments[@"bundle_id"], 255);
+        if (!bundle) return failure(@"invalid_arguments");
+        NSNumber *after = integerValue(arguments[@"after"] ?: @0, maxJSONInteger);
+        NSNumber *limit = integerValue(arguments[@"limit"] ?: @100, 500);
+        if (!after || !limit.unsignedIntegerValue) return failure(@"invalid_pagination");
+        NSArray *rows = [_store eventsForBundle:bundle after:after.unsignedLongLongValue
+                                          limit:limit.unsignedIntegerValue + 1];
+        if (!rows) return failure(@"storage_error");
+        BOOL more = rows.count > limit.unsignedIntegerValue;
+        if (more) rows = [rows subarrayWithRange:NSMakeRange(0, limit.unsignedIntegerValue)];
+        return @{@"ok": @YES, @"events": rows,
+                 @"next": rows.lastObject[@"appSeq"] ?: after, @"hasMore": @(more)};
+    }
     if (![tool isEqualToString:@"get_session"] && ![tool isEqualToString:@"read_session_events"])
         return failure(@"unknown_tool");
     NSString *sessionID = identifier(arguments[@"session_id"]);

@@ -35,6 +35,12 @@ static NSArray *tools(void) {
               @"add": @{@"type": @"array", @"items": @{@"type": @"string"}},
               @"remove": @{@"type": @"array", @"items": @{@"type": @"string"}},
           }}},
+        @{@"name": @"read_app_events", @"description": @"Page through one app's merged event timeline across all its sessions.",
+          @"inputSchema": @{@"type": @"object", @"required": @[@"bundle_id"], @"properties": @{
+              @"bundle_id": @{@"type": @"string", @"description": @"App bundle identifier"},
+              @"after": @{@"type": @"integer", @"minimum": @0},
+              @"limit": @{@"type": @"integer", @"minimum": @1, @"maximum": @500},
+          }}},
         @{@"name": @"relaunch_app", @"description": @"Kill a target app by bundle ID and reopen it so scope changes apply.",
           @"inputSchema": @{@"type": @"object", @"required": @[@"bundleId"], @"properties": @{
               @"bundleId": @{@"type": @"string"},
@@ -116,6 +122,38 @@ static BOOL serveSessions(int fd, NSString *target, IDHSessionService *service, 
     if (limit) arguments[@"limit"] = @([limit longLongValue]);
     __block NSDictionary *value;
     dispatch_sync(stateQueue, ^{ value = [service read:@"read_session_events" arguments:arguments]; });
+    sendResult(fd, value);
+    return YES;
+}
+
+static BOOL serveApps(int fd, NSString *target, IDHSessionService *service, dispatch_queue_t stateQueue) {
+    NSString *path = targetPath(target);
+    NSString *query = targetQuery(target);
+    NSArray<NSString *> *parts = [path componentsSeparatedByString:@"/"];
+    if (parts.count < 3 || parts.firstObject.length || ![parts[1] isEqualToString:@"api"] ||
+        ![parts[2] isEqualToString:@"apps"]) return NO;
+    if (parts.count == 3) {
+        __block NSDictionary *value;
+        dispatch_sync(stateQueue, ^{ value = idh_apps_list(); });
+        sendResult(fd, value);
+        return YES;
+    }
+    if (parts.count != 5 || ![parts[4] isEqualToString:@"events"]) {
+        sendHTTP(fd, 404, @"Not Found", nil);
+        return YES;
+    }
+    NSString *bundle = [parts[3] stringByRemovingPercentEncoding];
+    if (!bundle.length) {
+        sendHTTP(fd, 404, @"Not Found", nil);
+        return YES;
+    }
+    NSString *after = queryValue(query, @"after");
+    NSString *limit = queryValue(query, @"limit");
+    NSMutableDictionary *arguments = [@{@"bundle_id": bundle} mutableCopy];
+    if (after) arguments[@"after"] = @([after longLongValue]);
+    if (limit) arguments[@"limit"] = @([limit longLongValue]);
+    __block NSDictionary *value;
+    dispatch_sync(stateQueue, ^{ value = [service read:@"read_app_events" arguments:arguments]; });
     sendResult(fd, value);
     return YES;
 }
@@ -226,7 +264,7 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         ([path isEqualToString:@"/api/sessions"] || [path hasPrefix:@"/api/sessions/"]);
     BOOL settingsRoute = [target isEqualToString:@"/api/session-settings"];
     BOOL settingsRead = settingsRoute && [method isEqualToString:@"GET"];
-    BOOL appsRead = [method isEqualToString:@"GET"] && [path isEqualToString:@"/api/apps"];
+    BOOL appsRead = [method isEqualToString:@"GET"] && [path hasPrefix:@"/api/apps"];
     BOOL scopeRoute = [path isEqualToString:@"/api/injection-scope"];
     BOOL scopeRead = scopeRoute && [method isEqualToString:@"GET"];
     BOOL relaunchRoute = [method isEqualToString:@"POST"] && [path isEqualToString:@"/api/apps/relaunch"];
@@ -269,12 +307,13 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         if (!serveSessions(fd, target, service, stateQueue)) sendHTTP(fd, 404, @"Not Found", nil);
         return;
     }
-    if (appsRead || scopeRead) {
+    if (appsRead) {
+        if (!serveApps(fd, target, service, stateQueue)) sendHTTP(fd, 404, @"Not Found", nil);
+        return;
+    }
+    if (scopeRead) {
         __block NSDictionary *value;
-        dispatch_sync(stateQueue, ^{
-            value = appsRead ? idh_apps_list()
-                             : @{@"ok": @YES, @"scope": idh_scope_read() ?: @[]};
-        });
+        dispatch_sync(stateQueue, ^{ value = @{@"ok": @YES, @"scope": idh_scope_read() ?: @[]}; });
         sendResult(fd, value);
         return;
     }

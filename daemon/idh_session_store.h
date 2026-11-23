@@ -6,5 +6,6 @@
 - (NSArray<NSDictionary *> *)sessions;
 - (NSDictionary *)session:(NSString *)sessionID;
 - (NSArray<NSDictionary *> *)eventsForSession:(NSString *)sessionID after:(uint64_t)cursor limit:(NSUInteger)limit;
+- (NSArray<NSDictionary *> *)eventsForBundle:(NSString *)bundle after:(uint64_t)cursor limit:(NSUInteger)limit;
 - (BOOL)prune;
 @end
