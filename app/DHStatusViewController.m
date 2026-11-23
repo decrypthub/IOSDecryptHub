@@ -5,9 +5,6 @@
 #import "DHStatusViewController.h"
 #import "../src/session/idh_session_ipc.h"
 
-@interface DHStatusViewController ()
-@end
-
 @implementation DHStatusViewController {
     NSDictionary *_status;        // registrations 应答：modeEnabled/remoteListen/agents/mcpStatus
     dispatch_queue_t _requests;
@@ -52,27 +49,46 @@
 #pragma mark - hero
 
 - (void)buildHero {
-    UIView *hero = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 108)];
+    UIView *hero = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 96)];
 
-    _heroBadge = [[UIView alloc] initWithFrame:CGRectMake(20, 26, 56, 56)];
-    _heroBadge.layer.cornerRadius = 16;
-    _heroBadge.backgroundColor = [UIColor secondarySystemGroupedBackgroundColor];
+    _heroBadge = [UIView new];
+    _heroBadge.translatesAutoresizingMaskIntoConstraints = NO;
+    _heroBadge.layer.cornerRadius = 15;
     [hero addSubview:_heroBadge];
 
-    _heroIcon = [[UIImageView alloc] initWithFrame:CGRectInset(_heroBadge.bounds, 14, 14)];
+    _heroIcon = [UIImageView new];
+    _heroIcon.translatesAutoresizingMaskIntoConstraints = NO;
     _heroIcon.contentMode = UIViewContentModeScaleAspectFit;
     [_heroBadge addSubview:_heroIcon];
 
-    _heroTitle = [[UILabel alloc] initWithFrame:CGRectMake(92, 30, hero.bounds.size.width - 104, 26)];
-    _heroTitle.font = [UIFont systemFontOfSize:20 weight:UIFontWeightSemibold];
-    _heroTitle.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [hero addSubview:_heroTitle];
+    UIStackView *text = [[UIStackView alloc] init];
+    text.translatesAutoresizingMaskIntoConstraints = NO;
+    text.axis = UILayoutConstraintAxisVertical;
+    text.spacing = 3;
+    [hero addSubview:text];
 
-    _heroDetail = [[UILabel alloc] initWithFrame:CGRectMake(92, 56, hero.bounds.size.width - 104, 20)];
+    _heroTitle = [UILabel new];
+    _heroTitle.font = [UIFont systemFontOfSize:19 weight:UIFontWeightSemibold];
+    [text addArrangedSubview:_heroTitle];
+
+    _heroDetail = [UILabel new];
     _heroDetail.font = [UIFont systemFontOfSize:13];
     _heroDetail.textColor = [UIColor secondaryLabelColor];
-    _heroDetail.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    [hero addSubview:_heroDetail];
+    [text addArrangedSubview:_heroDetail];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [_heroBadge.leadingAnchor constraintEqualToAnchor:hero.leadingAnchor constant:20],
+        [_heroBadge.centerYAnchor constraintEqualToAnchor:hero.centerYAnchor],
+        [_heroBadge.widthAnchor constraintEqualToConstant:52],
+        [_heroBadge.heightAnchor constraintEqualToConstant:52],
+        [_heroIcon.centerXAnchor constraintEqualToAnchor:_heroBadge.centerXAnchor],
+        [_heroIcon.centerYAnchor constraintEqualToAnchor:_heroBadge.centerYAnchor],
+        [_heroIcon.widthAnchor constraintEqualToConstant:26],
+        [_heroIcon.heightAnchor constraintEqualToConstant:26],
+        [text.leadingAnchor constraintEqualToAnchor:_heroBadge.trailingAnchor constant:14],
+        [text.trailingAnchor constraintLessThanOrEqualToAnchor:hero.trailingAnchor constant:-16],
+        [text.centerYAnchor constraintEqualToAnchor:hero.centerYAnchor],
+    ]];
 
     self.tableView.tableHeaderView = hero;
     [self updateHero];
@@ -96,8 +112,8 @@
         symbol = @"exclamationmark.triangle";
         title = [mcp isEqualToString:@"port_busy"] ? @"端口被占用" : @"服务异常";
     }
-    _heroIcon.image = [[UIImage systemImageNamed:symbol]
-        imageWithConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:26 weight:UIImageSymbolWeightMedium]];
+    _heroIcon.image = [UIImage systemImageNamed:symbol
+                          withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightMedium]];
     _heroIcon.tintColor = color;
     _heroBadge.backgroundColor = [color colorWithAlphaComponent:0.14];
     _heroTitle.text = title;
@@ -159,8 +175,8 @@
 }
 
 - (void)iconForCell:(UITableViewCell *)cell name:(NSString *)name color:(UIColor *)color {
-    cell.imageView.image = [[UIImage systemImageNamed:name]
-        imageWithConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightMedium]];
+    cell.imageView.image = [UIImage systemImageNamed:name
+                               withConfiguration:[UIImageSymbolConfiguration configurationWithPointSize:16 weight:UIImageSymbolWeightMedium]];
     cell.imageView.tintColor = color;
 }
 
@@ -169,11 +185,11 @@
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView { return 2; }
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
-    return section == 0 ? 3 : 1;
+    return 1;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section {
-    return section == 0 ? @"状态" : @"连接";
+    return section == 0 ? @"会话" : @"连接";
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section {
@@ -183,26 +199,10 @@
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleValue1 reuseIdentifier:nil];
     cell.selectionStyle = UITableViewCellSelectionStyleNone;
-    BOOL online = [_status[@"ok"] boolValue];
-    NSString *mcp = _status[@"mcpStatus"];
     if (indexPath.section == 0) {
-        if (indexPath.row == 0) {
-            cell.textLabel.text = @"设备服务";
-            [self iconForCell:cell name:@"gearshape.2" color:[UIColor systemBlueColor]];
-            cell.detailTextLabel.text = !online ? @"不可达"
-                : [mcp isEqualToString:@"listening"] ? @"在线" : (mcp ?: @"异常");
-            cell.detailTextLabel.textColor = !online || ![mcp isEqualToString:@"listening"]
-                ? [UIColor systemRedColor] : [UIColor systemGreenColor];
-        } else if (indexPath.row == 1) {
-            cell.textLabel.text = @"会话模式";
-            [self iconForCell:cell name:@"record.circle" color:[UIColor systemPurpleColor]];
-            cell.accessoryView = [self switchForKey:@"modeEnabled" action:@selector(toggleMode:)];
-        } else {
-            cell.textLabel.text = @"已注入应用";
-            [self iconForCell:cell name:@"app.badge" color:[UIColor systemTealColor]];
-            cell.detailTextLabel.text = [NSString stringWithFormat:@"%lu",
-                                       (unsigned long)[_status[@"agents"] count]];
-        }
+        cell.textLabel.text = @"会话模式";
+        [self iconForCell:cell name:@"record.circle" color:[UIColor systemPurpleColor]];
+        cell.accessoryView = [self switchForKey:@"modeEnabled" action:@selector(toggleMode:)];
     } else {
         cell.textLabel.text = @"局域网连接";
         [self iconForCell:cell name:@"network" color:[UIColor systemIndigoColor]];
