@@ -10,6 +10,7 @@
 extern NSString *const IDHSessionSocketPath;
 extern NSString *const IDHSessionStateDirectory;
 extern NSString *const IDHSessionModePath;
+extern NSString *const IDHSessionRemotePath;
 
 BOOL IDHSessionModeEnabled(void);
 NSString *IDHSessionExecutablePath(pid_t pid);

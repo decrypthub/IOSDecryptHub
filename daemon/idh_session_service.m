@@ -544,7 +544,22 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
             }
         }
         return @{@"ok": @YES, @"agents": online, @"modeEnabled": @(IDHSessionModeEnabled()),
+                 @"remoteListen": @(access(IDHSessionRemotePath.fileSystemRepresentation, F_OK) == 0),
                  @"mcpStatus": self.mcpStatus};
+    }
+    if ([action isEqualToString:@"set_remote_listen"]) {
+        NSNumber *enabled = integerValue(message[@"enabled"], 1);
+        if (!enabled) return failure(@"invalid_mode");
+        const char *path = IDHSessionRemotePath.fileSystemRepresentation;
+        if (enabled.boolValue) {
+            if (![[NSData data] writeToFile:IDHSessionRemotePath options:NSDataWritingAtomic error:NULL])
+                return failure(@"storage_error");
+        } else if (unlink(path) && errno != ENOENT) {
+            return failure(@"storage_error");
+        }
+        // 监听地址只在启动时绑定一次；回包后退出由 launchd 以新绑定拉起。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC), dispatch_get_main_queue(), ^{ exit(0); });
+        return @{@"ok": @YES, @"remoteListen": enabled, @"restarting": @YES};
     }
     if ([action isEqualToString:@"session_settings"]) {
         NSDictionary *settings = message[@"settings"];
