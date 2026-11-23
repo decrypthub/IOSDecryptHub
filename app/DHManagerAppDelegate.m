@@ -22,10 +22,12 @@
                                                   image:[UIImage systemImageNamed:@"square.grid.2x2"]
                                                     tag:1];
     UITabBarController *tabs = [[UITabBarController alloc] init];
-    tabs.viewControllers = @[
-        [[UINavigationController alloc] initWithRootViewController:status],
-        [[UINavigationController alloc] initWithRootViewController:root],
-    ];
+    UINavigationController *statusNav = [[UINavigationController alloc] initWithRootViewController:status];
+    UINavigationController *appsNav = [[UINavigationController alloc] initWithRootViewController:root];
+    for (UINavigationController *nav in @[statusNav, appsNav]) {
+        nav.navigationBar.prefersLargeTitles = YES;
+    }
+    tabs.viewControllers = @[statusNav, appsNav];
     self.window.rootViewController = tabs;
     [self.window makeKeyAndVisible];
     return YES;
