@@ -137,6 +137,7 @@ compile_session_daemon() {
         -fobjc-arc -Wall -O2 -DIDH_ROOT_HIDE="$ROOT_HIDE" -framework Foundation -framework Security -lsqlite3 \
         "$SCRIPT_DIR/daemon/idhjd.m" "$SCRIPT_DIR/daemon/idh_session_store.m" \
         "$SCRIPT_DIR/daemon/idh_session_service.m" "$SCRIPT_DIR/daemon/idh_session_http.m" \
+        "$SCRIPT_DIR/daemon/idh_device_apps.m" \
         "$SCRIPT_DIR/src/session/idh_session_ipc.m" -o "$OUT"
 }
 

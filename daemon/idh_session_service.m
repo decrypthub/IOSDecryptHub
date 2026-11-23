@@ -13,6 +13,7 @@
 @implementation IDHForward
 @end
 #import "idh_session_store.h"
+#import "idh_device_apps.h"
 #import "../src/session/idh_session_ipc.h"
 #import "../src/dh_shared.h"
 #import <Security/Security.h>
@@ -646,6 +647,16 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         NSArray *sessions = [_store sessions];
         return sessions ? @{@"ok": @YES, @"sessions": sessions} : failure(@"storage_error");
     }
+    if ([tool isEqualToString:@"list_installed_apps"]) return idh_apps_list();
+    if ([tool isEqualToString:@"get_injection_scope"])
+        return @{@"ok": @YES, @"scope": idh_scope_read() ?: @[]};
+    if ([tool isEqualToString:@"set_injection_scope"]) {
+        id addList = arguments[@"add"];
+        id removeList = arguments[@"remove"];
+        return idh_scope_apply([addList isKindOfClass:NSArray.class] ? addList : @[],
+                               [removeList isKindOfClass:NSArray.class] ? removeList : @[]);
+    }
+    if ([tool isEqualToString:@"relaunch_app"]) return idh_app_relaunch(arguments[@"bundleId"]);
     if (![tool isEqualToString:@"get_session"] && ![tool isEqualToString:@"read_session_events"])
         return failure(@"unknown_tool");
     NSString *sessionID = identifier(arguments[@"session_id"]);

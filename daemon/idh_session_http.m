@@ -1,5 +1,6 @@
 #import "idh_session_http.h"
 #import "idh_session_service.h"
+#import "idh_device_apps.h"
 #import "panel_html.h"
 #import "../src/session/idh_session_ipc.h"
 #include <arpa/inet.h>
@@ -36,7 +37,25 @@ static NSArray *tools(void) {
               @"session_id": identity, @"after_seq": @{@"type": @"integer", @"minimum": @0},
               @"limit": @{@"type": @"integer", @"minimum": @1, @"maximum": @100},
           }}},
+        @{@"name": @"list_installed_apps", @"description": @"List installed apps with running state and the current injection scope.",
+          @"inputSchema": @{@"type": @"object", @"properties": @{}}},
+        @{@"name": @"get_injection_scope", @"description": @"Read the enabled bundle list the loader injects into.",
+          @"inputSchema": @{@"type": @"object", @"properties": @{}}},
+        @{@"name": @"set_injection_scope", @"description": @"Add or remove bundle IDs from the injection scope (writes take effect on next app launch).",
+          @"inputSchema": @{@"type": @"object", @"properties": @{
+              @"add": @{@"type": @"array", @"items": @{@"type": @"string"}},
+              @"remove": @{@"type": @"array", @"items": @{@"type": @"string"}},
+          }}},
+        @{@"name": @"relaunch_app", @"description": @"Kill a target app by bundle ID and reopen it so scope changes apply.",
+          @"inputSchema": @{@"type": @"object", @"required": @[@"bundleId"], @"properties": @{
+              @"bundleId": @{@"type": @"string"},
+          }}},
     ];
+}
+
+// 写工具（改名单/重启 App）只允许本机转发入口，与 settings 写同一纪律
+static BOOL deviceWriteTool(NSString *name) {
+    return [name isEqualToString:@"set_injection_scope"] || [name isEqualToString:@"relaunch_app"];
 }
 
 static void sendHTTP(int fd, int code, NSString *description, NSDictionary *value);
@@ -232,11 +251,16 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         ([path isEqualToString:@"/api/sessions"] || [path hasPrefix:@"/api/sessions/"]);
     BOOL settingsRoute = [target isEqualToString:@"/api/session-settings"];
     BOOL settingsRead = settingsRoute && [method isEqualToString:@"GET"];
-    if (!sessionRead && !settingsRoute && ![path isEqualToString:@"/api/mcp"]) {
+    BOOL appsRead = [method isEqualToString:@"GET"] && [path isEqualToString:@"/api/apps"];
+    BOOL scopeRoute = [path isEqualToString:@"/api/injection-scope"];
+    BOOL scopeRead = scopeRoute && [method isEqualToString:@"GET"];
+    BOOL relaunchRoute = [method isEqualToString:@"POST"] && [path isEqualToString:@"/api/apps/relaunch"];
+    if (!sessionRead && !settingsRoute && !appsRead && !scopeRoute && !relaunchRoute &&
+        ![path isEqualToString:@"/api/mcp"]) {
         sendHTTP(fd, 404, @"Not Found", nil);
         return;
     }
-    if (!sessionRead && !settingsRead && ![method isEqualToString:@"POST"]) {
+    if (!sessionRead && !settingsRead && !appsRead && !scopeRead && ![method isEqualToString:@"POST"]) {
         sendHTTP(fd, 405, @"Method Not Allowed", nil);
         return;
     }
@@ -261,6 +285,11 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         return;
     }
     if (settingsRoute && !fromLoopback(fd)) {
+        sendHTTP(fd, 403, @"Forbidden", @{@"error": @"local_forward_required"});
+        return;
+    }
+    BOOL deviceWrite = relaunchRoute || (scopeRoute && !scopeRead);
+    if (deviceWrite && !fromLoopback(fd)) {
         sendHTTP(fd, 403, @"Forbidden", @{@"error": @"local_forward_required"});
         return;
     }
@@ -292,6 +321,19 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         if (!serveSessions(fd, target, service, stateQueue)) sendHTTP(fd, 404, @"Not Found", nil);
         return;
     }
+    if (appsRead || scopeRead) {
+        if (!sessionAuthorized) {
+            sendHTTP(fd, 401, @"Unauthorized", nil);
+            return;
+        }
+        __block NSDictionary *value;
+        dispatch_sync(stateQueue, ^{
+            value = appsRead ? idh_apps_list()
+                             : @{@"ok": @YES, @"scope": idh_scope_read() ?: @[]};
+        });
+        sendResult(fd, value);
+        return;
+    }
     NSScanner *scanner = [NSScanner scannerWithString:headers[@"content-length"] ?: @""];
     unsigned long long length = 0;
     if (headers[@"transfer-encoding"] || ![scanner scanUnsignedLongLong:&length] || !scanner.isAtEnd ||
@@ -316,6 +358,25 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
                 ? [service updateSettings:request] : @{@"error": @"settings_pairing_required"};
         });
         sendSettings(fd, saved);
+        return;
+    }
+    if (scopeRoute || relaunchRoute) {
+        if (!sessionAuthorized) {
+            sendHTTP(fd, 401, @"Unauthorized", nil);
+            return;
+        }
+        if (![request isKindOfClass:NSDictionary.class]) {
+            sendHTTP(fd, 400, @"Bad Request", nil);
+            return;
+        }
+        __block NSDictionary *value;
+        dispatch_sync(stateQueue, ^{
+            value = scopeRoute
+                ? idh_scope_apply([request[@"add"] isKindOfClass:NSArray.class] ? request[@"add"] : @[],
+                                  [request[@"remove"] isKindOfClass:NSArray.class] ? request[@"remove"] : @[])
+                : idh_app_relaunch(request[@"bundleId"]);
+        });
+        sendResult(fd, value);
         return;
     }
     if (![request isKindOfClass:NSDictionary.class]) {
@@ -387,6 +448,13 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
     } else if (processList) {
         reply = @{@"jsonrpc": @"2.0", @"id": request[@"id"] ?: NSNull.null, @"result": @{@"tools": processTools()}};
     } else {
+        if (!fromLoopback(fd) && [rpcMethod isEqualToString:@"tools/call"]) {
+            NSString *name = request[@"params"][@"name"];
+            if ([name isKindOfClass:NSString.class] && deviceWriteTool(name)) {
+                sendHTTP(fd, 403, @"Forbidden", @{@"error": @"local_forward_required"});
+                return;
+            }
+        }
         reply = rpc(request, service, stateQueue);
     }
     sendHTTP(fd, reply ? 200 : 202, reply ? @"OK" : @"Accepted", reply);
