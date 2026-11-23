@@ -15,7 +15,9 @@
 
 #import <Foundation/Foundation.h>
 #import <Security/Security.h>
+#import <stdatomic.h>
 #import "fishhook.h"
+#import "hook_keychain.h"
 #import "log_store.h"
 #define DH_BOARD DH_DIAG_GENERAL
 #import "dh_health.h"
@@ -97,9 +99,12 @@ static void kc_log(NSString *api, NSString *summary, NSData *input, NSData *outp
 
 // ---------- SecItemCopyMatching ----------
 static OSStatus (*orig_SecItemCopyMatching)(CFDictionaryRef, CFTypeRef *);
+static _Atomic int g_kc_internal;   // 面板/工具自己的枚举查询不记成 hook 事件
+
 static OSStatus hooked_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result) {
     OSStatus st = orig_SecItemCopyMatching(query, result);
-    if (dh_capture_sub_enabled(DH_CAP_KEYCHAIN)) {
+    if (dh_capture_sub_enabled(DH_CAP_KEYCHAIN) &&
+        atomic_load_explicit(&g_kc_internal, memory_order_relaxed) == 0) {
         NSData *out = (st == errSecSuccess && result) ? kc_extract_result_data(*result) : nil;
         kc_log(@"SecItemCopyMatching", kc_summarize(query), nil, out ? [out copy] : nil, st);
     }
@@ -150,4 +155,104 @@ void dh_install_keychain_hooks(void) {
     rebind_symbols(r, sizeof(r)/sizeof(r[0]));
     dh_dlsym_register_rebindings(r, sizeof(r)/sizeof(r[0]));
     // 同 hook_asymmetric: Security.framework 可能注入后才加载, 不做安装后自检。
+}
+
+// ============================================================
+// 直接查看: 枚举本进程当前有权读到的 Keychain 条目
+// ============================================================
+// Hook 记录留给 App 真实调用, 否则每次刷新枚举都会在列表里多出一条 SecItemCopyMatching。
+static OSStatus kc_query(CFDictionaryRef q, CFTypeRef *result) {
+    atomic_fetch_add_explicit(&g_kc_internal, 1, memory_order_relaxed);
+    OSStatus st = orig_SecItemCopyMatching
+        ? orig_SecItemCopyMatching(q, result)
+        : SecItemCopyMatching(q, result);
+    atomic_fetch_sub_explicit(&g_kc_internal, 1, memory_order_relaxed);
+    return st;
+}
+
+static NSString *kc_class_short(CFTypeRef cls) {
+    // daemon 回传的 class 值是等值字符串而非常量本体, 不能用 == 比指针。
+    // CFEqual 不接受 NULL(不同于 isEqual: 容忍 nil), 属性表缺 class 键时会直接 SIGTRAP。
+    if (!cls) return @"?";
+    if (CFEqual(cls, kSecClassGenericPassword))  return @"genp";
+    if (CFEqual(cls, kSecClassInternetPassword)) return @"inet";
+    if (CFEqual(cls, kSecClassCertificate))      return @"cert";
+    if (CFEqual(cls, kSecClassKey))              return @"keys";
+    if (CFEqual(cls, kSecClassIdentity))         return @"iden";
+    return @"?";
+}
+
+// 单个条目的属性表 -> JSON 字典; data 单独由 kc_query 按 ReturnData 取回。
+// class 以发起查询时的类常量为准(条目由该类查询返回, 属性表里的 class 键可能缺失)。
+static NSDictionary *kc_item_dict(NSDictionary *a, NSData *data, CFTypeRef cls) {
+    NSMutableDictionary *item = [NSMutableDictionary dictionary];
+    item[@"class"] = kc_class_short(cls);
+    for (NSString *key in @[
+            (__bridge NSString *)kSecAttrService,
+            (__bridge NSString *)kSecAttrAccount,
+            (__bridge NSString *)kSecAttrAccessGroup,
+            (__bridge NSString *)kSecAttrLabel,
+            (__bridge NSString *)kSecAttrDescription,
+            (__bridge NSString *)kSecAttrAccessible,
+            (__bridge NSString *)kSecAttrServer,
+            (__bridge NSString *)kSecAttrProtocol,
+            (__bridge NSString *)kSecAttrSynchronizable]) {
+        id v = a[key];
+        if ([v isKindOfClass:[NSString class]] || [v isKindOfClass:[NSNumber class]])
+            item[key] = v;
+        else if ([v isKindOfClass:[NSDate class]])
+            item[key] = @([v timeIntervalSince1970] * 1000);
+    }
+    if (data) {
+        item[@"dataLen"] = @(data.length);
+        NSData *clip = data.length > 16384 ? [data subdataWithRange:NSMakeRange(0, 16384)] : data;
+        item[@"dataB64"] = [clip base64EncodedStringWithOptions:0];
+        item[@"dataTruncated"] = clip.length < data.length ? @YES : @NO;
+    }
+    return item;
+}
+
+NSDictionary *dh_keychain_items(NSInteger limit) {
+    if (limit <= 0 || limit > 500) limit = 200;
+    id classes[] = {
+        (__bridge id)kSecClassGenericPassword,
+        (__bridge id)kSecClassInternetPassword,
+        (__bridge id)kSecClassCertificate,
+        (__bridge id)kSecClassKey,
+        (__bridge id)kSecClassIdentity,
+    };
+    NSMutableArray *items = [NSMutableArray array];
+    NSMutableDictionary *statuses = [NSMutableDictionary dictionary];
+    for (int i = 0; i < 5 && items.count < limit; i++) {
+        // 属性+数据分开查: 数据需要 kSecReturnData, 某些类一次查太多可能 errSecParam,
+        // 失败就退回只查属性, 条目本身不丢。
+        NSMutableDictionary *q = [@{
+            (__bridge id)kSecClass:              classes[i],
+            (__bridge id)kSecMatchLimit:         (__bridge id)kSecMatchLimitAll,
+            (__bridge id)kSecReturnAttributes:   @YES,
+            (__bridge id)kSecReturnData:         @YES,
+            // 需要解锁/认证才能读的条目返回错误码, 不许在目标机上弹系统认证框。
+            (__bridge id)kSecUseAuthenticationUI:(__bridge id)kSecUseAuthenticationUIFail,
+        } mutableCopy];
+        CFTypeRef result = NULL;
+        OSStatus st = kc_query((__bridge CFDictionaryRef)q, &result);
+        BOOL hasData = st == errSecSuccess;
+        if (!hasData) {
+            if (result) { CFRelease(result); result = NULL; }
+            [q removeObjectForKey:(__bridge NSString *)kSecReturnData];
+            st = kc_query((__bridge CFDictionaryRef)q, &result);
+        }
+        statuses[kc_class_short((__bridge CFTypeRef)classes[i])] = @(st);
+        if (st != errSecSuccess || !result) continue;
+        for (id entry in (__bridge NSArray *)result) {
+            if (items.count >= (NSUInteger)limit) break;
+            if (![entry isKindOfClass:[NSDictionary class]]) continue;
+            NSData *data = hasData ? [entry[(__bridge NSString *)kSecValueData] isKindOfClass:[NSData class]]
+                                       ? entry[(__bridge NSString *)kSecValueData] : nil
+                                   : nil;
+            [items addObject:kc_item_dict(entry, data, (__bridge CFTypeRef)classes[i])];
+        }
+        if (result) CFRelease(result);
+    }
+    return @{@"ok": @YES, @"items": items, @"statuses": statuses, @"count": @(items.count)};
 }

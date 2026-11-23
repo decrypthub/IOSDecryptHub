@@ -34,6 +34,7 @@
 #include "dh_files.h"
 #include "dump_manager.h"
 #include "hook_webkit.h"
+#include "hook_keychain.h"
 #include "../trace/qbdi_trace.h"
 #include "../trace/qbdi_live.h"
 #include "../trace/qbdi_control_selftest.h"
@@ -1660,6 +1661,14 @@ static NSInteger category_from_string(NSString *c) {
     return -1;
 }
 
+// list_keychain_items —— 直接查看: 进程内枚举本 App 当前有权读到的 Keychain 条目,
+// 与 SecItem* hook 记录互补: hook 记的是 App 每次调用的行为, 这里给的是此刻的清单。
+static NSDictionary *tool_list_keychain_items(NSDictionary *args) {
+    NSInteger limit = [args[@"limit"] respondsToSelector:@selector(integerValue)]
+        ? [args[@"limit"] integerValue] : 200;
+    return tool_ok(dh_keychain_items(limit));
+}
+
 // get_stats —— 取证总览: 事件计数 / 捕获开关 / 进程 / 健康 / 落盘量 / 噪声
 static NSDictionary *tool_get_stats(NSDictionary *args) {
     DHLogStore *s = [DHLogStore shared];
@@ -3012,6 +3021,16 @@ static NSArray *tool_definitions(void) {
             @"inputSchema": @{@"type": @"object", @"properties": @{}},
         },
         @{
+            @"name": @"list_keychain_items",
+            @"description": @"Enumerate the Keychain items this host process can currently read (inherits the app entitlements/access groups). Read-only; returns class/service/account/access-group plus stored data (genp/inet, capped at 16KB per item, base64). Complements the 'keychain' hook events, which record individual SecItem* calls the app makes.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"limit": @{@"type": @"number", @"description": @"Max items returned (default 200, max 500)"},
+                },
+            },
+        },
+        @{
             @"name": @"query_events",
             @"description": @"Search captured runtime events (crypto/file/system) — the core forensic feed. Returns summaries newest-first. Use get_event for a full record.",
             @"inputSchema": @{
@@ -3814,6 +3833,7 @@ static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
     if ([name isEqualToString:@"list_files"])            return tool_list_files(args);
     if ([name isEqualToString:@"read_file"])             return tool_read_file(args);
     if ([name isEqualToString:@"dump_status"])           return tool_dump_status(args);
+    if ([name isEqualToString:@"list_keychain_items"])   return tool_list_keychain_items(args);
     // 取证: 控制 (有副作用)
     if ([name isEqualToString:@"set_capture"])           return tool_set_capture(args);
     if ([name isEqualToString:@"set_pause"])             return tool_set_pause(args);
