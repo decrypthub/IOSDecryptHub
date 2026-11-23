@@ -69,12 +69,6 @@ static NSDictionary *mergeSessionLimits(id changes, NSDictionary *current) {
     return [merged copy];
 }
 
-static NSString *newPairingToken(void) {
-    unsigned char bytes[32];
-    if (SecRandomCopyBytes(kSecRandomDefault, sizeof(bytes), bytes) != errSecSuccess) return nil;
-    return [[NSData dataWithBytes:bytes length:sizeof(bytes)] base64EncodedStringWithOptions:0];
-}
-
 static NSNumber *nowMs(void) {
     return @((uint64_t)(NSDate.date.timeIntervalSince1970 * 1000));
 }
@@ -566,36 +560,9 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         } else {
             if (![self end:@"mode_disabled" uncertainTail:_agentAudit != nil]) return failure(@"storage_error");
             if (unlink(IDHSessionModePath.fileSystemRepresentation) && errno != ENOENT) return failure(@"storage_error");
-            _pairingToken = nil;
             [_agents removeAllObjects];
-            // 在线登记和进程凭证独立于采集。关闭会话模式只撤销会话配对。
         }
         return @{@"ok": @YES};
-    }
-    if ([action isEqualToString:@"pair"]) {
-        if (!IDHSessionModeEnabled()) return failure(@"mode_disabled");
-        NSString *token = newPairingToken();
-        if (!token) return failure(@"pairing_failed");
-        _pairingToken = token;
-        return @{@"ok": @YES, @"token": _pairingToken};
-    }
-    if ([action isEqualToString:@"pair_process"]) {
-        NSString *diagnosticsBundle = nil;
-        if ([integerValue(message[@"diagnosticsOnly"], 1) boolValue]) {
-            diagnosticsBundle = stringValue(message[@"bundleId"], 255);
-            if (!diagnosticsBundle) return failure(@"invalid_bundle");
-        }
-        NSString *token = newPairingToken();
-        if (!token) return failure(@"pairing_failed");
-        _processToken = token;
-        _processDiagnosticsBundle = [diagnosticsBundle copy];
-        return @{@"ok": @YES, @"token": _processToken};
-    }
-    if ([action isEqualToString:@"pair_settings"]) {
-        NSString *token = newPairingToken();
-        if (!token) return failure(@"pairing_failed");
-        _settingsToken = token;
-        return @{@"ok": @YES, @"token": _settingsToken};
     }
     if ([action isEqualToString:@"read"])
         return [self read:message[@"tool"] arguments:message[@"arguments"]];

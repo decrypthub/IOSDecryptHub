@@ -33,7 +33,7 @@ static int httpListener(void) {
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(IDH_SESSION_PORT),
-                                  .sin_addr.s_addr = htonl(INADDR_ANY)};
+                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
     if (!bind(fd, (void *)&address, sizeof(address)) && !listen(fd, 8)) return fd;
     int error = errno;
     close(fd);

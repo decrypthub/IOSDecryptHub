@@ -7,17 +7,6 @@
 #include <errno.h>
 #include <sys/socket.h>
 
-static NSArray *processTools(void) {
-    return @[
-        @{@"name": @"get_process_identity",
-          @"description": @"Read one live process. Multiple processes of one app are selected by processGeneration.",
-          @"inputSchema": @{@"type": @"object", @"required": @[@"bundleId"], @"properties": @{
-              @"bundleId": @{@"type": @"string"},
-              @"processGeneration": @{@"type": @"string"},
-          }}},
-    ];
-}
-
 static BOOL processIdentityCall(NSDictionary *request) {
     if (![request[@"method"] isEqualToString:@"tools/call"]) return NO;
     NSDictionary *parameters = request[@"params"];
@@ -50,12 +39,13 @@ static NSArray *tools(void) {
           @"inputSchema": @{@"type": @"object", @"required": @[@"bundleId"], @"properties": @{
               @"bundleId": @{@"type": @"string"},
           }}},
+        @{@"name": @"get_process_identity",
+          @"description": @"Read one live process. Multiple processes of one app are selected by processGeneration.",
+          @"inputSchema": @{@"type": @"object", @"required": @[@"bundleId"], @"properties": @{
+              @"bundleId": @{@"type": @"string"},
+              @"processGeneration": @{@"type": @"string"},
+          }}},
     ];
-}
-
-// 写工具（改名单/重启 App）只允许本机转发入口，与 settings 写同一纪律
-static BOOL deviceWriteTool(NSString *name) {
-    return [name isEqualToString:@"set_injection_scope"] || [name isEqualToString:@"relaunch_app"];
 }
 
 static void sendHTTP(int fd, int code, NSString *description, NSDictionary *value);
@@ -169,7 +159,12 @@ static NSDictionary *rpc(NSDictionary *request, IDHSessionService *service, disp
         result = @{@"tools": tools()};
     } else if ([method isEqualToString:@"tools/call"]) {
         __block NSDictionary *value;
-        dispatch_sync(stateQueue, ^{ value = [service read:parameters[@"name"] arguments:parameters[@"arguments"] ?: @{}]; });
+        NSString *name = [parameters[@"name"] isKindOfClass:NSString.class] ? parameters[@"name"] : @"";
+        dispatch_sync(stateQueue, ^{ value = [service read:name arguments:parameters[@"arguments"] ?: @{}]; });
+        if ([value[@"error"] isEqualToString:@"unknown_tool"])
+            value = [service forwardTool:name arguments:
+                [parameters[@"arguments"] isKindOfClass:NSDictionary.class] ? parameters[@"arguments"] : @{}
+                queue:stateQueue];
         NSData *encoded = [NSJSONSerialization dataWithJSONObject:value options:0 error:NULL];
         NSString *text = [[NSString alloc] initWithData:encoded encoding:NSUTF8StringEncoding];
         result = @{@"content": @[@{@"type": @"text", @"text": text ?: @"{}"}],
@@ -180,30 +175,10 @@ static NSDictionary *rpc(NSDictionary *request, IDHSessionService *service, disp
     return @{@"jsonrpc": @"2.0", @"id": identity, @"result": result};
 }
 
-static BOOL tokenMatches(NSString *authorization, NSString *token) {
-    if (!token.length || ![authorization hasPrefix:@"Bearer "]) return NO;
-    NSData *supplied = [[authorization substringFromIndex:7] dataUsingEncoding:NSUTF8StringEncoding];
-    NSData *expected = [token dataUsingEncoding:NSUTF8StringEncoding];
-    if (supplied.length != expected.length) return NO;
-    const unsigned char *a = supplied.bytes;
-    const unsigned char *b = expected.bytes;
-    unsigned char difference = 0;
-    for (NSUInteger i = 0; i < expected.length; i++) difference |= a[i] ^ b[i];
-    return difference == 0;
-}
-
-static BOOL fromLoopback(int fd) {
-    struct sockaddr_in peer = {0};
-    socklen_t size = sizeof(peer);
-    return getpeername(fd, (struct sockaddr *)&peer, &size) == 0 &&
-        peer.sin_family == AF_INET && peer.sin_addr.s_addr == htonl(INADDR_LOOPBACK);
-}
-
 static void sendSettings(int fd, NSDictionary *result) {
     if ([result[@"ok"] boolValue]) sendHTTP(fd, 200, @"OK", result);
     else if ([result[@"error"] isEqualToString:@"revision_conflict"]) sendHTTP(fd, 409, @"Conflict", result);
     else if ([result[@"error"] isEqualToString:@"settings_storage_error"]) sendHTTP(fd, 500, @"Storage Error", result);
-    else if ([result[@"error"] isEqualToString:@"settings_pairing_required"]) sendHTTP(fd, 401, @"Unauthorized", result);
     else sendHTTP(fd, 400, @"Bad Request", result);
 }
 
@@ -284,29 +259,6 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         sendHTTP(fd, 401, @"Unauthorized", nil);
         return;
     }
-    if (settingsRoute && !fromLoopback(fd)) {
-        sendHTTP(fd, 403, @"Forbidden", @{@"error": @"local_forward_required"});
-        return;
-    }
-    BOOL deviceWrite = relaunchRoute || (scopeRoute && !scopeRead);
-    if (deviceWrite && !fromLoopback(fd)) {
-        sendHTTP(fd, 403, @"Forbidden", @{@"error": @"local_forward_required"});
-        return;
-    }
-    __block BOOL sessionAuthorized;
-    __block BOOL processAuthorized;
-    __block BOOL settingsAuthorized = NO;
-    __block NSString *processDiagnosticsBundle;
-    dispatch_sync(stateQueue, ^{
-        sessionAuthorized = IDHSessionModeEnabled() && tokenMatches(headers[@"authorization"], service.pairingToken);
-        processAuthorized = tokenMatches(headers[@"authorization"], service.processToken);
-        if (processAuthorized) processDiagnosticsBundle = service.processDiagnosticsBundle;
-        if (settingsRoute) settingsAuthorized = tokenMatches(headers[@"authorization"], service.settingsToken);
-    });
-    if (settingsRoute && !settingsAuthorized && !(settingsRead && sessionAuthorized)) {
-        sendSettings(fd, @{@"error": @"settings_pairing_required"});
-        return;
-    }
     if (settingsRead) {
         __block NSDictionary *snapshot;
         dispatch_sync(stateQueue, ^{ snapshot = [service settingsSnapshot]; });
@@ -314,18 +266,10 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         return;
     }
     if (sessionRead) {
-        if (!sessionAuthorized) {
-            sendHTTP(fd, 401, @"Unauthorized", nil);
-            return;
-        }
         if (!serveSessions(fd, target, service, stateQueue)) sendHTTP(fd, 404, @"Not Found", nil);
         return;
     }
     if (appsRead || scopeRead) {
-        if (!sessionAuthorized) {
-            sendHTTP(fd, 401, @"Unauthorized", nil);
-            return;
-        }
         __block NSDictionary *value;
         dispatch_sync(stateQueue, ^{
             value = appsRead ? idh_apps_list()
@@ -353,18 +297,11 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
             return;
         }
         __block NSDictionary *saved;
-        dispatch_sync(stateQueue, ^{
-            saved = tokenMatches(headers[@"authorization"], service.settingsToken)
-                ? [service updateSettings:request] : @{@"error": @"settings_pairing_required"};
-        });
+        dispatch_sync(stateQueue, ^{ saved = [service updateSettings:request]; });
         sendSettings(fd, saved);
         return;
     }
     if (scopeRoute || relaunchRoute) {
-        if (!sessionAuthorized) {
-            sendHTTP(fd, 401, @"Unauthorized", nil);
-            return;
-        }
         if (![request isKindOfClass:NSDictionary.class]) {
             sendHTTP(fd, 400, @"Bad Request", nil);
             return;
@@ -380,44 +317,11 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         return;
     }
     if (![request isKindOfClass:NSDictionary.class]) {
-        if (!sessionAuthorized && !processAuthorized) {
-            sendHTTP(fd, 401, @"Unauthorized", nil);
-            return;
-        }
         sendHTTP(fd, 200, @"OK", rpcError(nil, -32700, @"Invalid JSON-RPC message"));
         return;
     }
-    NSString *rpcMethod = request[@"method"];
-    BOOL identityCall = processIdentityCall(request);
-    BOOL processCall = processAuthorized && [rpcMethod isEqualToString:@"tools/call"];
-    BOOL processList = [rpcMethod isEqualToString:@"tools/list"] && processAuthorized && !sessionAuthorized;
-    BOOL handshake = [@[@"initialize", @"ping", @"notifications/initialized"] containsObject:rpcMethod];
-    if (identityCall || processList || processCall) {
-        if (!processAuthorized) {
-            sendHTTP(fd, 401, @"Unauthorized", nil);
-            return;
-        }
-    } else if (handshake) {
-        if (!sessionAuthorized && !processAuthorized) {
-            sendHTTP(fd, 401, @"Unauthorized", nil);
-            return;
-        }
-    } else if (!sessionAuthorized) {
-        sendHTTP(fd, 401, @"Unauthorized", nil);
-        return;
-    }
-    if (processDiagnosticsBundle && processCall) {
-        NSDictionary *parameters = [request[@"params"] isKindOfClass:NSDictionary.class] ? request[@"params"] : @{};
-        NSDictionary *arguments = [parameters[@"arguments"] isKindOfClass:NSDictionary.class] ? parameters[@"arguments"] : @{};
-        NSArray *allowed = @[@"get_process_identity", @"get_capabilities", @"get_stats"];
-        NSString *name = parameters[@"name"];
-        if (!name || ![allowed containsObject:name] || ![processDiagnosticsBundle isEqual:arguments[@"bundleId"]]) {
-            sendHTTP(fd, 403, @"Forbidden", nil);
-            return;
-        }
-    }
     NSDictionary *reply;
-    if (identityCall) {
+    if (processIdentityCall(request)) {
         NSDictionary *parameters = request[@"params"];
         NSDictionary *arguments = [parameters isKindOfClass:NSDictionary.class] ? parameters[@"arguments"] : nil;
         if (![arguments isKindOfClass:NSDictionary.class]) arguments = @{};
@@ -428,33 +332,7 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         NSDictionary *result = @{@"content": @[@{@"type": @"text", @"text": text ?: @"{}"}],
                                  @"structuredContent": value, @"isError": @(![value[@"ok"] boolValue])};
         reply = @{@"jsonrpc": @"2.0", @"id": request[@"id"] ?: NSNull.null, @"result": result};
-    } else if (processAuthorized && [rpcMethod isEqualToString:@"tools/call"]) {
-        NSDictionary *parameters = [request[@"params"] isKindOfClass:NSDictionary.class] ? request[@"params"] : @{};
-        NSString *name = parameters[@"name"];
-        NSDictionary *arguments = [parameters[@"arguments"] isKindOfClass:NSDictionary.class] ? parameters[@"arguments"] : @{};
-        NSArray *sessionNames = @[@"list_sessions", @"get_session", @"read_session_events", @"get_process_identity"];
-        if (![name isKindOfClass:NSString.class] || [sessionNames containsObject:name]) {
-            sendHTTP(fd, 401, @"Unauthorized", nil);
-            return;
-        }
-        NSDictionary *value = [service forwardTool:name arguments:arguments queue:stateQueue];
-        NSDictionary *result = [value[@"content"] isKindOfClass:NSArray.class] ? value : @{
-            @"content": @[@{@"type": @"text", @"text": [[NSString alloc] initWithData:[NSJSONSerialization dataWithJSONObject:value options:0 error:NULL] encoding:NSUTF8StringEncoding] ?: @"{}"}],
-            @"structuredContent": value, @"isError": @(![value[@"ok"] boolValue])
-        };
-        reply = @{@"jsonrpc": @"2.0", @"id": request[@"id"] ?: NSNull.null, @"result": result};
-        sendHTTP(fd, 200, @"OK", reply);
-        return;
-    } else if (processList) {
-        reply = @{@"jsonrpc": @"2.0", @"id": request[@"id"] ?: NSNull.null, @"result": @{@"tools": processTools()}};
     } else {
-        if (!fromLoopback(fd) && [rpcMethod isEqualToString:@"tools/call"]) {
-            NSString *name = request[@"params"][@"name"];
-            if ([name isKindOfClass:NSString.class] && deviceWriteTool(name)) {
-                sendHTTP(fd, 403, @"Forbidden", @{@"error": @"local_forward_required"});
-                return;
-            }
-        }
         reply = rpc(request, service, stateQueue);
     }
     sendHTTP(fd, reply ? 200 : 202, reply ? @"OK" : @"Accepted", reply);
