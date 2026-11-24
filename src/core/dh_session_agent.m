@@ -3,6 +3,7 @@
 #import "dh_event.h"
 #import "dh_health.h"
 #import "log_store.h"
+#import "dh_log_json.h"
 #import "../session/idh_session_ipc.h"
 #include <os/lock.h>
 #include <stdatomic.h>
@@ -54,6 +55,27 @@ void dh_session_record(DHLogEntry *entry, BOOL update) {
                 if ([value isKindOfClass:NSString.class] && [value length] && [value length] <= 96)
                     summary[key] = value;
             }
+            // 内容字段：算法/操作/详情/输入输出大小与前缀字节，面板直接展示（边界与 daemon projectEvent 一致）
+            NSDictionary *fields = dh_log_entry_summary(entry);
+            for (NSString *key in @[@"algorithm", @"operation"]) {
+                id value = fields[key];
+                if ([value isKindOfClass:NSString.class] && [value length] && [value length] <= 48)
+                    summary[key] = value;
+            }
+            for (NSString *key in @[@"detail", @"preview"]) {
+                id value = fields[key];
+                if ([value isKindOfClass:NSString.class] && [value length])
+                    summary[key] = [value length] > 200 ? [[value substringToIndex:200] stringByAppendingString:@"…"] : value;
+            }
+            for (NSString *key in @[@"inLen", @"outLen"]) {
+                id value = fields[key];
+                if ([value isKindOfClass:NSNumber.class] && [value unsignedLongLongValue])
+                    summary[key] = value;
+            }
+            if (entry.input.length)
+                summary[@"inputHex"] = DHHexFromData([entry.input subdataWithRange:NSMakeRange(0, MIN(entry.input.length, 32))]);
+            if (entry.output.length)
+                summary[@"outputHex"] = DHHexFromData([entry.output subdataWithRange:NSMakeRange(0, MIN(entry.output.length, 32))]);
             [pending addObject:summary];
             queuePeak = MAX(queuePeak, pending.count);
             wake = pending.count == IDH_SESSION_MAX_BATCH;

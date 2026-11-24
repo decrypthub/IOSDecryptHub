@@ -123,6 +123,22 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         if ([suffix rangeOfCharacterFromSet:[[NSCharacterSet characterSetWithCharactersInString:@"0123456789"] invertedSet]].location == NSNotFound)
             event[key] = text;
     }
+    for (NSString *key in @[@"algorithm", @"operation"]) {
+        NSString *text = stringValue(input[key], 48);
+        if (text) event[key] = text;
+    }
+    for (NSString *key in @[@"detail", @"preview"]) {
+        NSString *text = stringValue(input[key], 224);
+        if (text) event[key] = text;
+    }
+    for (NSString *key in @[@"inputHex", @"outputHex"]) {
+        NSString *text = stringValue(input[key], 64);
+        if (text) event[key] = text;
+    }
+    for (NSString *key in @[@"inLen", @"outLen"]) {
+        NSNumber *count = integerValue(input[key], maxJSONInteger);
+        if (count) event[key] = count;
+    }
     return event;
 }
 
