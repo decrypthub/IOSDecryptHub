@@ -4,6 +4,7 @@
 #import "dh_health.h"
 #import "log_store.h"
 #import "dh_log_json.h"
+#import "mcp_server.h"
 #import "../session/idh_session_ipc.h"
 #include <os/lock.h>
 #include <stdatomic.h>
@@ -12,37 +13,42 @@ static dispatch_source_t syncTimer;
 static dispatch_source_t syncWake;
 static os_unfair_lock stateLock = OS_UNFAIR_LOCK_INIT;
 static atomic_bool recording;
-static NSString *sessionID;
 static NSMutableArray<NSDictionary *> *pending;
 static uint64_t nextSequence;
 static uint64_t dropped;
-static uint64_t sourceDroppedAtStart;
-static uint64_t frozenSourceDropped;
 static NSUInteger queuePeak;
-static BOOL finishing;
-static BOOL boundaryRequested;
-static NSTimeInterval leaseExpiresAt;
 
-static void attach(NSString *requested, uint64_t sourceDrops) {
+static NSString *clippedText(id value, NSUInteger maxChars) {
+    if (![value isKindOfClass:NSString.class] || ![value length]) return nil;
+    NSString *s = value;
+    return s.length > maxChars ? [[s substringToIndex:maxChars] stringByAppendingString:@"…"] : s;
+}
+
+static void setRecordingEnabled(BOOL enabled) {
     os_unfair_lock_lock(&stateLock);
-    if (requested != sessionID && ![requested isEqualToString:sessionID]) {
-        sessionID = [requested copy];
-        pending = requested ? [NSMutableArray new] : nil;
-        nextSequence = dropped = 0;
-        sourceDroppedAtStart = sourceDrops;
+    if (enabled) {
+        if (!pending) {
+            pending = [NSMutableArray new];
+            queuePeak = 0;
+        }
+        atomic_store(&recording, true);
+    } else {
+        atomic_store(&recording, false);
+        pending = nil;
         queuePeak = 0;
-        finishing = boundaryRequested = NO;
-        leaseExpiresAt = NSProcessInfo.processInfo.systemUptime + 300;
-        atomic_store(&recording, requested != nil);
     }
     os_unfair_lock_unlock(&stateLock);
+}
+
+void dh_session_agent_prepare(void) {
+    if (IDHSessionModeEnabled()) setRecordingEnabled(YES);
 }
 
 void dh_session_record(DHLogEntry *entry, BOOL update) {
     if (!atomic_load(&recording) || entry.restoredFromJournal) return;
     BOOL wake = NO;
     os_unfair_lock_lock(&stateLock);
-    if (atomic_load(&recording) && NSProcessInfo.processInfo.systemUptime < leaseExpiresAt) {
+    if (atomic_load(&recording) && pending) {
         uint64_t sequence = ++nextSequence;
         if (pending.count < IDH_SESSION_PENDING_CAPACITY) {
             NSDictionary *context = entry.eventContext;
@@ -55,57 +61,42 @@ void dh_session_record(DHLogEntry *entry, BOOL update) {
                 if ([value isKindOfClass:NSString.class] && [value length] && [value length] <= 96)
                     summary[key] = value;
             }
-            // 内容字段：算法/操作/详情/输入输出大小与前缀字节，面板直接展示（边界与 daemon projectEvent 一致）
             NSDictionary *fields = dh_log_entry_summary(entry);
-            for (NSString *key in @[@"algorithm", @"operation"]) {
-                id value = fields[key];
-                if ([value isKindOfClass:NSString.class] && [value length] && [value length] <= 48)
-                    summary[key] = value;
+            NSString *algo = clippedText(fields[@"algorithm"], 120);
+            NSString *op = clippedText(fields[@"operation"], 60);
+            NSString *detail = clippedText(fields[@"detail"], 220);
+            NSString *preview = clippedText(fields[@"preview"], 220);
+            NSString *pubInfo = clippedText(entry.publicKeyInfo, 220);
+            if (algo) summary[@"algorithm"] = algo;
+            if (op) summary[@"operation"] = op;
+            if (detail) summary[@"detail"] = detail;
+            if (preview) summary[@"preview"] = preview;
+            if (pubInfo) summary[@"publicKeyInfo"] = pubInfo;
+            if (entry.input && (entry.input.length || entry.category <= DHCategoryAsymmetric))
+                summary[@"inLen"] = @(entry.input.length);
+            if (entry.output && (entry.output.length || entry.category <= DHCategoryAsymmetric))
+                summary[@"outLen"] = @(entry.output.length);
+            if (entry.key.length) {
+                summary[@"keyLen"] = @(entry.key.length);
+                summary[@"keyHex"] = DHHexFromData([entry.key subdataWithRange:NSMakeRange(0, MIN(entry.key.length, 64))]);
             }
-            for (NSString *key in @[@"detail", @"preview"]) {
-                id value = fields[key];
-                if ([value isKindOfClass:NSString.class] && [value length])
-                    summary[key] = [value length] > 200 ? [[value substringToIndex:200] stringByAppendingString:@"…"] : value;
-            }
-            for (NSString *key in @[@"inLen", @"outLen"]) {
-                id value = fields[key];
-                if ([value isKindOfClass:NSNumber.class] && [value unsignedLongLongValue])
-                    summary[key] = value;
+            if (entry.iv.length) {
+                summary[@"ivLen"] = @(entry.iv.length);
+                summary[@"ivHex"] = DHHexFromData([entry.iv subdataWithRange:NSMakeRange(0, MIN(entry.iv.length, 32))]);
             }
             if (entry.input.length)
-                summary[@"inputHex"] = DHHexFromData([entry.input subdataWithRange:NSMakeRange(0, MIN(entry.input.length, 32))]);
+                summary[@"inputHex"] = DHHexFromData([entry.input subdataWithRange:NSMakeRange(0, MIN(entry.input.length, 256))]);
             if (entry.output.length)
-                summary[@"outputHex"] = DHHexFromData([entry.output subdataWithRange:NSMakeRange(0, MIN(entry.output.length, 32))]);
+                summary[@"outputHex"] = DHHexFromData([entry.output subdataWithRange:NSMakeRange(0, MIN(entry.output.length, 256))]);
             [pending addObject:summary];
             queuePeak = MAX(queuePeak, pending.count);
-            wake = pending.count == IDH_SESSION_MAX_BATCH;
+            wake = (pending.count == 1 || pending.count == IDH_SESSION_MAX_BATCH);
         } else {
             dropped++;
         }
     }
     os_unfair_lock_unlock(&stateLock);
-    if (wake) dispatch_source_merge_data(syncWake, 1);
-}
-
-static void requestBoundary(DHLogStore *store, NSString *requested) {
-    os_unfair_lock_lock(&stateLock);
-    BOOL schedule = !boundaryRequested && [sessionID isEqualToString:requested];
-    if (schedule) boundaryRequested = YES;
-    os_unfair_lock_unlock(&stateLock);
-    if (!schedule) return;
-
-    [store enqueueSessionBoundary:^{
-        uint64_t sourceDrops = store.droppedEventCount;
-        os_unfair_lock_lock(&stateLock);
-        BOOL applies = [sessionID isEqualToString:requested];
-        if (applies) {
-            atomic_store(&recording, false);
-            frozenSourceDropped = sourceDrops - MIN(sourceDroppedAtStart, sourceDrops);
-            finishing = YES;
-        }
-        os_unfair_lock_unlock(&stateLock);
-        if (applies) dispatch_source_merge_data(syncWake, 1);
-    }];
+    if (wake && syncWake) dispatch_source_merge_data(syncWake, 1);
 }
 
 static BOOL syncAgent(void) {
@@ -113,38 +104,42 @@ static BOOL syncAgent(void) {
     dh_in_hook = 1;
     @try {
         if (!IDHSessionModeEnabled()) {
-            attach(nil, 0);
+            setRecordingEnabled(NO);
             return NO;
         }
         DHLogStore *store = [DHLogStore shared];
-        uint64_t sourceDrops = store.droppedEventCount;
         NSMutableArray *categories = [NSMutableArray array];
         for (NSInteger category = DHCategoryDigest; category <= DHCategoryOther; category++) {
             if (![store isPausedForCategory:category]) [categories addObject:@(category)];
         }
         os_unfair_lock_lock(&stateLock);
         NSUInteger length = MIN(pending.count, IDH_SESSION_MAX_BATCH);
-        NSArray<NSDictionary *> *batch = length ? [pending subarrayWithRange:NSMakeRange(0, length)] : @[];
+        if (!length) {
+            os_unfair_lock_unlock(&stateLock);
+            return NO;
+        }
+        NSArray<NSDictionary *> *batch = [pending subarrayWithRange:NSMakeRange(0, length)];
         uint64_t latest = nextSequence;
-        uint64_t sourceDelta = finishing ? frozenSourceDropped : sourceDrops - MIN(sourceDroppedAtStart, sourceDrops);
         NSMutableDictionary *request = [@{
             @"action": @"agent_sync", @"processGeneration": DHProcessGeneration(),
             @"agentBuild": @DH_VERSION_STR, @"paused": @(store.paused), @"enabledCategories": categories,
-            @"sessionId": sessionID ?: @"", @"events": batch, @"canConfirmTail": @YES,
-            @"dropped": @(dropped), @"sourceDropped": @(sourceDelta), @"queuePeak": @(queuePeak),
+            @"events": batch, @"dropped": @(dropped),
+            @"sourceDropped": @(store.droppedEventCount), @"queuePeak": @(queuePeak),
         } mutableCopy];
-        if (finishing && pending.count == length) request[@"finalSeq"] = @(latest);
         os_unfair_lock_unlock(&stateLock);
+
+        while (length > 1) {
+            NSData *probe = [NSJSONSerialization dataWithJSONObject:request options:0 error:NULL];
+            if (probe.length && probe.length <= IDH_SESSION_MAX_MESSAGE - 4096) break;
+            length /= 2;
+            request[@"events"] = [batch subarrayWithRange:NSMakeRange(0, length)];
+        }
+
         NSDictionary *reply = IDHSessionRequest(request);
-        if (![reply[@"ok"] boolValue]) return NO;
-        NSString *wanted = [reply[@"sessionId"] isKindOfClass:NSString.class] ? reply[@"sessionId"] : nil;
-        if (![wanted isEqualToString:request[@"sessionId"]]) {
-            attach(wanted, sourceDrops);
-            if ([reply[@"draining"] boolValue]) requestBoundary(store, wanted);
+        if (![reply[@"ok"] boolValue]) {
+            if ([reply[@"error"] isEqualToString:@"scope_or_mode_disabled"]) setRecordingEnabled(NO);
             return NO;
         }
-        if ([reply[@"draining"] boolValue]) requestBoundary(store, wanted);
-
         NSNumber *lastSeq = reply[@"lastSeq"];
         if (![lastSeq isKindOfClass:NSNumber.class]) return NO;
         uint64_t acknowledged = lastSeq.unsignedLongLongValue;
@@ -156,7 +151,7 @@ static BOOL syncAgent(void) {
             count++;
         }
         if (count) [pending removeObjectsInRange:NSMakeRange(0, count)];
-        BOOL more = count && (pending.count || (finishing && !request[@"finalSeq"]));
+        BOOL more = count && pending.count > 0;
         os_unfair_lock_unlock(&stateLock);
         return more;
     } @finally {
@@ -171,19 +166,62 @@ static void drain(void) {
             if (!syncAgent()) return;
         }
     }
-    dispatch_source_merge_data(syncWake, 1);
+    if (syncWake) dispatch_source_merge_data(syncWake, 1);
+}
+
+static void performCall(NSDictionary *call) {
+    NSString *generation = call[@"processGeneration"];
+    if (![generation isKindOfClass:NSString.class] || ![generation isEqualToString:DHProcessGeneration()]) {
+        IDHSessionRequest(@{@"action": @"agent_result", @"processGeneration": DHProcessGeneration(),
+                            @"id": call[@"id"] ?: @"", @"result": @{@"ok": @NO, @"error": @"stale_generation"}});
+        return;
+    }
+    NSDictionary *message = @{@"jsonrpc": @"2.0", @"id": call[@"id"] ?: @"", @"method": @"tools/call",
+                              @"params": @{@"name": call[@"name"] ?: @"", @"arguments": call[@"arguments"] ?: @{}}};
+    NSDictionary *handled = [MCPServer handleMessage:message];
+    NSDictionary *result = handled[@"result"];
+    if (![result isKindOfClass:NSDictionary.class]) result = @{@"ok": @NO, @"error": @"no_result"};
+    NSData *encoded = [NSJSONSerialization dataWithJSONObject:result options:0 error:NULL];
+    if (!encoded || encoded.length > IDH_SESSION_MAX_MESSAGE / 2)
+        result = @{@"ok": @NO, @"error": @"too_large"};
+    IDHSessionRequest(@{@"action": @"agent_result", @"processGeneration": DHProcessGeneration(),
+                        @"id": call[@"id"] ?: @"", @"result": result});
+}
+
+static BOOL announcePresence(void) {
+    int saved = dh_in_hook;
+    dh_in_hook = 1;
+    @try {
+        NSDictionary *reply = IDHSessionRequest(@{@"action": @"agent_presence",
+                                                  @"processGeneration": DHProcessGeneration(),
+                                                  @"agentBuild": @DH_VERSION_STR});
+        NSDictionary *call = [reply[@"call"] isKindOfClass:NSDictionary.class] ? reply[@"call"] : nil;
+        if (call) performCall(call);
+        return [reply[@"ok"] boolValue];
+    } @finally {
+        dh_in_hook = saved;
+    }
+}
+
+static void tick(void) {
+    BOOL inScope = announcePresence();
+    if (!inScope || !IDHSessionModeEnabled()) {
+        setRecordingEnabled(NO);
+        return;
+    }
+    setRecordingEnabled(YES);
+    drain();
 }
 
 BOOL dh_session_agent_start(void) {
-    if (!IDHSessionModeEnabled()) return NO;
     dispatch_queue_t queue = dispatch_queue_create("com.iosdecrypthub.session.agent", DISPATCH_QUEUE_SERIAL);
     syncWake = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_ADD, 0, 0, queue);
     dispatch_source_set_event_handler(syncWake, ^{ drain(); });
     dispatch_resume(syncWake);
     syncTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
     dispatch_source_set_timer(syncTimer, DISPATCH_TIME_NOW, NSEC_PER_SEC / 2, NSEC_PER_SEC / 10);
-    dispatch_source_set_event_handler(syncTimer, ^{ drain(); });
+    dispatch_source_set_event_handler(syncTimer, ^{ tick(); });
     dispatch_resume(syncTimer);
-    return YES;
+    return IDHSessionModeEnabled();
 }
 #endif

@@ -56,6 +56,9 @@ static NSString *sym_op_name(CCOperation o) {
 static NSString *sym_full_name(CCAlgorithm alg, NSInteger keyLenBytes, CCMode mode, CCPadding pad) {
     NSString *algo = sym_alg_name(alg);
     NSInteger bits = keyLenBytes * 8;
+    if (alg == kCCAlgorithmRC4) {
+        return bits > 0 ? [NSString stringWithFormat:@"RC4-%ld", (long)bits] : @"RC4";
+    }
     if (alg == kCCAlgorithmAES && (bits == 128 || bits == 192 || bits == 256)) {
         algo = [NSString stringWithFormat:@"AES-%ld", (long)bits];
     }
@@ -91,7 +94,7 @@ static CCCryptorStatus hooked_CCCrypt(CCOperation op, CCAlgorithm alg, CCOptions
     e.algorithm  = sym_full_name(alg, keyLength, mode, pad);
     e.operation  = sym_op_name(op);
     e.key        = key ? [NSData dataWithBytes:key length:keyLength] : nil;
-    e.iv         = (iv && mode != kCCModeECB) ? [NSData dataWithBytes:iv length:ivLen] : nil;
+    e.iv         = (iv && mode != kCCModeECB && alg != kCCAlgorithmRC4) ? [NSData dataWithBytes:iv length:ivLen] : nil;
     e.input      = dataIn ? [NSData dataWithBytes:dataIn length:dataInLength] : nil;
     if (s == kCCSuccess && dataOut && dataOutMoved) {
         e.output = [NSData dataWithBytes:dataOut length:*dataOutMoved];

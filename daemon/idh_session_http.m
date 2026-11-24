@@ -3,45 +3,31 @@
 #import "idh_device_apps.h"
 #import "panel_html.h"
 #import "../src/session/idh_session_ipc.h"
-#include <arpa/inet.h>
 #include <errno.h>
 #include <sys/socket.h>
 
-static void sendData(int fd, NSString *type, NSData *body);
-
-static BOOL processIdentityCall(NSDictionary *request) {
-    if (![request[@"method"] isEqualToString:@"tools/call"]) return NO;
-    NSDictionary *parameters = request[@"params"];
-    return [parameters isKindOfClass:NSDictionary.class] &&
-        [parameters[@"name"] isEqualToString:@"get_process_identity"];
-}
-
 static NSArray *tools(void) {
-    NSDictionary *identity = @{@"type": @"string", @"description": @"Session ID returned by list_sessions"};
     return @[
-        @{@"name": @"list_sessions", @"description": @"List recent device observation sessions.",
+        @{@"name": @"list_installed_apps", @"description": @"List installed apps, current injection scope, and per-app stored event summaries.",
           @"inputSchema": @{@"type": @"object", @"properties": @{}}},
-        @{@"name": @"get_session", @"description": @"Read a session and its completion and loss status.",
-          @"inputSchema": @{@"type": @"object", @"properties": @{@"session_id": identity}, @"required": @[@"session_id"]}},
-        @{@"name": @"read_session_events", @"description": @"Page through retained event summaries in ascending session sequence.",
-          @"inputSchema": @{@"type": @"object", @"required": @[@"session_id"], @"properties": @{
-              @"session_id": identity, @"after_seq": @{@"type": @"integer", @"minimum": @0},
-              @"limit": @{@"type": @"integer", @"minimum": @1, @"maximum": @100},
+        @{@"name": @"read_app_events", @"description": @"Read an app's stored events. Omit after/before to read the latest slice; pass before=oldestSeq to page older events, or after=latestSeq to poll newer events.",
+          @"inputSchema": @{@"type": @"object", @"required": @[@"bundle_id"], @"properties": @{
+              @"bundle_id": @{@"type": @"string", @"description": @"App bundle identifier"},
+              @"categories": @{@"type": @"array", @"items": @{@"type": @"integer", @"minimum": @0, @"maximum": @8}},
+              @"after": @{@"type": @"integer", @"minimum": @0},
+              @"before": @{@"type": @"integer", @"minimum": @1},
+              @"limit": @{@"type": @"integer", @"minimum": @1, @"maximum": @500},
           }}},
-        @{@"name": @"list_installed_apps", @"description": @"List installed apps with running state and the current injection scope.",
-          @"inputSchema": @{@"type": @"object", @"properties": @{}}},
+        @{@"name": @"clear_app_events", @"description": @"Delete all stored events on the device for one app bundle.",
+          @"inputSchema": @{@"type": @"object", @"required": @[@"bundleId"], @"properties": @{
+              @"bundleId": @{@"type": @"string"},
+          }}},
         @{@"name": @"get_injection_scope", @"description": @"Read the enabled bundle list the loader injects into.",
           @"inputSchema": @{@"type": @"object", @"properties": @{}}},
         @{@"name": @"set_injection_scope", @"description": @"Add or remove bundle IDs from the injection scope (writes take effect on next app launch).",
           @"inputSchema": @{@"type": @"object", @"properties": @{
               @"add": @{@"type": @"array", @"items": @{@"type": @"string"}},
               @"remove": @{@"type": @"array", @"items": @{@"type": @"string"}},
-          }}},
-        @{@"name": @"read_app_events", @"description": @"Page through one app's merged event timeline across all its sessions.",
-          @"inputSchema": @{@"type": @"object", @"required": @[@"bundle_id"], @"properties": @{
-              @"bundle_id": @{@"type": @"string", @"description": @"App bundle identifier"},
-              @"after": @{@"type": @"integer", @"minimum": @0},
-              @"limit": @{@"type": @"integer", @"minimum": @1, @"maximum": @500},
           }}},
         @{@"name": @"relaunch_app", @"description": @"Kill a target app by bundle ID and reopen it so scope changes apply.",
           @"inputSchema": @{@"type": @"object", @"required": @[@"bundleId"], @"properties": @{
@@ -57,6 +43,7 @@ static NSArray *tools(void) {
 }
 
 static void sendHTTP(int fd, int code, NSString *description, NSDictionary *value);
+static void sendData(int fd, NSString *type, NSData *body);
 
 static NSString *queryValue(NSString *query, NSString *key) {
     for (NSString *part in [query componentsSeparatedByString:@"&"]) {
@@ -80,8 +67,7 @@ static void sendBody(int fd, int code, NSString *description, NSString *type, NS
 
 static void sendResult(int fd, NSDictionary *value) {
     BOOL ok = [value[@"ok"] boolValue];
-    int code = ok ? 200 : ([value[@"error"] isEqualToString:@"unknown_session"] ? 404 : 400);
-    sendHTTP(fd, code, ok ? @"OK" : @"Error", value);
+    sendHTTP(fd, ok ? 200 : 400, ok ? @"OK" : @"Error", value);
 }
 
 static NSString *targetPath(NSString *target) {
@@ -96,34 +82,9 @@ static NSString *targetQuery(NSString *target) {
 
 static BOOL serveSessions(int fd, NSString *target, IDHSessionService *service, dispatch_queue_t stateQueue) {
     NSString *path = targetPath(target);
-    NSString *query = targetQuery(target);
-    NSArray<NSString *> *parts = [path componentsSeparatedByString:@"/"];
-    if (parts.count < 3 || parts.firstObject.length || ![parts[1] isEqualToString:@"api"] ||
-        ![parts[2] isEqualToString:@"sessions"]) return NO;
-    if (parts.count == 3) {
-        __block NSDictionary *value;
-        dispatch_sync(stateQueue, ^{ value = [service read:@"list_sessions" arguments:@{}]; });
-        sendResult(fd, value);
-        return YES;
-    }
-    if (parts.count > 5 || !parts[3].length || (parts.count == 5 && ![parts[4] isEqualToString:@"events"])) {
-        sendHTTP(fd, 404, @"Not Found", nil);
-        return YES;
-    }
-    NSString *sessionID = parts[3];
-    if (parts.count == 4) {
-        __block NSDictionary *value;
-        dispatch_sync(stateQueue, ^{ value = [service read:@"get_session" arguments:@{@"session_id": sessionID}]; });
-        sendResult(fd, value);
-        return YES;
-    }
-    NSString *after = queryValue(query, @"after_seq");
-    NSString *limit = queryValue(query, @"limit");
-    NSMutableDictionary *arguments = [@{@"session_id": sessionID} mutableCopy];
-    if (after) arguments[@"after_seq"] = @([after longLongValue]);
-    if (limit) arguments[@"limit"] = @([limit longLongValue]);
+    if (![path isEqualToString:@"/api/sessions"]) return NO;
     __block NSDictionary *value;
-    dispatch_sync(stateQueue, ^{ value = [service read:@"read_session_events" arguments:arguments]; });
+    dispatch_sync(stateQueue, ^{ value = [service read:@"list_sessions" arguments:@{}]; });
     sendResult(fd, value);
     return YES;
 }
@@ -136,7 +97,7 @@ static BOOL serveApps(int fd, NSString *target, IDHSessionService *service, disp
         ![parts[2] isEqualToString:@"apps"]) return NO;
     if (parts.count == 3) {
         __block NSDictionary *value;
-        dispatch_sync(stateQueue, ^{ value = idh_apps_list(); });
+        dispatch_sync(stateQueue, ^{ value = [service read:@"list_installed_apps" arguments:@{}]; });
         sendResult(fd, value);
         return YES;
     }
@@ -159,10 +120,27 @@ static BOOL serveApps(int fd, NSString *target, IDHSessionService *service, disp
         return YES;
     }
     NSString *after = queryValue(query, @"after");
+    NSString *before = queryValue(query, @"before");
     NSString *limit = queryValue(query, @"limit");
+    NSString *catsRaw = [queryValue(query, @"categories") stringByRemovingPercentEncoding];
     NSMutableDictionary *arguments = [@{@"bundle_id": bundle} mutableCopy];
-    if (after) arguments[@"after"] = @([after longLongValue]);
-    if (limit) arguments[@"limit"] = @([limit longLongValue]);
+    if (after.length) arguments[@"after"] = @([after longLongValue]);
+    if (before.length) arguments[@"before"] = @([before longLongValue]);
+    if (limit.length) arguments[@"limit"] = @([limit longLongValue]);
+    if (catsRaw.length) {
+        NSMutableArray<NSNumber *> *cats = [NSMutableArray array];
+        for (NSString *tok in [catsRaw componentsSeparatedByString:@","]) {
+            if (!tok.length) continue;
+            NSScanner *sc = [NSScanner scannerWithString:tok];
+            NSInteger c = -1;
+            if (![sc scanInteger:&c] || !sc.isAtEnd || c < 0 || c > 8) {
+                sendHTTP(fd, 400, @"Bad Request", @{@"ok": @NO, @"error": @"invalid_categories"});
+                return YES;
+            }
+            [cats addObject:@(c)];
+        }
+        if (cats.count) arguments[@"categories"] = cats;
+    }
     __block NSDictionary *value;
     dispatch_sync(stateQueue, ^{ value = [service read:@"read_app_events" arguments:arguments]; });
     sendResult(fd, value);
@@ -281,15 +259,15 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         sendHTTP(fd, 200, @"OK", health);
         return;
     }
-    BOOL sessionRead = [method isEqualToString:@"GET"] &&
-        ([path isEqualToString:@"/api/sessions"] || [path hasPrefix:@"/api/sessions/"]);
+    BOOL sessionRead = [method isEqualToString:@"GET"] && [path isEqualToString:@"/api/sessions"];
     BOOL settingsRoute = [target isEqualToString:@"/api/session-settings"];
     BOOL settingsRead = settingsRoute && [method isEqualToString:@"GET"];
     BOOL appsRead = [method isEqualToString:@"GET"] && [path hasPrefix:@"/api/apps"];
     BOOL scopeRoute = [path isEqualToString:@"/api/injection-scope"];
     BOOL scopeRead = scopeRoute && [method isEqualToString:@"GET"];
     BOOL relaunchRoute = [method isEqualToString:@"POST"] && [path isEqualToString:@"/api/apps/relaunch"];
-    if (!sessionRead && !settingsRoute && !appsRead && !scopeRoute && !relaunchRoute &&
+    BOOL clearRoute = [method isEqualToString:@"POST"] && [path isEqualToString:@"/api/apps/clear"];
+    if (!sessionRead && !settingsRoute && !appsRead && !scopeRoute && !relaunchRoute && !clearRoute &&
         ![path isEqualToString:@"/api/mcp"]) {
         sendHTTP(fd, 404, @"Not Found", nil);
         return;
@@ -361,39 +339,31 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
         sendSettings(fd, saved);
         return;
     }
-    if (scopeRoute || relaunchRoute) {
+    if (scopeRoute || relaunchRoute || clearRoute) {
         if (![request isKindOfClass:NSDictionary.class]) {
             sendHTTP(fd, 400, @"Bad Request", nil);
             return;
         }
         __block NSDictionary *value;
         dispatch_sync(stateQueue, ^{
-            value = scopeRoute
-                ? idh_scope_apply([request[@"add"] isKindOfClass:NSArray.class] ? request[@"add"] : @[],
-                                  [request[@"remove"] isKindOfClass:NSArray.class] ? request[@"remove"] : @[])
-                : idh_app_relaunch(request[@"bundleId"]);
+            if (scopeRoute) {
+                value = idh_scope_apply([request[@"add"] isKindOfClass:NSArray.class] ? request[@"add"] : @[],
+                                        [request[@"remove"] isKindOfClass:NSArray.class] ? request[@"remove"] : @[]);
+            } else if (relaunchRoute) {
+                value = idh_app_relaunch(request[@"bundleId"]);
+            } else {
+                value = [service read:@"clear_app_events" arguments:@{@"bundleId": request[@"bundleId"] ?: @""}];
+            }
         });
         sendResult(fd, value);
         return;
     }
     if (![request isKindOfClass:NSDictionary.class]) {
-        sendHTTP(fd, 200, @"OK", rpcError(nil, -32700, @"Invalid JSON-RPC message"));
+        sendHTTP(fd, 400, @"Bad Request", @{@"jsonrpc": @"2.0", @"id": NSNull.null,
+                 @"error": @{@"code": @(-32700), @"message": @"Parse error"}});
         return;
     }
-    NSDictionary *reply;
-    if (processIdentityCall(request)) {
-        NSDictionary *parameters = request[@"params"];
-        NSDictionary *arguments = [parameters isKindOfClass:NSDictionary.class] ? parameters[@"arguments"] : nil;
-        if (![arguments isKindOfClass:NSDictionary.class]) arguments = @{};
-        __block NSDictionary *value;
-        dispatch_sync(stateQueue, ^{ value = [service processIdentity:arguments]; });
-        NSData *encoded = [NSJSONSerialization dataWithJSONObject:value options:0 error:NULL];
-        NSString *text = [[NSString alloc] initWithData:encoded encoding:NSUTF8StringEncoding];
-        NSDictionary *result = @{@"content": @[@{@"type": @"text", @"text": text ?: @"{}"}],
-                                 @"structuredContent": value, @"isError": @(![value[@"ok"] boolValue])};
-        reply = @{@"jsonrpc": @"2.0", @"id": request[@"id"] ?: NSNull.null, @"result": result};
-    } else {
-        reply = rpc(request, service, stateQueue);
-    }
-    sendHTTP(fd, reply ? 200 : 202, reply ? @"OK" : @"Accepted", reply);
+    NSDictionary *reply = rpc(request, service, stateQueue);
+    if (reply) sendHTTP(fd, 200, @"OK", reply);
+    else sendHTTP(fd, 202, @"Accepted", nil);
 }

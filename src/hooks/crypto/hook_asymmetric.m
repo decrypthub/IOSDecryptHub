@@ -51,6 +51,53 @@ static NSString *describe_key(SecKeyRef key) {
     return out;
 }
 
+static NSUInteger sec_key_bits(SecKeyRef key, NSString **outType) {
+    if (outType) *outType = nil;
+    if (!key) return 0;
+    NSUInteger bits = 0;
+    NSString *type = nil;
+    CFDictionaryRef attrs = SecKeyCopyAttributes(key);
+    if (attrs) {
+        NSDictionary *d = (__bridge_transfer NSDictionary *)attrs;
+        type = d[(__bridge NSString *)kSecAttrKeyType];
+        NSNumber *sz = d[(__bridge NSString *)kSecAttrKeySizeInBits];
+        if (sz.unsignedIntegerValue) bits = sz.unsignedIntegerValue;
+    }
+    if (!bits && (!type || [type isEqual:(__bridge NSString *)kSecAttrKeyTypeRSA])) {
+        bits = SecKeyGetBlockSize(key) * 8;
+    }
+    if (outType) {
+        if ([type isEqual:(__bridge NSString *)kSecAttrKeyTypeRSA]) *outType = @"RSA";
+        else if ([type isEqual:(__bridge NSString *)kSecAttrKeyTypeECSECPrimeRandom]) *outType = @"ECDSA";
+    }
+    return bits;
+}
+
+static NSString *sec_alg_name(SecKeyAlgorithm algorithm, SecKeyRef key) {
+    NSString *raw = (__bridge NSString *)algorithm ?: @"";
+    for (NSString *prefix in @[@"algid:sign:", @"algid:encrypt:", @"algid:keyexchange:"]) {
+        if ([raw hasPrefix:prefix]) { raw = [raw substringFromIndex:prefix.length]; break; }
+    }
+    raw = [raw stringByReplacingOccurrencesOfString:@":message-" withString:@":"];
+    raw = [raw stringByReplacingOccurrencesOfString:@":digest-" withString:@":"];
+    NSArray<NSString *> *parts = [raw componentsSeparatedByString:@":"];
+    NSString *keyType = nil;
+    NSUInteger bits = sec_key_bits(key, &keyType);
+    NSString *head = parts.firstObject.length ? parts.firstObject : (keyType ?: @"Asym");
+    NSString *headWithBits = bits ? [NSString stringWithFormat:@"%@-%lu", head, (unsigned long)bits] : head;
+    if (parts.count <= 1) return headWithBits;
+    NSString *rest = [[parts subarrayWithRange:NSMakeRange(1, parts.count - 1)] componentsJoinedByString:@"-"];
+    return [NSString stringWithFormat:@"%@-%@", headWithBits, rest];
+}
+
+static NSString *sec_legacy_alg_name(SecKeyRef key, NSString *padName) {
+    NSString *keyType = nil;
+    NSUInteger bits = sec_key_bits(key, &keyType);
+    NSString *head = keyType ?: @"RSA";
+    if (bits) head = [NSString stringWithFormat:@"%@-%lu", head, (unsigned long)bits];
+    return [NSString stringWithFormat:@"%@-%@", head, padName];
+}
+
 // ---------- SecKeyCreateSignature ----------
 static CFDataRef (*orig_SecKeyCreateSignature)(SecKeyRef, SecKeyAlgorithm, CFDataRef, CFErrorRef *);
 static CFDataRef hooked_SecKeyCreateSignature(SecKeyRef key, SecKeyAlgorithm algorithm,
@@ -59,7 +106,7 @@ static CFDataRef hooked_SecKeyCreateSignature(SecKeyRef key, SecKeyAlgorithm alg
     if (!dh_capture_sub_enabled(DH_CAP_ASYMMETRIC)) return out;
     DHLogEntry *e = [DHLogEntry new];
     e.category   = DHCategoryAsymmetric;
-    e.algorithm  = [NSString stringWithFormat:@"SIGN-%@", (__bridge NSString *)algorithm];
+    e.algorithm  = sec_alg_name(algorithm, key);
     e.operation  = @"sign";
     e.publicKeyInfo = describe_key(key);
     e.input      = dataToSign ? (__bridge NSData *)dataToSign : nil;
@@ -79,7 +126,7 @@ static Boolean hooked_SecKeyVerifySignature(SecKeyRef key, SecKeyAlgorithm algor
     if (!dh_capture_sub_enabled(DH_CAP_ASYMMETRIC)) return ok;
     DHLogEntry *e = [DHLogEntry new];
     e.category   = DHCategoryAsymmetric;
-    e.algorithm  = [NSString stringWithFormat:@"VERIFY-%@", (__bridge NSString *)algorithm];
+    e.algorithm  = sec_alg_name(algorithm, key);
     e.operation  = ok ? @"verify (ok)" : @"verify (fail)";
     e.publicKeyInfo = describe_key(key);
     e.input      = signedData ? (__bridge NSData *)signedData : nil;
@@ -98,7 +145,7 @@ static CFDataRef hooked_SecKeyCreateEncryptedData(SecKeyRef key, SecKeyAlgorithm
     if (!dh_capture_sub_enabled(DH_CAP_ASYMMETRIC)) return out;
     DHLogEntry *e = [DHLogEntry new];
     e.category   = DHCategoryAsymmetric;
-    e.algorithm  = [NSString stringWithFormat:@"ENC-%@", (__bridge NSString *)algorithm];
+    e.algorithm  = sec_alg_name(algorithm, key);
     e.operation  = @"encrypt";
     e.publicKeyInfo = describe_key(key);
     e.input      = plaintext ? (__bridge NSData *)plaintext : nil;
@@ -117,7 +164,7 @@ static CFDataRef hooked_SecKeyCreateDecryptedData(SecKeyRef key, SecKeyAlgorithm
     if (!dh_capture_sub_enabled(DH_CAP_ASYMMETRIC)) return out;
     DHLogEntry *e = [DHLogEntry new];
     e.category   = DHCategoryAsymmetric;
-    e.algorithm  = [NSString stringWithFormat:@"DEC-%@", (__bridge NSString *)algorithm];
+    e.algorithm  = sec_alg_name(algorithm, key);
     e.operation  = @"decrypt";
     e.publicKeyInfo = describe_key(key);
     e.input      = ciphertext ? (__bridge NSData *)ciphertext : nil;
@@ -158,7 +205,7 @@ static OSStatus hooked_SecKeyEncrypt(SecKeyRef key, SecPadding padding,
     if (dh_capture_sub_enabled(DH_CAP_ASYMMETRIC) && plain && plainLen > 0) {
         DHLogEntry *e = [DHLogEntry new];
         e.category   = DHCategoryAsymmetric;
-        e.algorithm  = [NSString stringWithFormat:@"ENC-legacy:%@", dh_padding_name(padding)];
+        e.algorithm  = sec_legacy_alg_name(key, dh_padding_name(padding));
         e.operation  = @"encrypt";
         e.publicKeyInfo = describe_key(key);
         e.input      = [NSData dataWithBytes:plain length:plainLen];
@@ -179,7 +226,7 @@ static OSStatus hooked_SecKeyDecrypt(SecKeyRef key, SecPadding padding,
     if (dh_capture_sub_enabled(DH_CAP_ASYMMETRIC) && cipher && cipherLen > 0) {
         DHLogEntry *e = [DHLogEntry new];
         e.category   = DHCategoryAsymmetric;
-        e.algorithm  = [NSString stringWithFormat:@"DEC-legacy:%@", dh_padding_name(padding)];
+        e.algorithm  = sec_legacy_alg_name(key, dh_padding_name(padding));
         e.operation  = @"decrypt";
         e.publicKeyInfo = describe_key(key);
         e.input      = [NSData dataWithBytes:cipher length:cipherLen];
@@ -200,7 +247,7 @@ static OSStatus hooked_SecKeyRawSign(SecKeyRef key, SecPadding padding,
     if (dh_capture_sub_enabled(DH_CAP_ASYMMETRIC) && data && dataLen > 0) {
         DHLogEntry *e = [DHLogEntry new];
         e.category   = DHCategoryAsymmetric;
-        e.algorithm  = [NSString stringWithFormat:@"SIGN-legacy:%@", dh_padding_name(padding)];
+        e.algorithm  = sec_legacy_alg_name(key, dh_padding_name(padding));
         e.operation  = @"sign";
         e.publicKeyInfo = describe_key(key);
         e.input      = [NSData dataWithBytes:data length:dataLen];
@@ -221,7 +268,7 @@ static OSStatus hooked_SecKeyRawVerify(SecKeyRef key, SecPadding padding,
     if (dh_capture_sub_enabled(DH_CAP_ASYMMETRIC) && data && dataLen > 0) {
         DHLogEntry *e = [DHLogEntry new];
         e.category   = DHCategoryAsymmetric;
-        e.algorithm  = [NSString stringWithFormat:@"VERIFY-legacy:%@", dh_padding_name(padding)];
+        e.algorithm  = sec_legacy_alg_name(key, dh_padding_name(padding));
         e.operation  = @"verify";
         e.publicKeyInfo = describe_key(key);
         e.input      = [NSData dataWithBytes:data length:dataLen];
