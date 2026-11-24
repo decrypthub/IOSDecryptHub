@@ -20,10 +20,10 @@ for kind in ['raise','raise_state','raise_state_identity']:
  names[original]=a.prefix+'_'+original
 for path in [source,header,client,user]:
  text=path.read_text();text=re.sub(r'\b('+'|'.join(map(re.escape,names))+r')\b',lambda m:names[m[0]],text)
- path.write_text(text,encoding='utf8',newline='\n')
+ with path.open('w',encoding='utf8',newline='\n') as f: f.write(text)
 if a.protocol=='mach_exc':
  narrowHeader=out/(a.prefix+'_exc_client.h');narrowUser=out/(a.prefix+'_exc_client.c')
  subprocess.run(['xcrun','mig','-arch','arm64','-isysroot',sdk,'-server','/dev/null','-sheader','/dev/null','-user',str(narrowUser),'-header',str(narrowHeader),str(Path(sdk)/'usr/include/mach/exc.defs')],check=True)
  for path in [narrowHeader,narrowUser]:
   text=path.read_text();text=re.sub(r'\b(exception_raise(?:_state(?:_identity)?)?)\b',lambda m:a.prefix+'_'+m[0],text)
-  path.write_text(text,encoding='utf8',newline='\n')
+  with path.open('w',encoding='utf8',newline='\n') as f: f.write(text)
