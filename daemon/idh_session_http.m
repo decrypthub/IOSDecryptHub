@@ -7,6 +7,8 @@
 #include <errno.h>
 #include <sys/socket.h>
 
+static void sendData(int fd, NSString *type, NSData *body);
+
 static BOOL processIdentityCall(NSDictionary *request) {
     if (![request[@"method"] isEqualToString:@"tools/call"]) return NO;
     NSDictionary *parameters = request[@"params"];
@@ -138,13 +140,22 @@ static BOOL serveApps(int fd, NSString *target, IDHSessionService *service, disp
         sendResult(fd, value);
         return YES;
     }
-    if (parts.count != 5 || ![parts[4] isEqualToString:@"events"]) {
+    BOOL eventsRoute = parts.count == 5 && [parts[4] isEqualToString:@"events"];
+    BOOL iconRoute = parts.count == 5 && [parts[4] isEqualToString:@"icon"];
+    if (!eventsRoute && !iconRoute) {
         sendHTTP(fd, 404, @"Not Found", nil);
         return YES;
     }
     NSString *bundle = [parts[3] stringByRemovingPercentEncoding];
     if (!bundle.length) {
         sendHTTP(fd, 404, @"Not Found", nil);
+        return YES;
+    }
+    if (iconRoute) {
+        __block NSData *png;
+        dispatch_sync(stateQueue, ^{ png = idh_app_icon(bundle); });
+        if (png.length) sendData(fd, @"image/png", png);
+        else sendHTTP(fd, 404, @"Not Found", nil);
         return YES;
     }
     NSString *after = queryValue(query, @"after");
@@ -156,6 +167,16 @@ static BOOL serveApps(int fd, NSString *target, IDHSessionService *service, disp
     dispatch_sync(stateQueue, ^{ value = [service read:@"read_app_events" arguments:arguments]; });
     sendResult(fd, value);
     return YES;
+}
+
+static void sendData(int fd, NSString *type, NSData *body) {
+    NSString *header = [NSString stringWithFormat:
+        @"HTTP/1.1 200 OK\r\nContent-Length: %lu\r\nContent-Type: %@\r\n"
+         "Cache-Control: private, max-age=300\r\nConnection: close\r\n\r\n",
+        (unsigned long)body.length, type];
+    NSData *data = [header dataUsingEncoding:NSUTF8StringEncoding];
+    if (IDHSessionWriteBytes(fd, data.bytes, data.length) && body.length)
+        IDHSessionWriteBytes(fd, body.bytes, body.length);
 }
 
 static void sendHTTP(int fd, int code, NSString *description, NSDictionary *value) {

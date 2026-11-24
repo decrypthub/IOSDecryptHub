@@ -17,3 +17,6 @@ NSDictionary *idh_scope_apply(NSArray *add, NSArray *remove);
 
 // 结束指定 App 进程并用 uiopen 拉起；@{@"ok",@"relaunched",@"killed"}
 NSDictionary *idh_app_relaunch(NSString *bundleID);
+
+// 应用图标 PNG（MobileIcons/UIKit 私有类目，含 Assets.car 编译图标）；取不到返回 nil
+NSData *idh_app_icon(NSString *bundleId);

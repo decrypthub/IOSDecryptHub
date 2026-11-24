@@ -215,3 +215,40 @@ NSDictionary *idh_app_relaunch(NSString *bundleID) {
     BOOL relaunched = idh_uiopen(bundleID);
     return @{@"ok": @YES, @"relaunched": @(relaunched), @"killed": killed};
 }
+
+// UIKit 私有类目走 MobileIcons，任意进程可用；idhjd 不链 UIKit，用时 dlopen + NSInvocation。
+static id idh_uikit_icon(Class cls, NSString *bid, int format) {
+    SEL sel = @selector(_applicationIconImageForBundleIdentifier:format:scale:);
+    NSMethodSignature *sig = [cls methodSignatureForSelector:sel];
+    if (!sig) return nil;
+    NSInvocation *call = [NSInvocation invocationWithMethodSignature:sig];
+    call.selector = sel;
+    call.target = cls;
+    double scale = 3.0;
+    [call setArgument:&bid atIndex:2];
+    [call setArgument:&format atIndex:3];
+    [call setArgument:&scale atIndex:4];
+    [call invoke];
+    __unsafe_unretained id icon = nil;
+    [call getReturnValue:&icon];
+    return icon;
+}
+
+NSData *idh_app_icon(NSString *bundleId) {
+    if (![bundleId isKindOfClass:NSString.class] || !bundleId.length || bundleId.length > 255) return nil;
+    static Class UIImageClass;
+    static NSData *(*pngOf)(id) = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        if (!dlopen("/System/Library/Frameworks/UIKit.framework/UIKit", RTLD_LAZY)) return;
+        UIImageClass = NSClassFromString(@"UIImage");
+        pngOf = (NSData *(*)(id))dlsym(RTLD_DEFAULT, "UIImagePNGRepresentation");
+    });
+    if (!UIImageClass || !pngOf) return nil;
+    for (NSNumber *format in @[@2, @10]) {
+        id icon = idh_uikit_icon(UIImageClass, bundleId, format.intValue);
+        NSData *png = icon ? pngOf(icon) : nil;
+        if (png.length) return png;
+    }
+    return nil;
+}
