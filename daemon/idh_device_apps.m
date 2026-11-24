@@ -21,9 +21,27 @@ static NSString *idh_bootstrap_root(void) {
     return root.length ? root : nil;
 }
 
-static NSString *idh_config_path(void) {
+static NSArray *idh_config_candidates(void) {
+    // RootHide 的 user/501 域里进程自身路径不可解析（dladdr 给的是 .jbroot 绝对路径，
+    // 但该前缀在该域挂载视图外）；/var/jb 在所有域内都指向 jbroot，作兜底候选。
     NSString *root = idh_bootstrap_root();
-    return root.length ? [root stringByAppendingPathComponent:DH_CONFIG_REL] : nil;
+    NSMutableArray *candidates = [NSMutableArray array];
+    if (root.length) [candidates addObject:[root stringByAppendingPathComponent:DH_CONFIG_REL]];
+    [candidates addObject:[@"/var/jb" stringByAppendingPathComponent:DH_CONFIG_REL]];
+    [candidates addObject:[@"/" stringByAppendingPathComponent:DH_CONFIG_REL]];
+    return candidates;
+}
+
+static NSString *idh_config_path(void) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *path in idh_config_candidates()) {
+        NSString *dir = [path stringByDeletingLastPathComponent];
+        BOOL isDir = NO;
+        if ([fm fileExistsAtPath:dir isDirectory:&isDir] && isDir) return path;
+        if ([fm createDirectoryAtPath:dir withIntermediateDirectories:YES
+                           attributes:nil error:nil]) return path;
+    }
+    return idh_config_candidates().firstObject;
 }
 
 // bundleID -> @{name, execName, appPath, kind}
@@ -145,14 +163,15 @@ NSDictionary *idh_scope_apply(NSArray *add, NSArray *remove) {
     prefs[DH_KEY_BUNDLES] = scope;
     if (![prefs writeToFile:DH_LOADER_PREFS atomically:YES])
         return @{@"ok": @NO, @"error": @"prefs_write_failed"};
-    NSString *config = idh_config_path();
-    if (config.length) {
-        [[NSFileManager defaultManager] createDirectoryAtPath:[config stringByDeletingLastPathComponent]
+    // jb 侧 config 是 loader 的兜底镜像，尽力写：逐候选尝试，全部失败不否决已生效的 prefs。
+    // RootHide user/501 域里 jbroot 归 root，mobile 写不进，镜像未更新属预期。
+    BOOL mirrored = NO;
+    for (NSString *path in idh_config_candidates()) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:[path stringByDeletingLastPathComponent]
                                   withIntermediateDirectories:YES attributes:nil error:nil];
-        if (![scope writeToFile:config atomically:YES])
-            return @{@"ok": @NO, @"error": @"config_write_failed", @"scope": scope};
+        if ([scope writeToFile:path atomically:YES]) { mirrored = YES; break; }
     }
-    return @{@"ok": @YES, @"scope": scope};
+    return @{@"ok": @YES, @"scope": scope, @"configMirror": @(mirrored)};
 }
 
 static NSArray *idh_kill_named(NSSet *names) {
