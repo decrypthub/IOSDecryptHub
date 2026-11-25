@@ -5,6 +5,7 @@
 #import "log_store.h"
 #import "dh_log_json.h"
 #import "mcp_server.h"
+#import "http_server.h"
 #import "../session/idh_session_ipc.h"
 #include <os/lock.h>
 #include <stdatomic.h>
@@ -192,9 +193,12 @@ static BOOL announcePresence(void) {
     int saved = dh_in_hook;
     dh_in_hook = 1;
     @try {
-        NSDictionary *reply = IDHSessionRequest(@{@"action": @"agent_presence",
-                                                  @"processGeneration": DHProcessGeneration(),
-                                                  @"agentBuild": @DH_VERSION_STR});
+        NSMutableDictionary *presence = [@{@"action": @"agent_presence",
+                                           @"processGeneration": DHProcessGeneration(),
+                                           @"agentBuild": @DH_VERSION_STR} mutableCopy];
+        uint16_t httpPort = dh_http_port();
+        if (httpPort) presence[@"httpPort"] = @(httpPort);
+        NSDictionary *reply = IDHSessionRequest(presence);
         NSDictionary *call = [reply[@"call"] isKindOfClass:NSDictionary.class] ? reply[@"call"] : nil;
         if (call) performCall(call);
         return [reply[@"ok"] boolValue];

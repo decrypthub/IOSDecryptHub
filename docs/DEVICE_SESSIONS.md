@@ -4,7 +4,7 @@
 
 ## 组件分工
 
-- `idhjd`：手机常驻设备服务，固定使用 `8088`，负责设备健康、已安装应用、注入范围、App 事件存储、事件分页、按 App 清理和进程工具转发。
+- `idhjd`：手机常驻设备服务，固定使用 `8088`，负责设备健康、已安装应用、注入范围、App 事件存储、事件分页、按 App 清理、进程 MCP 转发和进程 HTTP 工具代理。
 - Agent：注入目标进程后按进程代向 `idhjd` 登记；会话模式开启且 bundle 在注入范围内时才提交事件。
 - Manager：查看设备状态和应用列表，管理注入范围，必要时重启目标 App 使新范围生效。
 - 电脑 `idh`：通过 USB 或明确配置的地址连接同一台 `idhjd`；电脑面板只是客户端，不另采数据。
@@ -26,13 +26,16 @@
 | `GET /api/apps` | 已安装应用、运行状态和注入范围摘要 |
 | `GET /api/apps/<bundle>/events` | 按 App 读取事件，可用 `after` / `before` / `limit` 分页 |
 | `GET /api/apps/<bundle>/icon` | 应用真实图标 PNG |
+| `GET/POST /api/apps/<bundle>/tools/<工具路径>` | 经 `idhjd` 访问该 App 在线进程的原版文件、符号和 Dump HTTP 接口 |
 | `GET /api/injection-scope` | 读取 loader 注入范围 |
 | `POST /api/injection-scope` | 增加或移除 bundle；下次启动目标 App 生效 |
 | `POST /api/apps/relaunch` | 结束并重新打开目标 App |
 | `POST /api/apps/clear` | 真正删除该 App 在设备上的事件记录 |
 | `POST /api/mcp` | 同一能力的 MCP 入口 |
 
-MCP 工具包括 `list_installed_apps`、`read_app_events`、`clear_app_events`、`get_injection_scope`、`set_injection_scope` 和 `relaunch_app`。`read_app_events` 不传游标时读最新一页；`after` 用于增量轮询，`before` 用于向历史翻页，`limit` 最大 500。电脑端对会改变设备状态的工具必须保留显式确认门。
+MCP 工具包括 `list_installed_apps`、`read_app_events`、`clear_app_events`、`get_injection_scope`、`set_injection_scope`、`relaunch_app` 和 `get_process_identity`。`read_app_events` 不传游标时读最新一页；`after` 用于增量轮询，`before` 用于向历史翻页，`limit` 最大 500。电脑端对会改变设备状态的工具必须保留显式确认门。
+
+进程工具代理的路径形状是 `/api/apps/<bundle>/tools/<工具路径>`；其中 `<工具路径>` 对应进程内 `/api/<工具路径>`。当前只放行原版文件、符号和 Dump：`files`、`files/preview`、`files/download`、`symbols`、`symbols/images`、`dump/images`、`dump/status`、`dump/download`、`dump/image`，以及 `POST dump`。代理按 bundle 选择唯一在线进程；多进程同包名时明确失败，不用第一个进程猜测。二进制下载经代理流式转发，不把 IPA 或文件整体读入 `idhjd` 内存。
 
 ## 事件存储
 

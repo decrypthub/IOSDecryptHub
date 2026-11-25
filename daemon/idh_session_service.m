@@ -229,7 +229,10 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
     if (!scopeContains(_scopePath, bundle)) return failure(@"scope_disabled");
     NSString *generation = identifier(message[@"processGeneration"]);
     NSString *build = stringValue(message[@"agentBuild"], 40);
-    if (!generation || !build || pid <= 1) return failure(@"invalid_agent_identity");
+    NSNumber *httpPort = integerValue(message[@"httpPort"], 65535);
+    if (!generation || !build || pid <= 1 ||
+        (message[@"httpPort"] && (!httpPort || [httpPort unsignedIntegerValue] < 1024)))
+        return failure(@"invalid_agent_identity");
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     NSMutableArray<NSString *> *replaced = [NSMutableArray new];
     for (NSString *existing in _presence) {
@@ -248,8 +251,9 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         }
         if (oldest) [_presence removeObjectForKey:oldest];
     }
-    NSDictionary *agentInfo = @{@"bundleId": bundle, @"pid": @(pid),
-                                @"processGeneration": generation, @"agentBuild": build, @"seen": @(now)};
+    NSMutableDictionary *agentInfo = [@{@"bundleId": bundle, @"pid": @(pid),
+                                        @"processGeneration": generation, @"agentBuild": build, @"seen": @(now)} mutableCopy];
+    if (httpPort) agentInfo[@"httpPort"] = httpPort;
     _presence[generation] = agentInfo;
     if (!_agents[bundle] && _agents.count >= 32) [_agents removeObjectForKey:_agents.allKeys.firstObject];
     _agents[bundle] = @{@"info": agentInfo, @"seen": @(now)};
@@ -298,8 +302,11 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
             ![other[@"processGeneration"] isEqualToString:entry[@"processGeneration"]])
             return failure(@"pid_reused");
     }
-    return @{@"ok": @YES, @"bundleId": bundle, @"pid": @(pid),
-             @"processGeneration": entry[@"processGeneration"], @"agentBuild": entry[@"agentBuild"] ?: @""};
+    NSMutableDictionary *identity = [@{@"ok": @YES, @"bundleId": bundle, @"pid": @(pid),
+                                       @"processGeneration": entry[@"processGeneration"],
+                                       @"agentBuild": entry[@"agentBuild"] ?: @""} mutableCopy];
+    if (entry[@"httpPort"]) identity[@"httpPort"] = entry[@"httpPort"];
+    return identity;
 }
 
 - (NSDictionary *)beginForwardLocked:(NSString *)name arguments:(NSDictionary *)arguments {
@@ -363,8 +370,10 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
     ]];
     NSMutableArray *apps = [NSMutableArray new];
     for (NSDictionary *entry in entries) {
-        [apps addObject:@{@"bundleId": entry[@"bundleId"], @"pid": entry[@"pid"],
-                          @"processGeneration": entry[@"processGeneration"]}];
+        NSMutableDictionary *app = [@{@"bundleId": entry[@"bundleId"], @"pid": entry[@"pid"],
+                                      @"processGeneration": entry[@"processGeneration"]} mutableCopy];
+        if (entry[@"httpPort"]) app[@"httpPort"] = entry[@"httpPort"];
+        [apps addObject:app];
     }
     return @{@"ok": @YES, @"service": @"idhjd", @"version": @1, @"apps": apps};
 }
@@ -440,6 +449,7 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         row[@"running"] = @(live != nil);
         if (live[@"pid"]) row[@"pid"] = live[@"pid"];
         if (live[@"processGeneration"]) row[@"processGeneration"] = live[@"processGeneration"];
+        if (live[@"httpPort"]) row[@"httpPort"] = live[@"httpPort"];
         [out addObject:row];
     }
     return out;
@@ -573,6 +583,7 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         }
         return @{@"ok": @YES, @"sessions": items};
     }
+    if ([tool isEqualToString:@"get_process_identity"]) return [self processIdentity:arguments];
     if ([tool isEqualToString:@"get_injection_scope"])
         return @{@"ok": @YES, @"scope": idh_scope_read() ?: @[]};
     if ([tool isEqualToString:@"set_injection_scope"]) {
