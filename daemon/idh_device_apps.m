@@ -10,6 +10,7 @@
 #include <sys/param.h>
 #include <signal.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static NSString *idh_bootstrap_root(void) {
@@ -204,7 +205,7 @@ static NSArray *idh_kill_named(NSSet *names) {
     return killed;
 }
 
-static BOOL idh_uiopen(NSString *bundleID) {
+static BOOL idh_uiopen(NSString *bundleID, NSString *execName) {
     const char *candidates[] = {"/var/jb/usr/bin/uiopen", "/usr/local/bin/uiopen", "/usr/bin/uiopen", NULL};
     NSMutableArray *paths = [NSMutableArray array];
     NSString *root = idh_bootstrap_root();
@@ -222,7 +223,14 @@ static BOOL idh_uiopen(NSString *bundleID) {
         execl(tool, tool, "--bundleid", bundleID.UTF8String, (char *)NULL);
         _exit(127);
     }
-    return YES;
+    int status = 0;
+    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    usleep(300 * 1000);
+    for (int i = 0; i < 50; i++) {
+        if (idh_name_running(execName, idh_running_names())) return YES;
+        usleep(100 * 1000);
+    }
+    return NO;
 }
 
 NSDictionary *idh_app_relaunch(NSString *bundleID) {
@@ -231,7 +239,7 @@ NSDictionary *idh_app_relaunch(NSString *bundleID) {
     NSString *execName = idh_app_map()[bundleID][@"execName"];
     if (!execName.length) return @{@"ok": @NO, @"error": @"unknown_bundle_id"};
     NSArray *killed = idh_kill_named([NSSet setWithObject:execName]);
-    BOOL relaunched = idh_uiopen(bundleID);
+    BOOL relaunched = idh_uiopen(bundleID, execName);
     return @{@"ok": @YES, @"relaunched": @(relaunched), @"killed": killed};
 }
 
