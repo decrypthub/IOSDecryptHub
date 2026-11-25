@@ -7,6 +7,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <sys/param.h>
 #include <signal.h>
 #include <sys/sysctl.h>
@@ -222,6 +223,32 @@ static void idh_finish_child(pid_t pid) {
     }
 }
 
+static BOOL idh_spawn_mobile(NSString *execPath, NSString *execName) {
+    pid_t pid = fork();
+    if (pid < 0) return NO;
+    if (pid == 0) {
+        setsid();
+        if (setgid(501) != 0 || initgroups("mobile", 501) != 0 || setuid(501) != 0) _exit(1);
+        setenv("HOME", "/var/mobile", 1);
+        setenv("TMPDIR", "/var/mobile/tmp", 1);
+        setenv("USER", "mobile", 1);
+        setenv("LOGNAME", "mobile", 1);
+        pid_t app = fork();
+        if (app == 0) {
+            execl(execPath.fileSystemRepresentation, execPath.fileSystemRepresentation, (char *)NULL);
+            _exit(127);
+        }
+        _exit(app < 0 ? 1 : 0);
+    }
+    idh_finish_child(pid);
+    usleep(300 * 1000);
+    for (int i = 0; i < 50; i++) {
+        if (idh_name_running(execName, idh_running_names())) return YES;
+        usleep(100 * 1000);
+    }
+    return NO;
+}
+
 static BOOL idh_uiopen(NSString *bundleID, NSString *execName) {
     const char *candidates[] = {"/var/jb/usr/bin/uiopen", "/usr/local/bin/uiopen", "/usr/bin/uiopen", NULL};
     NSMutableArray *paths = [NSMutableArray array];
@@ -256,10 +283,13 @@ static BOOL idh_uiopen(NSString *bundleID, NSString *execName) {
 NSDictionary *idh_app_relaunch(NSString *bundleID) {
     if (![bundleID isKindOfClass:NSString.class] || !bundleID.length || bundleID.length > 255)
         return @{@"ok": @NO, @"error": @"invalid_arguments"};
-    NSString *execName = idh_app_map()[bundleID][@"execName"];
+    NSDictionary *meta = idh_app_map()[bundleID];
+    NSString *execName = meta[@"execName"];
     if (!execName.length) return @{@"ok": @NO, @"error": @"unknown_bundle_id"};
     NSArray *killed = idh_kill_named([NSSet setWithObject:execName]);
-    BOOL relaunched = idh_uiopen(bundleID, execName);
+    BOOL relaunched = [meta[@"kind"] isEqualToString:@"jb"]
+        ? idh_spawn_mobile([meta[@"appPath"] stringByAppendingPathComponent:execName], execName)
+        : idh_uiopen(bundleID, execName);
     return @{@"ok": @YES, @"relaunched": @(relaunched), @"killed": killed};
 }
 
