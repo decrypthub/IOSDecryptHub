@@ -272,31 +272,17 @@ typedef NS_ENUM(NSInteger, DHFilter) {
 
     cell.textLabel.text = app.name;
     BOOL on = [self.enabled containsObject:app.bundleID];
-    if ([self.pendingRestart containsObject:app.bundleID]) {
-        // 改了开关还没重启：直接标在这一行上，比横幅更贴身
+    // 副标题只留 bundleID；状态标记只在偏离预期时出现：
+    // 改了开关没重启 → 需重启；已开启、进程在跑但没注上 → 未注入。
+    // 注入正常这类符合预期的状态不再在列表里重复显示。
+    if ([self.pendingRestart containsObject:app.bundleID] ||
+        (on && DHAppProcessRunning(app) && !self.injected[app.bundleID])) {
         NSMutableAttributedString *subtitle = [[NSMutableAttributedString alloc]
             initWithString:app.bundleID
                 attributes:@{ NSForegroundColorAttributeName: [UIColor secondaryLabelColor] }];
-        [subtitle appendAttributedString:[[NSAttributedString alloc]
-            initWithString:@"　需重启"
-                attributes:@{ NSForegroundColorAttributeName: [UIColor systemOrangeColor] }]];
-        cell.detailTextLabel.attributedText = subtitle;
-    } else if (on && self.injected[app.bundleID]) {
-        NSNumber *port = self.injected[app.bundleID][@"port"];
-        NSMutableAttributedString *subtitle = [[NSMutableAttributedString alloc]
-            initWithString:app.bundleID
-                attributes:@{ NSForegroundColorAttributeName: [UIColor secondaryLabelColor] }];
-        NSString *mark = port ? [NSString stringWithFormat:@"　已注入 :%@", port] : @"　已注入";
+        NSString *mark = [self.pendingRestart containsObject:app.bundleID] ? @"　需重启" : @"　未注入";
         [subtitle appendAttributedString:[[NSAttributedString alloc]
             initWithString:mark
-                attributes:@{ NSForegroundColorAttributeName: [UIColor systemGreenColor] }]];
-        cell.detailTextLabel.attributedText = subtitle;
-    } else if (on && DHAppProcessRunning(app)) {
-        NSMutableAttributedString *subtitle = [[NSMutableAttributedString alloc]
-            initWithString:app.bundleID
-                attributes:@{ NSForegroundColorAttributeName: [UIColor secondaryLabelColor] }];
-        [subtitle appendAttributedString:[[NSAttributedString alloc]
-            initWithString:IDHSessionModeEnabled() ? @"　等待 Agent 登记" : @"　未注入"
                 attributes:@{ NSForegroundColorAttributeName: [UIColor systemOrangeColor] }]];
         cell.detailTextLabel.attributedText = subtitle;
     } else {

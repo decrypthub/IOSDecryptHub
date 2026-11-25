@@ -3,10 +3,6 @@
 @interface IDHSessionService : NSObject
 - (instancetype)initWithManagerExecutable:(NSString *)path scopePreferences:(NSString *)scopePath;
 @property (nonatomic, copy) NSString *mcpStatus;
-@property (nonatomic, readonly, copy) NSString *pairingToken;
-@property (nonatomic, readonly, copy) NSString *processToken;
-@property (nonatomic, readonly, copy) NSString *processDiagnosticsBundle;
-@property (nonatomic, readonly, copy) NSString *settingsToken;
 - (void)expire;
 - (NSDictionary *)health;
 - (NSDictionary *)settingsSnapshot;

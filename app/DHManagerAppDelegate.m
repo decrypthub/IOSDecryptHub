@@ -2,6 +2,7 @@
 
 #import <UIKit/UIKit.h>
 #import "DHRootViewController.h"
+#import "DHStatusViewController.h"
 
 @interface DHManagerAppDelegate : UIResponder <UIApplicationDelegate>
 @property (nonatomic, strong) UIWindow *window;
@@ -12,9 +13,22 @@
 - (BOOL)application:(__unused UIApplication *)application
     didFinishLaunchingWithOptions:(__unused NSDictionary *)options {
     self.window = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    DHStatusViewController *status = [[DHStatusViewController alloc] init];
+    status.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"设备"
+                                                    image:[UIImage systemImageNamed:@"iphone"]
+                                                      tag:0];
     DHRootViewController *root = [[DHRootViewController alloc] initWithStyle:UITableViewStyleGrouped];
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:root];
-    self.window.rootViewController = nav;
+    root.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"应用"
+                                                  image:[UIImage systemImageNamed:@"square.grid.2x2"]
+                                                    tag:1];
+    UITabBarController *tabs = [[UITabBarController alloc] init];
+    UINavigationController *statusNav = [[UINavigationController alloc] initWithRootViewController:status];
+    UINavigationController *appsNav = [[UINavigationController alloc] initWithRootViewController:root];
+    for (UINavigationController *nav in @[statusNav, appsNav]) {
+        nav.navigationBar.prefersLargeTitles = YES;
+    }
+    tabs.viewControllers = @[statusNav, appsNav];
+    self.window.rootViewController = tabs;
     [self.window makeKeyAndVisible];
     return YES;
 }

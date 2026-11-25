@@ -99,15 +99,6 @@ static NSString *categoryText(NSUInteger category) {
                     message:reasonText(response[@"error"] ?: @"service_unavailable") preferredStyle:UIAlertControllerStyleAlert];
                 [error addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleCancel handler:nil]];
                 [self presentViewController:error animated:YES completion:nil];
-            } else if (response[@"token"]) {
-                [UIPasteboard.generalPasteboard setItems:@[@{@"public.utf8-plain-text": response[@"token"]}]
-                    options:@{UIPasteboardOptionLocalOnly: @YES,
-                              UIPasteboardOptionExpirationDate: [NSDate dateWithTimeIntervalSinceNow:120]}];
-                UIAlertController *copied = [UIAlertController alertControllerWithTitle:@"已复制只读凭证"
-                    message:@"通过已授权的调试转发连接本机 8088。重新配对或服务重启后需使用新凭证。"
-                    preferredStyle:UIAlertControllerStyleAlert];
-                [copied addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-                [self presentViewController:copied animated:YES completion:nil];
             } else if (response[@"session"]) {
                 self->_selected = response[@"session"][@"sessionId"];
             }
@@ -131,7 +122,7 @@ static NSString *categoryText(NSUInteger category) {
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section {
     switch (section) {
         case 0: return 4;
-        case 1: return [_status[@"modeEnabled"] boolValue] ? 3 : 1;
+        case 1: return [_status[@"modeEnabled"] boolValue] ? 2 : 1;
         case 2: return _events.count;
         default: return [_status[@"sessions"] count];
     }
@@ -201,7 +192,6 @@ static NSString *categoryText(NSUInteger category) {
                 cell.selectionStyle = UITableViewCellSelectionStyleNone;
             }
         }
-        if (indexPath.row == 2) cell.textLabel.text = @"复制 MCP 只读凭证";
     } else if (indexPath.section == 2) {
         NSDictionary *event = _events[indexPath.row];
         cell.textLabel.text = [NSString stringWithFormat:@"#%@ · %@%@", event[@"seq"],
@@ -236,9 +226,6 @@ static NSString *categoryText(NSUInteger category) {
                 [self perform:@{@"action": @"end", @"sessionId": _session[@"sessionId"]}];
             else
                 [self perform:@{@"action": @"start", @"sessionId": NSUUID.UUID.UUIDString.lowercaseString}];
-            break;
-        case 2:
-            [self perform:@{@"action": @"pair"}];
             break;
     }
 }

@@ -65,6 +65,9 @@ static void dh_bootstrap(void) {
     dh_noise_load([docsDir stringByAppendingPathComponent:@".dh_noise.conf"]);
     dh_spoof_load([docsDir stringByAppendingPathComponent:@".dh_spoof.conf"]);
     dh_webkit_probe_load([docsDir stringByAppendingPathComponent:@".dh_webkit_probe.conf"]);
+#if DH_DEVICE_SESSIONS
+    dh_session_agent_prepare();
+#endif
     // 安装 hook —— 尽早完成, 否则早期发生的加解密会漏抓.
     dh_install_all_hooks();
     dh_diag_append(DH_DIAG_GENERAL, "INFO", "hook 安装完成 (Digest/HMAC/对称/非对称/KDF/EVP/文件/系统)");

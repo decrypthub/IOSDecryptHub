@@ -13,6 +13,7 @@
 NSString *const IDHSessionSocketPath = @"/private/var/run/idhjd-v1.sock";
 NSString *const IDHSessionStateDirectory = @"/private/var/db/idhjd-v1";
 NSString *const IDHSessionModePath = @"/private/var/db/idhjd-v1/enabled";
+NSString *const IDHSessionRemotePath = @"/private/var/db/idhjd-v1/listen-remote";
 
 BOOL IDHSessionModeEnabled(void) {
     struct stat info;

@@ -2,9 +2,15 @@
 
 @interface IDHSessionStore : NSObject
 - (instancetype)initWithPath:(NSString *)path;
-- (BOOL)save:(NSDictionary *)session events:(NSArray<NSDictionary *> *)events;
-- (NSArray<NSDictionary *> *)sessions;
-- (NSDictionary *)session:(NSString *)sessionID;
-- (NSArray<NSDictionary *> *)eventsForSession:(NSString *)sessionID after:(uint64_t)cursor limit:(NSUInteger)limit;
-- (BOOL)prune;
+- (BOOL)appendEvents:(NSArray<NSDictionary *> *)events
+           forBundle:(NSString *)bundle
+           maxPerApp:(NSUInteger)maxPerApp;
+- (NSArray<NSDictionary *> *)appSummaries;
+- (NSDictionary *)appSummaryForBundle:(NSString *)bundle;
+- (NSDictionary *)queryEventsForBundle:(NSString *)bundle
+                            categories:(NSArray<NSNumber *> *)categories
+                                 after:(NSNumber *)after
+                                before:(NSNumber *)before
+                                 limit:(NSUInteger)limit;
+- (NSDictionary *)clearEventsForBundle:(NSString *)bundle;
 @end
