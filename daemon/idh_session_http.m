@@ -4,7 +4,11 @@
 #import "panel_html.h"
 #import "../src/session/idh_session_ipc.h"
 #include <errno.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 static NSArray *tools(void) {
     return @[
@@ -78,6 +82,136 @@ static NSString *targetPath(NSString *target) {
 static NSString *targetQuery(NSString *target) {
     NSRange split = [target rangeOfString:@"?"];
     return split.location == NSNotFound ? @"" : [target substringFromIndex:NSMaxRange(split)];
+}
+
+static BOOL parseToolsRoute(NSString *path, NSString **bundle, NSString **toolPath) {
+    NSArray<NSString *> *parts = [path componentsSeparatedByString:@"/"];
+    if (parts.count < 6 || parts.firstObject.length || ![parts[1] isEqualToString:@"api"] ||
+        ![parts[2] isEqualToString:@"apps"] || ![parts[4] isEqualToString:@"tools"]) return NO;
+    NSString *bundlePart = [parts[3] stringByRemovingPercentEncoding];
+    NSString *tool = [[parts subarrayWithRange:NSMakeRange(5, parts.count - 5)] componentsJoinedByString:@"/"];
+    if (!bundlePart.length || !tool.length) return NO;
+    if (bundle) *bundle = bundlePart;
+    if (toolPath) *toolPath = tool;
+    return YES;
+}
+
+static BOOL allowedToolPath(NSString *toolPath, NSString *method) {
+    if ([method isEqualToString:@"GET"]) {
+        return [toolPath isEqualToString:@"files"] ||
+               [toolPath isEqualToString:@"files/preview"] ||
+               [toolPath isEqualToString:@"files/download"] ||
+               [toolPath isEqualToString:@"symbols"] ||
+               [toolPath isEqualToString:@"symbols/images"] ||
+               [toolPath isEqualToString:@"dump/images"] ||
+               [toolPath isEqualToString:@"dump/status"] ||
+               [toolPath isEqualToString:@"dump/download"] ||
+               [toolPath isEqualToString:@"dump/image"];
+    }
+    return [method isEqualToString:@"POST"] && [toolPath isEqualToString:@"dump"];
+}
+
+static int connectLoopback(uint16_t port) {
+    int upstream = socket(AF_INET, SOCK_STREAM, 0);
+    if (upstream < 0) return -1;
+    struct timeval timeout = { .tv_sec = 20, .tv_usec = 0 };
+    setsockopt(upstream, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    setsockopt(upstream, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+    struct sockaddr_in address = {
+        .sin_family = AF_INET,
+        .sin_port = htons(port),
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    while (connect(upstream, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        if (errno == EINTR) continue;
+        close(upstream);
+        return -1;
+    }
+    return upstream;
+}
+
+static void relayUpstreamResponse(int client, int upstream) {
+    char bytes[16384];
+    for (;;) {
+        ssize_t count = recv(upstream, bytes, sizeof(bytes), 0);
+        if (count < 0 && errno == EINTR) continue;
+        if (count <= 0) break;
+        if (!IDHSessionWriteBytes(client, bytes, (size_t)count)) break;
+    }
+}
+
+static void serveToolProxy(int fd, NSString *method, NSString *target, NSString *path,
+                           NSDictionary<NSString *, NSString *> *headers,
+                           NSMutableData *incoming, NSUInteger bodyOffset,
+                           IDHSessionService *service, dispatch_queue_t stateQueue) {
+    NSString *bundle = nil;
+    NSString *toolPath = nil;
+    if (!parseToolsRoute(path, &bundle, &toolPath)) {
+        sendHTTP(fd, 404, @"Not Found", nil);
+        return;
+    }
+    if (![method isEqualToString:@"GET"] && ![method isEqualToString:@"POST"]) {
+        sendHTTP(fd, 405, @"Method Not Allowed", nil);
+        return;
+    }
+    if (!allowedToolPath(toolPath, method)) {
+        sendHTTP(fd, 404, @"Not Found", nil);
+        return;
+    }
+    if (headers[@"transfer-encoding"]) {
+        sendHTTP(fd, 400, @"Bad Request", nil);
+        return;
+    }
+    unsigned long long length = 0;
+    if (headers[@"content-length"]) {
+        NSScanner *scanner = [NSScanner scannerWithString:headers[@"content-length"]];
+        if (![scanner scanUnsignedLongLong:&length] || !scanner.isAtEnd || length > 1024 * 1024) {
+            sendHTTP(fd, 400, @"Bad Request", nil);
+            return;
+        }
+    }
+    NSMutableData *body = [NSMutableData dataWithLength:(NSUInteger)length];
+    if (length) {
+        NSUInteger buffered = MIN((NSUInteger)length, incoming.length - bodyOffset);
+        [incoming getBytes:body.mutableBytes range:NSMakeRange(bodyOffset, buffered)];
+        if (!IDHSessionReadBytes(fd, (char *)body.mutableBytes + buffered, (size_t)length - buffered)) return;
+    }
+
+    __block NSDictionary *identity;
+    dispatch_sync(stateQueue, ^{
+        identity = [service read:@"get_process_identity" arguments:@{@"bundleId": bundle}];
+    });
+    if (![identity[@"ok"] boolValue]) {
+        sendResult(fd, identity);
+        return;
+    }
+    NSNumber *portNumber = identity[@"httpPort"];
+    if (![portNumber isKindOfClass:NSNumber.class] || portNumber.unsignedIntegerValue < 1024 ||
+        portNumber.unsignedIntegerValue > 65535) {
+        sendHTTP(fd, 503, @"Service Unavailable", @{@"ok": @NO, @"error": @"process_tools_unavailable"});
+        return;
+    }
+    int upstream = connectLoopback((uint16_t)portNumber.unsignedIntegerValue);
+    if (upstream < 0) {
+        sendHTTP(fd, 503, @"Service Unavailable", @{@"ok": @NO, @"error": @"process_tools_unreachable"});
+        return;
+    }
+
+    NSString *query = targetQuery(target);
+    NSString *upstreamTarget = [NSString stringWithFormat:@"/api/%@%@", toolPath,
+                                query.length ? [NSString stringWithFormat:@"?%@", query] : @""];
+    NSMutableString *request = [NSMutableString stringWithFormat:
+        @"%@ %@ HTTP/1.1\r\nHost: 127.0.0.1:%u\r\nAccept: */*\r\nConnection: close\r\n",
+        method, upstreamTarget, (unsigned)portNumber.unsignedIntegerValue];
+    if (headers[@"content-type"]) [request appendFormat:@"Content-Type: %@\r\n", headers[@"content-type"]];
+    if (length || [method isEqualToString:@"POST"])
+        [request appendFormat:@"Content-Length: %llu\r\n", length];
+    [request appendString:@"\r\n"];
+    NSData *headerData = [request dataUsingEncoding:NSUTF8StringEncoding];
+    BOOL sent = IDHSessionWriteBytes(upstream, headerData.bytes, headerData.length);
+    if (sent && length) sent = IDHSessionWriteBytes(upstream, body.bytes, body.length);
+    if (sent) relayUpstreamResponse(fd, upstream);
+    close(upstream);
 }
 
 static BOOL serveSessions(int fd, NSString *target, IDHSessionService *service, dispatch_queue_t stateQueue) {
@@ -262,17 +396,18 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
     BOOL sessionRead = [method isEqualToString:@"GET"] && [path isEqualToString:@"/api/sessions"];
     BOOL settingsRoute = [target isEqualToString:@"/api/session-settings"];
     BOOL settingsRead = settingsRoute && [method isEqualToString:@"GET"];
-    BOOL appsRead = [method isEqualToString:@"GET"] && [path hasPrefix:@"/api/apps"];
+    BOOL toolsRoute = parseToolsRoute(path, nil, nil);
+    BOOL appsRead = [method isEqualToString:@"GET"] && [path hasPrefix:@"/api/apps"] && !toolsRoute;
     BOOL scopeRoute = [path isEqualToString:@"/api/injection-scope"];
     BOOL scopeRead = scopeRoute && [method isEqualToString:@"GET"];
     BOOL relaunchRoute = [method isEqualToString:@"POST"] && [path isEqualToString:@"/api/apps/relaunch"];
     BOOL clearRoute = [method isEqualToString:@"POST"] && [path isEqualToString:@"/api/apps/clear"];
     if (!sessionRead && !settingsRoute && !appsRead && !scopeRoute && !relaunchRoute && !clearRoute &&
-        ![path isEqualToString:@"/api/mcp"]) {
+        !toolsRoute && ![path isEqualToString:@"/api/mcp"]) {
         sendHTTP(fd, 404, @"Not Found", nil);
         return;
     }
-    if (!sessionRead && !settingsRead && !appsRead && !scopeRead && ![method isEqualToString:@"POST"]) {
+    if (!sessionRead && !settingsRead && !appsRead && !scopeRead && !toolsRoute && ![method isEqualToString:@"POST"]) {
         sendHTTP(fd, 405, @"Method Not Allowed", nil);
         return;
     }
@@ -294,6 +429,10 @@ void IDHSessionHandleHTTP(int fd, IDHSessionService *service, dispatch_queue_t s
     }
     if (headers[@"origin"]) {
         sendHTTP(fd, 401, @"Unauthorized", nil);
+        return;
+    }
+    if (toolsRoute) {
+        serveToolProxy(fd, method, target, path, headers, incoming, NSMaxRange(end), service, stateQueue);
         return;
     }
     if (settingsRead) {

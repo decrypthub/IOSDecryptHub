@@ -76,6 +76,10 @@ expect_present "守护进程提供设备面板" 'kDHDaemonPanelHTML' daemon/idh_
 expect_present "设备健康检查保持免鉴权" 'EqualToString:@"/health"' daemon/idh_session_http.m
 expect_present "在线登记独立于采集" 'agent_presence' daemon/idh_session_service.m
 expect_present "进程工具经守护进程转发" 'forwardTool' daemon/idh_session_service.h
+expect_present "Agent 上报进程工具端口" 'presence\[@"httpPort"\]' src/core/dh_session_agent.m
+expect_present "设备服务实现进程身份查询" 'get_process_identity.*processIdentity' daemon/idh_session_service.m
+expect_present "进程 HTTP 工具经设备服务代理" 'serveToolProxy' daemon/idh_session_http.m
+expect_present "工具代理下载按流转发" 'relayUpstreamResponse' daemon/idh_session_http.m
 expect_present "事件按 App 连续归档" 'CREATE TABLE IF NOT EXISTS app_events' daemon/idh_session_store.m
 expect_present "事件分页保持有界" 'limit > 500' daemon/idh_session_store.m
 expect_present "注入范围拒绝系统 bundle" 'com.apple.' daemon/idh_device_apps.m
