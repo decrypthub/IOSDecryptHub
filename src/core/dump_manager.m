@@ -39,10 +39,6 @@
 // ============================================================
 // 工具
 // ============================================================
-static NSString *docs_dir(void) {
-    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-}
-
 - (NSString *)appBaseName {
     NSString *bp = [[NSBundle mainBundle] bundlePath];
     NSString *base = [[bp lastPathComponent] stringByDeletingPathExtension];   // X.app -> X
@@ -154,7 +150,7 @@ static NSString *docs_dir(void) {
         return;
     }
 
-    NSString *outPath = [docs_dir() stringByAppendingPathComponent:
+    NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@-decrypted.zip", [self appBaseName]]];
     [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
 
@@ -216,7 +212,7 @@ static BOOL dh_is_signing_residue(NSString *sub) {
         return;
     }
 
-    NSString *outPath = [docs_dir() stringByAppendingPathComponent:
+    NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@-decrypted.ipa", [self appBaseName]]];
     [fm removeItemAtPath:outPath error:nil];
 
