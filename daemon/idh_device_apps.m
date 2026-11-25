@@ -205,6 +205,23 @@ static NSArray *idh_kill_named(NSSet *names) {
     return killed;
 }
 
+static BOOL idh_reap_child(pid_t pid, int attempts) {
+    for (int i = 0; i < attempts; i++) {
+        int status = 0;
+        pid_t done = waitpid(pid, &status, WNOHANG);
+        if (done == pid || (done < 0 && errno != EINTR)) return YES;
+        usleep(50 * 1000);
+    }
+    return NO;
+}
+
+static void idh_finish_child(pid_t pid) {
+    if (!idh_reap_child(pid, 20)) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+    }
+}
+
 static BOOL idh_uiopen(NSString *bundleID, NSString *execName) {
     const char *candidates[] = {"/var/jb/usr/bin/uiopen", "/usr/local/bin/uiopen", "/usr/bin/uiopen", NULL};
     NSMutableArray *paths = [NSMutableArray array];
@@ -223,13 +240,16 @@ static BOOL idh_uiopen(NSString *bundleID, NSString *execName) {
         execl(tool, tool, "--bundleid", bundleID.UTF8String, (char *)NULL);
         _exit(127);
     }
-    int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
     usleep(300 * 1000);
     for (int i = 0; i < 50; i++) {
-        if (idh_name_running(execName, idh_running_names())) return YES;
+        idh_reap_child(pid, 1);
+        if (idh_name_running(execName, idh_running_names())) {
+            idh_finish_child(pid);
+            return YES;
+        }
         usleep(100 * 1000);
     }
+    idh_finish_child(pid);
     return NO;
 }
 
