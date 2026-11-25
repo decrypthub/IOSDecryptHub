@@ -1,13 +1,15 @@
 # IOSDecryptHub 越狱版当前进度
 
-## 2026-11-25：设备 / App 架构合入主线（研发主线，未真机验收）
+## 2026-11-25：设备 / App 架构合入主线，进程工具双端真机验收通过
 
 - 设备会话基座和按 App 产品功能已合入 main：`idhjd` 提供设备健康、已安装应用、真实图标、注入范围、App 重启、事件归档与分页；电脑 `idh` 面板改为按设备/App 组织，支持 USB、事件增量轮询、历史翻页和按 App 清理。
 - 事件存储从单场会话淘汰改为 SQLite `app_events` / `app_stats` 连续归档。MCP / REST 以 `list_installed_apps`、`read_app_events`、`get/set_injection_scope`、`relaunch_app` 和 `clear_app_events` 为当前接口。
 - 用户已确认当前采用 Frida 式传输信任：设备 HTTP 不再使用自定义 Bearer / pairing token，默认绑回环，局域网监听是显式标记行为。旧 `IDH_DEVICE_SESSION_TOKEN`、`IDH_DEVICE_SETTINGS_TOKEN` 和 `pair_process` 文档不再适用。
 - 合并前完整包与 control-flow CI 已通过，最终 merge tree 与已验证 feature tree 完全相同；idh-cli 为 65 项本机测试通过。以上不等于 rootless / RootHide 真机验收。
-- 本主线同时恢复进程内原工具服务：设备服务固定 `8088`，rootless / RootHide 的进程内文件、符号、Dump 和诊断服务从 `8089..8108` 选端口，避免会话模式开启后丢失原版能力。该行为尚未真机验收。
-- 进程工具代理已在研发分支实现：Agent 心跳上报进程内 HTTP 端口，`idhjd` 通过 `/api/apps/<bundle>/tools/...` 代理原版文件、符号和 Dump 接口，下载按流转发；`get_process_identity` 同步补齐设备端实现。该代理尚未真机验收。
+- 本主线同时恢复进程内原工具服务：设备服务固定 `8088`，rootless / RootHide 的进程内文件、符号、Dump 和诊断服务从 `8089..8108` 选端口，避免会话模式开启后丢失原版能力。
+- 进程工具代理（Agent 心跳上报进程内 HTTP 端口，`idhjd` 经 `/api/apps/<bundle>/tools/...` 代理原版文件、符号、Dump 接口，下载流转发；`get_process_identity` 设备端实现）已在 1.28.52 CI 验证包上完成双端真机验收：rootless 与 RootHide 的 `tools/files`、`tools/files/download`（二进制字节数精确一致）、`tools/symbols`、`tools/symbols/images`、`tools/dump`（POST）与 `tools/dump/status` 均经代理拿到真实进程数据；进程不在线时错误如实透传。
+- 同日顺带修掉三个验收中暴露的问题并合入 main：① Dump 临时/产物目录改用 `NSTemporaryDirectory()` 并透传 NSError（PR #13，RootHide 上宿主 `Documents` 在 jbroot 下归 `root:mobile 755` 导致产物 zip 写失败；rootless 双端验证通过，bin zip 186,638 字节、RootHide 169,774 字节均含正确解密二进制）；② rootless 宿主主程序 dyld 真实路径含 `dopamine-` 段被默认 image 黑名单伪装成 `libSystem.B.dylib` 导致 `dump/images` 为空，dyld 伪装层放行主 bundle 内镜像（PR #14）；③ `relaunch` 谎报（PR #15）：`uiopen` fork 成功不再等同拉起，jb 应用在 `uiopen` 确认未拉起时兜底 `idh_spawn_mobile`（setuid 501 + execve 直启），fork 后仅 async-signal-safe 调用并关闭继承 fd。
+- relaunch 双端真机验收：RootHide 0.7s 返回 `{"relaunched":true,"killed":["CryptoTestHost"]}`，新进程注入后 tools 正常；rootless 约 28s 返回 `relaunched:true`（`uiopen` 超时回收后直启兜底），新进程 pid/uid=501/lstart 全新，`dump`（ipa）完成并下载 188,930 字节 zip（186,496 字节解密二进制 + Info.plist）。
 - 2026-11-21/22 的双机记录属于已被取代的 session/token 中间实现：当时验证过设备接管 `8088`、进程诊断转发、历史摘要读取和限额写入。这些事实只能作为设计证据保留，不能当作当前按 App 架构的验收结论。
 
 ## 2026-11-20：1.28.52 正式发布
