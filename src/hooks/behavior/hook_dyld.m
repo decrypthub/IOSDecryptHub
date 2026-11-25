@@ -14,6 +14,9 @@
 #import <Foundation/Foundation.h>
 #import <mach-o/dyld.h>
 #import <dlfcn.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
 #import "fishhook.h"
 #import "log_store.h"
 #import "dh_capture.h"
@@ -49,10 +52,26 @@ static void dyld_log_hidden_once(const char *name) {
     [[DHLogStore shared] append:e];
 }
 
+static BOOL image_in_main_bundle(const char *imageName) {
+    if (!imageName || !*imageName) return NO;
+    static char bundlePath[PATH_MAX];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *bundle = NSBundle.mainBundle.bundlePath;
+        const char *path = bundle.fileSystemRepresentation;
+        char resolved[PATH_MAX];
+        if (path && realpath(path, resolved)) path = resolved;
+        if (path) strlcpy(bundlePath, path, sizeof(bundlePath));
+    });
+    size_t length = strlen(bundlePath);
+    return length && !strncmp(imageName, bundlePath, length) &&
+           (!imageName[length] || imageName[length] == '/');
+}
+
 static const char *(*orig_dyld_get_image_name)(uint32_t);
 static const char *hooked_dyld_get_image_name(uint32_t index) {
     const char *real = orig_dyld_get_image_name(index);
-    if (real && dh_spoof_should_hide_image(real)) {
+    if (real && !image_in_main_bundle(real) && dh_spoof_should_hide_image(real)) {
         dyld_log_hidden_once(real);
         return kBenignImageName;
     }
@@ -63,7 +82,8 @@ static int (*orig_dladdr)(const void *, Dl_info *);
 static int hooked_dladdr(const void *addr, Dl_info *info) {
     int r = orig_dladdr(addr, info);
     if (dh_in_hook) return r; // IDH identity capture must retain the actual image path.
-    if (r != 0 && info && info->dli_fname && dh_spoof_should_hide_image(info->dli_fname)) {
+    if (r != 0 && info && info->dli_fname && !image_in_main_bundle(info->dli_fname) &&
+        dh_spoof_should_hide_image(info->dli_fname)) {
         dyld_log_hidden_once(info->dli_fname);
         info->dli_fname = kBenignImageName;   // 抹掉命中 image 的真实路径, 保持调用成功
     }
