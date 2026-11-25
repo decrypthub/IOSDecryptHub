@@ -39,10 +39,6 @@
 // ============================================================
 // 工具
 // ============================================================
-static NSString *docs_dir(void) {
-    return [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-}
-
 - (NSString *)appBaseName {
     NSString *bp = [[NSBundle mainBundle] bundlePath];
     NSString *base = [[bp lastPathComponent] stringByDeletingPathExtension];   // X.app -> X
@@ -50,11 +46,15 @@ static NSString *docs_dir(void) {
 }
 
 // 砸壳临时目录(放解密后的镜像文件, 供 zw_add_file 流式打包, 用完即删)。
-- (NSString *)makeTmpDir {
-    NSString *d = [docs_dir() stringByAppendingPathComponent:@".dump_tmp"];
+- (NSString *)makeTmpDir:(NSError **)error {
+    NSString *d = [NSTemporaryDirectory() stringByAppendingPathComponent:@".dump_tmp"];
     NSFileManager *fm = [NSFileManager defaultManager];
     [fm removeItemAtPath:d error:nil];   // 清掉上次残留
-    if (![fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:nil]) return nil;
+    NSError *local = nil;
+    if (![fm createDirectoryAtPath:d withIntermediateDirectories:YES attributes:nil error:&local]) {
+        if (error) *error = local;
+        return nil;
+    }
     return d;
 }
 - (void)cleanupTmp:(NSString *)d {
@@ -142,10 +142,15 @@ static NSString *docs_dir(void) {
     }
     if (targets.count == 0) { [self failWith:@"没有可导出的镜像"]; return; }
 
-    NSString *tmpDir = [self makeTmpDir];
-    if (!tmpDir) { [self failWith:@"无法创建临时目录"]; return; }
+    NSError *tmpError = nil;
+    NSString *tmpDir = [self makeTmpDir:&tmpError];
+    if (!tmpDir) {
+        [self failWith:[NSString stringWithFormat:@"无法创建临时目录: %@",
+                        tmpError.localizedDescription ?: @"未知错误"]];
+        return;
+    }
 
-    NSString *outPath = [docs_dir() stringByAppendingPathComponent:
+    NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@-decrypted.zip", [self appBaseName]]];
     [[NSFileManager defaultManager] removeItemAtPath:outPath error:nil];
 
@@ -199,10 +204,15 @@ static BOOL dh_is_signing_residue(NSString *sub) {
     NSString *appDirName = [bundlePath lastPathComponent];   // X.app
     if (bundlePath.length == 0) { [self failWith:@"无法取得 bundle 路径"]; return; }
 
-    NSString *tmpDir = [self makeTmpDir];
-    if (!tmpDir) { [self failWith:@"无法创建临时目录"]; return; }
+    NSError *tmpError = nil;
+    NSString *tmpDir = [self makeTmpDir:&tmpError];
+    if (!tmpDir) {
+        [self failWith:[NSString stringWithFormat:@"无法创建临时目录: %@",
+                        tmpError.localizedDescription ?: @"未知错误"]];
+        return;
+    }
 
-    NSString *outPath = [docs_dir() stringByAppendingPathComponent:
+    NSString *outPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@-decrypted.ipa", [self appBaseName]]];
     [fm removeItemAtPath:outPath error:nil];
 
@@ -341,8 +351,12 @@ static BOOL dh_is_signing_residue(NSString *sub) {
     }
 
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *dir = [docs_dir() stringByAppendingPathComponent:@".dump_tmp_single"];
-    [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:@".dump_tmp_single"];
+    NSError *dirError = nil;
+    if (![fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:&dirError]) {
+        if (error) *error = dirError;
+        return nil;
+    }
     NSString *outPath = [dir stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%08x_%@", arc4random(), target.name]];
 
