@@ -33,7 +33,7 @@ static int httpListener(void) {
     int yes = 1;
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     struct sockaddr_in address = {.sin_family = AF_INET, .sin_port = htons(IDH_SESSION_PORT),
-                                  .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+                                  .sin_addr.s_addr = htonl(INADDR_ANY)};
     if (!bind(fd, (void *)&address, sizeof(address)) && !listen(fd, 8)) return fd;
     int error = errno;
     close(fd);
@@ -123,14 +123,10 @@ int main(void) {
         dispatch_source_set_event_handler(timer, ^{
             @autoreleasepool {
                 [service expire];
-                if (IDHSessionModeEnabled() && !http) {
+                if (!http) {
                     int listener = httpListener();
                     if (listener >= 0) http = serve(listener, ^(int client) { IDHSessionHandleHTTP(client, service, state); });
                     service.mcpStatus = http ? @"listening" : (errno == EADDRINUSE ? @"port_busy" : @"listen_failed");
-                } else if (!IDHSessionModeEnabled() && http) {
-                    dispatch_source_cancel(http);
-                    http = nil;
-                    service.mcpStatus = @"disabled";
                 }
             }
         });

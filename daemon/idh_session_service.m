@@ -1,4 +1,17 @@
 #import "idh_session_service.h"
+
+@interface IDHForward : NSObject
+@property (nonatomic, copy) NSString *callID;
+@property (nonatomic, copy) NSString *generation;
+@property (nonatomic, copy) NSString *name;
+@property (nonatomic, copy) NSDictionary *arguments;
+@property (nonatomic, copy) NSDictionary *result;
+@property (nonatomic) BOOL delivered;
+@property (nonatomic) dispatch_semaphore_t semaphore;
+@end
+
+@implementation IDHForward
+@end
 #import "idh_session_store.h"
 #import "../src/session/idh_session_ipc.h"
 #import "../src/dh_shared.h"
@@ -33,6 +46,32 @@ static NSNumber *integerValue(id value, uint64_t maximum) {
 
 static NSDictionary *failure(NSString *reason) {
     return @{@"ok": @NO, @"error": reason};
+}
+
+static NSDictionary *defaultSessionLimits(void) {
+    return @{@"maxRecords": @(maxRecords), @"maxBytes": @(maxBytes), @"recordSeconds": @((NSUInteger)recordSeconds)};
+}
+
+static NSDictionary *mergeSessionLimits(id changes, NSDictionary *current) {
+    if (![changes isKindOfClass:NSDictionary.class] || ![changes count]) return nil;
+    NSDictionary *ceilings = defaultSessionLimits();
+    NSMutableDictionary *merged = [current mutableCopy];
+    for (NSString *key in changes) {
+        NSNumber *ceiling = ceilings[key];
+        id raw = changes[key];
+        if (!ceiling || ![raw isKindOfClass:NSNumber.class] ||
+            CFGetTypeID((__bridge CFTypeRef)raw) == CFBooleanGetTypeID()) return nil;
+        NSNumber *value = integerValue(raw, ceiling.unsignedLongLongValue);
+        if (value.unsignedLongLongValue < ([key isEqualToString:@"maxBytes"] ? 512 : 1)) return nil;
+        merged[key] = value;
+    }
+    return [merged copy];
+}
+
+static NSString *newPairingToken(void) {
+    unsigned char bytes[32];
+    if (SecRandomCopyBytes(kSecRandomDefault, sizeof(bytes), bytes) != errSecSuccess) return nil;
+    return [[NSData dataWithBytes:bytes length:sizeof(bytes)] base64EncodedStringWithOptions:0];
 }
 
 static NSNumber *nowMs(void) {
@@ -96,9 +135,16 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
     IDHSessionStore *_store;
     NSString *_managerExecutable;
     NSString *_scopePath;
+    NSString *_settingsPath;
+    NSString *_settingsRevision;
+    NSDictionary *_sessionLimits;
+    BOOL _settingsReadable;
     NSDictionary *_active;
     NSData *_agentAudit;
     NSMutableDictionary<NSString *, NSDictionary *> *_agents;
+    NSMutableDictionary<NSString *, NSDictionary *> *_presence;
+    NSMutableDictionary<NSString *, NSDictionary *> *_replaced;
+    NSMutableDictionary<NSString *, IDHForward *> *_forwards;
     NSTimeInterval _openedAt;
     NSTimeInterval _startedAt;
     NSTimeInterval _lastSeen;
@@ -111,7 +157,31 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
     _managerExecutable = [path copy];
     _scopePath = [scopePath copy];
     _agents = [NSMutableDictionary new];
+    _presence = [NSMutableDictionary new];
+    _replaced = [NSMutableDictionary new];
+    _forwards = [NSMutableDictionary new];
     _mcpStatus = @"starting";
+    _settingsPath = [IDHSessionStateDirectory stringByAppendingPathComponent:@"session-settings.json"];
+    _settingsRevision = @"0";
+    _sessionLimits = defaultSessionLimits();
+    NSError *settingsError = nil;
+    NSData *settings = [NSData dataWithContentsOfFile:_settingsPath options:0 error:&settingsError];
+    if (settings) {
+        id saved = [NSJSONSerialization JSONObjectWithData:settings options:0 error:NULL];
+        if ([saved isKindOfClass:NSDictionary.class]) {
+            NSString *revision = identifier(saved[@"revision"]);
+            NSDictionary *limits = mergeSessionLimits(saved[@"deviceSession"], _sessionLimits);
+            if (revision && limits) {
+                _settingsRevision = revision;
+                _sessionLimits = limits;
+                _settingsReadable = YES;
+            }
+        }
+    } else {
+        _settingsReadable = [settingsError.domain isEqualToString:NSCocoaErrorDomain] &&
+                            settingsError.code == NSFileReadNoSuchFileError;
+    }
+    if (!_settingsReadable) NSLog(@"idhjd: saved session settings could not be loaded");
     _store = [[IDHSessionStore alloc] initWithPath:[IDHSessionStateDirectory stringByAppendingPathComponent:@"sessions.sqlite3"]];
     NSArray *sessions = [_store sessions];
     if (!sessions) return nil;
@@ -123,6 +193,29 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
     return self;
 }
 
+- (NSDictionary *)settingsSnapshot {
+    if (!_settingsReadable) return failure(@"settings_storage_error");
+    return @{@"ok": @YES, @"revision": _settingsRevision, @"deviceSession": _sessionLimits};
+}
+
+- (NSDictionary *)updateSettings:(NSDictionary *)request {
+    if (!_settingsReadable) return failure(@"settings_storage_error");
+    NSString *expected = stringValue(request[@"revision"], 36);
+    if (!expected || request.count != 2) return failure(@"invalid_settings");
+    if (![_settingsRevision isEqualToString:expected]) return failure(@"revision_conflict");
+    NSDictionary *limits = mergeSessionLimits(request[@"deviceSession"], _sessionLimits);
+    if (!limits) return failure(@"invalid_settings");
+    if ([_sessionLimits isEqualToDictionary:limits]) return [self settingsSnapshot];
+    NSString *revision = NSUUID.UUID.UUIDString.lowercaseString;
+    NSData *data = [NSJSONSerialization dataWithJSONObject:@{@"revision": revision, @"deviceSession": limits}
+                                                  options:0 error:NULL];
+    if (!data || ![data writeToFile:_settingsPath options:NSDataWritingAtomic error:NULL])
+        return failure(@"settings_storage_error");
+    _settingsRevision = revision;
+    _sessionLimits = limits;
+    return [self settingsSnapshot];
+}
+
 - (BOOL)end:(NSString *)reason uncertainTail:(BOOL)uncertain {
     if (!_active) return YES;
     if (![_store save:ended(_active, reason, uncertain) events:@[]]) return NO;
@@ -131,7 +224,166 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
     return YES;
 }
 
+- (void)expirePresence {
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    for (NSString *generation in [_replaced.allKeys copy]) {
+        if (now >= [_replaced[generation][@"until"] doubleValue]) [_replaced removeObjectForKey:generation];
+    }
+    NSMutableArray<NSString *> *stale = [NSMutableArray new];
+    for (NSString *generation in _presence) {
+        NSDictionary *entry = _presence[generation];
+        pid_t pid = [entry[@"pid"] intValue];
+        BOOL exited = pid > 1 && kill(pid, 0) == -1 && errno == ESRCH;
+        BOOL quiet = now - [entry[@"seen"] doubleValue] > heartbeatSeconds;
+        if (exited || quiet || !scopeContains(_scopePath, entry[@"bundleId"])) [stale addObject:generation];
+    }
+    [_presence removeObjectsForKeys:stale];
+}
+
+- (NSDictionary *)notePresence:(NSDictionary *)message bundle:(NSString *)bundle pid:(pid_t)pid {
+    if (!scopeContains(_scopePath, bundle)) return failure(@"scope_disabled");
+    NSString *generation = identifier(message[@"processGeneration"]);
+    NSString *build = stringValue(message[@"agentBuild"], 40);
+    if (!generation || !build || pid <= 1) return failure(@"invalid_agent_identity");
+    NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
+    // 同一个 pid 出现新的进程代，说明旧进程已经退出并且系统把 pid 给了新进程。
+    NSMutableArray<NSString *> *replaced = [NSMutableArray new];
+    for (NSString *existing in _presence) {
+        NSDictionary *old = _presence[existing];
+        if ([old[@"pid"] intValue] == pid && ![existing isEqualToString:generation]) {
+            _replaced[existing] = @{@"pid": @(pid), @"until": @(now + heartbeatSeconds)};
+            [replaced addObject:existing];
+        }
+    }
+    [_presence removeObjectsForKeys:replaced];
+    if (!_presence[generation] && _presence.count >= 32) {
+        NSString *oldest = nil;
+        for (NSString *existing in _presence) {
+            if (!oldest || [_presence[existing][@"seen"] doubleValue] < [_presence[oldest][@"seen"] doubleValue])
+                oldest = existing;
+        }
+        if (oldest) [_presence removeObjectForKey:oldest];
+    }
+    _presence[generation] = @{@"bundleId": bundle, @"pid": @(pid), @"processGeneration": generation,
+                              @"agentBuild": build, @"seen": @(now)};
+    return @{@"ok": @YES};
+}
+
+- (NSArray<NSDictionary *> *)liveProcessesForBundle:(NSString *)bundle {
+    NSMutableArray *live = [NSMutableArray new];
+    for (NSDictionary *entry in _presence.allValues)
+        if ([entry[@"bundleId"] isEqualToString:bundle]) [live addObject:entry];
+    return live;
+}
+
+- (NSDictionary *)processIdentity:(NSDictionary *)arguments {
+    [self expirePresence];
+    NSString *bundle = stringValue(arguments[@"bundleId"], 255);
+    if (!bundle) return failure(@"invalid_arguments");
+    NSString *generation = nil;
+    if (arguments[@"processGeneration"]) {
+        generation = identifier(arguments[@"processGeneration"]);
+        if (!generation) return failure(@"invalid_arguments");
+    }
+    NSArray<NSDictionary *> *live = [self liveProcessesForBundle:bundle];
+    NSDictionary *entry = nil;
+    if (!generation) {
+        if (live.count == 1) entry = live[0];
+        else if (live.count == 0) return failure(@"not_online");
+        else return failure(@"process_generation_required");
+    } else {
+        entry = _presence[generation];
+        if (entry && ![entry[@"bundleId"] isEqualToString:bundle]) entry = nil;
+    }
+    if (!entry) {
+        NSDictionary *replaced = generation ? _replaced[generation] : nil;
+        if (replaced && NSProcessInfo.processInfo.systemUptime < [replaced[@"until"] doubleValue])
+            return failure(@"pid_reused");
+        return live.count ? failure(@"stale_generation") : failure(@"not_online");
+    }
+    pid_t pid = [entry[@"pid"] intValue];
+    if (pid > 1 && kill(pid, 0) == -1 && errno == ESRCH) {
+        [_presence removeObjectForKey:entry[@"processGeneration"]];
+        return failure(@"not_online");
+    }
+    for (NSDictionary *other in _presence.allValues) {
+        if ([other[@"pid"] intValue] == pid &&
+            ![other[@"processGeneration"] isEqualToString:entry[@"processGeneration"]])
+            return failure(@"pid_reused");
+    }
+    return @{@"ok": @YES, @"bundleId": bundle, @"pid": @(pid),
+             @"processGeneration": entry[@"processGeneration"], @"agentBuild": entry[@"agentBuild"] ?: @""};
+}
+
+- (NSDictionary *)beginForwardLocked:(NSString *)name arguments:(NSDictionary *)arguments {
+    if (![name isKindOfClass:NSString.class] || !name.length || name.length > 64) return failure(@"invalid_arguments");
+    NSDictionary *identity = [self processIdentity:arguments];
+    if (![identity[@"ok"] boolValue]) return identity;
+    NSString *generation = identity[@"processGeneration"];
+    if (_forwards[generation]) return failure(@"busy");
+    NSMutableDictionary *forwarded = [arguments mutableCopy] ?: [NSMutableDictionary new];
+    [forwarded removeObjectForKey:@"bundleId"];
+    [forwarded removeObjectForKey:@"processGeneration"];
+    NSData *encoded = [NSJSONSerialization dataWithJSONObject:forwarded options:0 error:NULL];
+    if (!encoded || encoded.length > IDH_SESSION_MAX_MESSAGE / 2) return failure(@"too_large");
+    IDHForward *call = [IDHForward new];
+    call.callID = [NSUUID UUID].UUIDString.lowercaseString;
+    call.generation = generation;
+    call.name = name;
+    call.arguments = forwarded;
+    call.semaphore = dispatch_semaphore_create(0);
+    _forwards[generation] = call;
+    return @{@"ok": @YES, @"generation": generation};
+}
+
+- (NSDictionary *)pendingCallForGeneration:(NSString *)generation {
+    IDHForward *call = _forwards[generation];
+    if (!call || call.delivered) return nil;
+    call.delivered = YES;
+    return @{@"id": call.callID, @"name": call.name, @"arguments": call.arguments ?: @{},
+             @"processGeneration": generation};
+}
+
+- (void)completeForward:(NSString *)generation callID:(NSString *)callID result:(NSDictionary *)result {
+    IDHForward *call = _forwards[generation];
+    if (!call || ![call.callID isEqualToString:callID] || call.result) return;
+    call.result = result;
+    dispatch_semaphore_signal(call.semaphore);
+}
+
+- (NSDictionary *)forwardTool:(NSString *)name arguments:(NSDictionary *)arguments queue:(dispatch_queue_t)queue {
+    __block NSDictionary *begun;
+    __block IDHForward *call;
+    dispatch_sync(queue, ^{
+        begun = [self beginForwardLocked:name arguments:arguments];
+        if ([begun[@"ok"] boolValue]) call = _forwards[begun[@"generation"]];
+    });
+    if (![begun[@"ok"] boolValue]) return begun;
+    long wait = dispatch_semaphore_wait(call.semaphore, dispatch_time(DISPATCH_TIME_NOW, 15 * NSEC_PER_SEC));
+    __block NSDictionary *result;
+    dispatch_sync(queue, ^{
+        if (_forwards[call.generation] == call) [_forwards removeObjectForKey:call.generation];
+        result = wait == 0 && call.result ? call.result : failure(@"agent_timeout");
+    });
+    return result;
+}
+
+- (NSDictionary *)health {
+    [self expirePresence];
+    NSArray *entries = [_presence.allValues sortedArrayUsingDescriptors:@[
+        [NSSortDescriptor sortDescriptorWithKey:@"bundleId" ascending:YES],
+        [NSSortDescriptor sortDescriptorWithKey:@"pid" ascending:YES],
+    ]];
+    NSMutableArray *apps = [NSMutableArray new];
+    for (NSDictionary *entry in entries) {
+        [apps addObject:@{@"bundleId": entry[@"bundleId"], @"pid": entry[@"pid"],
+                          @"processGeneration": entry[@"processGeneration"]}];
+    }
+    return @{@"ok": @YES, @"service": @"idhjd", @"version": @1, @"apps": apps};
+}
+
 - (void)expire {
+    [self expirePresence];
     if (!_active) return;
     NSTimeInterval now = NSProcessInfo.processInfo.systemUptime;
     int pid = [_active[@"pid"] intValue];
@@ -142,7 +394,8 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         [self end:@"drain_timeout" uncertainTail:YES];
     else if ([_active[@"status"] isEqualToString:@"waiting"] && now - _openedAt >= waitSeconds)
         [self end:@"agent_timeout" uncertainTail:pid > 0];
-    else if ([_active[@"status"] isEqualToString:@"observing"] && now - _startedAt >= recordSeconds)
+    else if ([_active[@"status"] isEqualToString:@"observing"] &&
+             now - _startedAt >= [_active[@"limits"][@"recordSeconds"] doubleValue])
         [self end:@"deadline" uncertainTail:YES];
 }
 
@@ -188,6 +441,8 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
     uint64_t last = [session[@"lastSeq"] unsignedLongLongValue], previous = 0;
     NSUInteger count = [session[@"count"] unsignedIntegerValue];
     NSUInteger bytes = [session[@"bytes"] unsignedIntegerValue];
+    NSUInteger recordLimit = [session[@"limits"][@"maxRecords"] unsignedIntegerValue];
+    NSUInteger byteLimit = [session[@"limits"][@"maxBytes"] unsignedIntegerValue];
     BOOL atLimit = NO;
     for (id item in incoming) {
         NSDictionary *event = projectEvent(item, generation);
@@ -196,7 +451,7 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         previous = seq;
         if (seq <= last) continue;
         NSUInteger size = [NSJSONSerialization dataWithJSONObject:event options:0 error:NULL].length;
-        if (count == maxRecords || size > maxBytes - bytes) { atLimit = YES; break; }
+        if (count >= recordLimit || bytes >= byteLimit || size > byteLimit - bytes) { atLimit = YES; break; }
         [events addObject:event];
         last = seq;
         count++;
@@ -213,7 +468,7 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
     session[@"dropped"] = @(MAX(dropped.unsignedLongLongValue, [session[@"dropped"] unsignedLongLongValue]));
     session[@"sourceDropped"] = @(MAX(sourceDropped.unsignedLongLongValue, [session[@"sourceDropped"] unsignedLongLongValue]));
     session[@"queuePeak"] = @(MAX(queuePeak.unsignedIntegerValue, [session[@"queuePeak"] unsignedIntegerValue]));
-    atLimit = atLimit || count >= maxRecords || bytes >= maxBytes;
+    atLimit = atLimit || count >= recordLimit || bytes >= byteLimit;
     BOOL finished = finalSeq && !atLimit;
     if (finished) {
         uint64_t lastProduced = finalSeq.unsignedLongLongValue;
@@ -246,8 +501,9 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         if ([session[@"bundleId"] isEqualToString:bundle]) [sessions addObject:session];
     }
     BOOL mode = IDHSessionModeEnabled();
-    return @{@"ok": @YES, @"modeEnabled": @(mode), @"mcpStatus": mode ? self.mcpStatus : @"disabled",
+    return @{@"ok": @YES, @"modeEnabled": @(mode), @"mcpStatus": self.mcpStatus,
              @"scopeEnabled": @(scopeContains(_scopePath, bundle)), @"agent": (mode ? [self onlineAgentForBundle:bundle] : nil) ?: NSNull.null,
+             @"settings": [self settingsSnapshot],
              @"sessions": sessions};
 }
 
@@ -261,6 +517,28 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         if (!bundle || [bundle isEqualToString:@"com.iosdecrypthub.manager"]) return failure(@"invalid_agent");
         return [self synchronizeAgent:message bundle:bundle pid:pid audit:audit];
     }
+    if ([action isEqualToString:@"agent_presence"]) {
+        NSString *bundle = bundleForExecutable(executable);
+        if (!bundle || [bundle isEqualToString:@"com.iosdecrypthub.manager"]) return failure(@"invalid_agent");
+        NSDictionary *noted = [self notePresence:message bundle:bundle pid:pid];
+        if (![noted[@"ok"] boolValue]) return noted;
+        NSMutableDictionary *reply = [noted mutableCopy];
+        NSString *generation = identifier(message[@"processGeneration"]);
+        NSDictionary *call = [self pendingCallForGeneration:generation];
+        if (call) reply[@"call"] = call;
+        return reply;
+    }
+    if ([action isEqualToString:@"agent_result"]) {
+        NSString *bundle = bundleForExecutable(executable);
+        NSString *generation = identifier(message[@"processGeneration"]);
+        NSString *callID = identifier(message[@"id"]);
+        NSDictionary *entry = generation ? _presence[generation] : nil;
+        if (!bundle || !generation || !callID || !entry || [entry[@"pid"] intValue] != pid ||
+            ![entry[@"bundleId"] isEqualToString:bundle]) return failure(@"stale_generation");
+        NSDictionary *result = [message[@"result"] isKindOfClass:NSDictionary.class] ? message[@"result"] : failure(@"invalid_result");
+        [self completeForward:generation callID:callID result:result];
+        return @{@"ok": @YES};
+    }
     if (![_managerExecutable isEqualToString:executable]) return failure(@"manager_required");
     if ([action isEqualToString:@"registrations"]) {
         NSMutableDictionary *online = [NSMutableDictionary new];
@@ -270,7 +548,13 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
                 if (agent) online[bundle] = agent;
             }
         }
-        return @{@"ok": @YES, @"agents": online};
+        return @{@"ok": @YES, @"agents": online, @"modeEnabled": @(IDHSessionModeEnabled()),
+                 @"mcpStatus": self.mcpStatus};
+    }
+    if ([action isEqualToString:@"session_settings"]) {
+        NSDictionary *settings = message[@"settings"];
+        if (![settings isKindOfClass:NSDictionary.class]) return failure(@"invalid_settings");
+        return [self updateSettings:settings];
     }
     if ([action isEqualToString:@"set_mode"]) {
         NSNumber *enabled = integerValue(message[@"enabled"], 1);
@@ -283,16 +567,34 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
             if (unlink(IDHSessionModePath.fileSystemRepresentation) && errno != ENOENT) return failure(@"storage_error");
             _pairingToken = nil;
             [_agents removeAllObjects];
+            // 在线登记和进程凭证独立于采集。关闭会话模式只撤销会话配对。
         }
         return @{@"ok": @YES};
     }
     if ([action isEqualToString:@"pair"]) {
         if (!IDHSessionModeEnabled()) return failure(@"mode_disabled");
-        unsigned char bytes[32];
-        if (SecRandomCopyBytes(kSecRandomDefault, sizeof(bytes), bytes) != errSecSuccess)
-            return failure(@"pairing_failed");
-        _pairingToken = [[NSData dataWithBytes:bytes length:sizeof(bytes)] base64EncodedStringWithOptions:0];
+        NSString *token = newPairingToken();
+        if (!token) return failure(@"pairing_failed");
+        _pairingToken = token;
         return @{@"ok": @YES, @"token": _pairingToken};
+    }
+    if ([action isEqualToString:@"pair_process"]) {
+        NSString *diagnosticsBundle = nil;
+        if ([integerValue(message[@"diagnosticsOnly"], 1) boolValue]) {
+            diagnosticsBundle = stringValue(message[@"bundleId"], 255);
+            if (!diagnosticsBundle) return failure(@"invalid_bundle");
+        }
+        NSString *token = newPairingToken();
+        if (!token) return failure(@"pairing_failed");
+        _processToken = token;
+        _processDiagnosticsBundle = [diagnosticsBundle copy];
+        return @{@"ok": @YES, @"token": _processToken};
+    }
+    if ([action isEqualToString:@"pair_settings"]) {
+        NSString *token = newPairingToken();
+        if (!token) return failure(@"pairing_failed");
+        _settingsToken = token;
+        return @{@"ok": @YES, @"token": _settingsToken};
     }
     if ([action isEqualToString:@"read"])
         return [self read:message[@"tool"] arguments:message[@"arguments"]];
@@ -310,7 +612,8 @@ static NSDictionary *projectEvent(id value, NSString *generation) {
         if (_active) return failure(@"active_session");
         NSDictionary *session = @{@"sessionId": sessionID, @"bundleId": bundle, @"createdAtMs": nowMs(),
                                   @"status": @"waiting", @"count": @0, @"bytes": @0, @"lastSeq": @0,
-                                  @"dropped": @0, @"sourceDropped": @0, @"queuePeak": @0};
+                                  @"dropped": @0, @"sourceDropped": @0, @"queuePeak": @0,
+                                  @"limits": _sessionLimits, @"settingsRevision": _settingsRevision};
         if (![_store save:session events:@[]]) return failure(@"storage_error");
         _active = session;
         _openedAt = NSProcessInfo.processInfo.systemUptime;

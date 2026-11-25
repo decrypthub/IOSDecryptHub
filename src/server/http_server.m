@@ -37,6 +37,7 @@
 #import "dh_log_json.h"
 #import "mcp_server.h"
 #import "hook_network.h"
+#import "hook_keychain.h"
 
 #define DH_HTTP_PORT_FIRST  8088
 #define DH_HTTP_PORT_LAST   8108
@@ -615,6 +616,12 @@ static void handle_dump_image_download(int fd, NSDictionary *q) {
     [[NSFileManager defaultManager] removeItemAtPath:tmpPath error:nil];
 }
 
+// ---- Keychain 直接查看: 进程内枚举当前有权读到的条目 ----
+static void handle_keychain_items(int fd, NSDictionary *q) {
+    NSInteger limit = q[@"limit"] ? [q[@"limit"] integerValue] : 200;
+    send_json(fd, 200, dh_keychain_items(limit));
+}
+
 // ---- 宿主沙盒文件浏览 (只读) ----
 static void handle_files_list(int fd, NSDictionary *q) {
     NSError *err = nil;
@@ -909,6 +916,8 @@ static void handle_connection(int fd) {
                 handle_symbols_images(fd);
             } else if ([path isEqualToString:@"/api/symbols"]) {
                 handle_symbols(fd, q);
+            } else if ([path isEqualToString:@"/api/keychain/items"]) {
+                handle_keychain_items(fd, q);
             } else if ([path isEqualToString:@"/api/files"]) {
                 handle_files_list(fd, q);
             } else if ([path isEqualToString:@"/api/files/preview"]) {

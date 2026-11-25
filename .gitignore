@@ -13,6 +13,7 @@ tests/exercise_runner
 
 # 生成的 Web 资源头文件 (make 自动从 web/ 生成)
 src/server/web_index_html.h
+daemon/panel_html.h
 src/server/web_wechat_png.h
 
 # 注入脚本中间产物

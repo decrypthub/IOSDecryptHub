@@ -34,6 +34,7 @@
 #include "dh_files.h"
 #include "dump_manager.h"
 #include "hook_webkit.h"
+#include "hook_keychain.h"
 #include "../trace/qbdi_trace.h"
 #include "../trace/qbdi_live.h"
 #include "../trace/qbdi_control_selftest.h"
@@ -942,7 +943,89 @@ static NSDictionary *tool_objc_call(NSDictionary *args) {
         argv[i] = s;
     }
 
+    // 返回类型编组: 把 IMP 的返回值一律当 id 接, ARC 会对非对象位型(BOOL/int 的 0x1)
+    // 调 objc_retain → 直接崩宿主(实测 triggerByKey: 返 YES 时 SIGBUS far=0x1)。
+    // 先看签名再决定调用形态; 结构体/指针等复杂返回明确拒绝, 不猜。
+    char retEnc[32] = {0};
+    method_getReturnType(m, retEnc, sizeof(retEnc));
+    char rc = retEnc[0];
+
     id result = nil;
+    NSMutableDictionary *out = [@{
+        @"class": className ?: @"(object)",
+        @"selector": selName,
+        @"class_method": isClassMethod ? @YES : @NO,
+        @"arg_count": @(argList.count),
+    } mutableCopy];
+
+    if (rc != '@' && rc != '#') {
+        // 标量/void 路径: 统一按 intptr_t/double 接, 不进 ARC。
+        if (rc == 'f' || rc == 'd') {
+            double rv = 0;
+            @try {
+                switch (argList.count) {
+                    case 0: rv = ((double (*)(id, SEL))imp)(receiver, sel); break;
+                    case 1: rv = ((double (*)(id, SEL, id))imp)(receiver, sel, argv[0]); break;
+                    case 2: rv = ((double (*)(id, SEL, id, id))imp)(receiver, sel, argv[0], argv[1]); break;
+                    case 3: rv = ((double (*)(id, SEL, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2]); break;
+                    case 4: rv = ((double (*)(id, SEL, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3]); break;
+                    case 5: rv = ((double (*)(id, SEL, id, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3], argv[4]); break;
+                    case 6: rv = ((double (*)(id, SEL, id, id, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]); break;
+                    default: return tool_err(@"argument count not supported");
+                }
+            } @catch (NSException *ex) {
+                return tool_err([NSString stringWithFormat:@"target raised %@: %@", ex.name, ex.reason]);
+            }
+            out[@"returned_nil"] = @NO;
+            out[@"return_type"] = @(retEnc);
+            out[@"result"] = @(rv);
+            return tool_ok(out);
+        }
+        if (rc == 'c' || rc == 'B' || rc == 's' || rc == 'i' || rc == 'l' || rc == 'q' ||
+            rc == 'C' || rc == 'S' || rc == 'I' || rc == 'L' || rc == 'Q') {
+            intptr_t rv = 0;
+            @try {
+                switch (argList.count) {
+                    case 0: rv = ((intptr_t (*)(id, SEL))imp)(receiver, sel); break;
+                    case 1: rv = ((intptr_t (*)(id, SEL, id))imp)(receiver, sel, argv[0]); break;
+                    case 2: rv = ((intptr_t (*)(id, SEL, id, id))imp)(receiver, sel, argv[0], argv[1]); break;
+                    case 3: rv = ((intptr_t (*)(id, SEL, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2]); break;
+                    case 4: rv = ((intptr_t (*)(id, SEL, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3]); break;
+                    case 5: rv = ((intptr_t (*)(id, SEL, id, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3], argv[4]); break;
+                    case 6: rv = ((intptr_t (*)(id, SEL, id, id, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]); break;
+                    default: return tool_err(@"argument count not supported");
+                }
+            } @catch (NSException *ex) {
+                return tool_err([NSString stringWithFormat:@"target raised %@: %@", ex.name, ex.reason]);
+            }
+            out[@"returned_nil"] = @NO;
+            out[@"return_type"] = @(retEnc);
+            out[@"result"] = @(rv);
+            return tool_ok(out);
+        }
+        if (rc == 'v') {
+            @try {
+                switch (argList.count) {
+                    case 0: ((void (*)(id, SEL))imp)(receiver, sel); break;
+                    case 1: ((void (*)(id, SEL, id))imp)(receiver, sel, argv[0]); break;
+                    case 2: ((void (*)(id, SEL, id, id))imp)(receiver, sel, argv[0], argv[1]); break;
+                    case 3: ((void (*)(id, SEL, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2]); break;
+                    case 4: ((void (*)(id, SEL, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3]); break;
+                    case 5: ((void (*)(id, SEL, id, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3], argv[4]); break;
+                    case 6: ((void (*)(id, SEL, id, id, id, id, id, id))imp)(receiver, sel, argv[0], argv[1], argv[2], argv[3], argv[4], argv[5]); break;
+                    default: return tool_err(@"argument count not supported");
+                }
+            } @catch (NSException *ex) {
+                return tool_err([NSString stringWithFormat:@"target raised %@: %@", ex.name, ex.reason]);
+            }
+            out[@"returned_nil"] = @YES;
+            out[@"return_type"] = @(retEnc);
+            out[@"result"] = @"(void)";
+            return tool_ok(out);
+        }
+        return tool_err([NSString stringWithFormat:@"unsupported return type '%s' (only object/void/scalar returns are marshalled)", retEnc]);
+    }
+
     @try {
         switch (argList.count) {
             case 0: result = ((id (*)(id, SEL))imp)(receiver, sel); break;
@@ -958,13 +1041,7 @@ static NSDictionary *tool_objc_call(NSDictionary *args) {
         return tool_err([NSString stringWithFormat:@"target raised %@: %@", ex.name, ex.reason]);
     }
 
-    NSMutableDictionary *out = [@{
-        @"class": className ?: @"(object)",
-        @"selector": selName,
-        @"class_method": isClassMethod ? @YES : @NO,
-        @"arg_count": @(argList.count),
-        @"returned_nil": result ? @NO : @YES,
-    } mutableCopy];
+    out[@"returned_nil"] = result ? @NO : @YES;
     if (result) {
         out[@"return_class"] = NSStringFromClass([result class]);
         NSString *desc = nil;
@@ -1658,6 +1735,14 @@ static NSInteger category_from_string(NSString *c) {
     if ([c isEqualToString:@"network"])    return DHCategoryNetwork;
     if ([c isEqualToString:@"kc"])         return DHCategoryKeychain;
     return -1;
+}
+
+// list_keychain_items —— 直接查看: 进程内枚举本 App 当前有权读到的 Keychain 条目,
+// 与 SecItem* hook 记录互补: hook 记的是 App 每次调用的行为, 这里给的是此刻的清单。
+static NSDictionary *tool_list_keychain_items(NSDictionary *args) {
+    NSInteger limit = [args[@"limit"] respondsToSelector:@selector(integerValue)]
+        ? [args[@"limit"] integerValue] : 200;
+    return tool_ok(dh_keychain_items(limit));
 }
 
 // get_stats —— 取证总览: 事件计数 / 捕获开关 / 进程 / 健康 / 落盘量 / 噪声
@@ -3012,6 +3097,16 @@ static NSArray *tool_definitions(void) {
             @"inputSchema": @{@"type": @"object", @"properties": @{}},
         },
         @{
+            @"name": @"list_keychain_items",
+            @"description": @"Enumerate the Keychain items this host process can currently read (inherits the app entitlements/access groups). Read-only; returns class/service/account/access-group plus stored data (genp/inet, capped at 16KB per item, base64). Complements the 'keychain' hook events, which record individual SecItem* calls the app makes.",
+            @"inputSchema": @{
+                @"type": @"object",
+                @"properties": @{
+                    @"limit": @{@"type": @"number", @"description": @"Max items returned (default 200, max 500)"},
+                },
+            },
+        },
+        @{
             @"name": @"query_events",
             @"description": @"Search captured runtime events (crypto/file/system) — the core forensic feed. Returns summaries newest-first. Use get_event for a full record.",
             @"inputSchema": @{
@@ -3814,6 +3909,7 @@ static NSDictionary *dispatch_tool(NSString *name, NSDictionary *args) {
     if ([name isEqualToString:@"list_files"])            return tool_list_files(args);
     if ([name isEqualToString:@"read_file"])             return tool_read_file(args);
     if ([name isEqualToString:@"dump_status"])           return tool_dump_status(args);
+    if ([name isEqualToString:@"list_keychain_items"])   return tool_list_keychain_items(args);
     // 取证: 控制 (有副作用)
     if ([name isEqualToString:@"set_capture"])           return tool_set_capture(args);
     if ([name isEqualToString:@"set_pause"])             return tool_set_pause(args);

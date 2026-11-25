@@ -22,6 +22,8 @@
 #import <sys/sysctl.h>
 #import <sys/utsname.h>
 #import <mach-o/dyld.h>
+#import <string.h>
+#import <stdio.h>
 
 extern int ptrace(int, pid_t, caddr_t, int);
 #ifndef P_TRACED
@@ -91,6 +93,34 @@ static void do_pbkdf(void) {
     unsigned char dk[32];
     CCKeyDerivationPBKDF(kCCPBKDF2, "user-password", strlen("user-password"),
                          (const uint8_t *)"saltsalt", 8, kCCPRFHmacAlgSHA256, 10000, dk, sizeof(dk));
+}
+static void do_keychain(void) {
+    NSString *svc = @"com.taisuii.cryptotesthost.keychain";
+    NSString *acct = @"idh-demo";
+    NSDictionary *base = @{ (id)kSecClass: (id)kSecClassGenericPassword,
+                            (id)kSecAttrService: svc,
+                            (id)kSecAttrAccount: acct,
+                            (id)kSecAttrAccessGroup: @"com.taisuii.cryptotesthost" };
+    SecItemDelete((__bridge CFDictionaryRef)base);
+    NSMutableDictionary *add = [base mutableCopy];
+    add[(id)kSecValueData] = [@"idh-keychain-demo" dataUsingEncoding:NSUTF8StringEncoding];
+    SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+    NSMutableDictionary *query = [base mutableCopy];
+    query[(id)kSecReturnData] = @YES;
+    query[(id)kSecMatchLimit] = (id)kSecMatchLimitOne;
+    CFTypeRef out = NULL;
+    SecItemCopyMatching((__bridge CFDictionaryRef)query, &out);
+    if (out) CFRelease(out);
+    NSDictionary *update = @{ (id)kSecValueData: [@"idh-keychain-demo-2" dataUsingEncoding:NSUTF8StringEncoding] };
+    SecItemUpdate((__bridge CFDictionaryRef)base, (__bridge CFDictionaryRef)update);
+    SecItemDelete((__bridge CFDictionaryRef)base);
+    // 留一条不删的持久条目, 给面板「当前条目」直接查看验证
+    NSDictionary *persist = @{ (id)kSecClass: (id)kSecClassGenericPassword,
+                               (id)kSecAttrService: svc,
+                               (id)kSecAttrAccount: @"idh-demo-persist",
+                               (id)kSecAttrAccessGroup: @"com.taisuii.cryptotesthost",
+                               (id)kSecValueData: [@"idh-keychain-persist" dataUsingEncoding:NSUTF8StringEncoding] };
+    SecItemAdd((__bridge CFDictionaryRef)persist, NULL);
 }
 static void do_bigdata(void) {
     size_t n = 128 * 1024;
@@ -217,6 +247,8 @@ static NSDictionary *dh_selfcheck(void) {
     return out;
 }
 
+static NSString *gPluginLoad = @"pending";
+static void dh_ensure_plugin(void);
 static void dh_write_status(void) {
     @autoreleasepool {
         NSMutableDictionary *out = [NSMutableDictionary dictionary];
@@ -247,6 +279,7 @@ static void dh_write_status(void) {
         }
         out[@"engine_config_access"] = access;
         out[@"documents"] = test_file_path().stringByDeletingLastPathComponent;
+        out[@"pluginLoad"] = gPluginLoad ?: @"pending";
         out[@"selfcheck"] = dh_selfcheck();
 
         NSData *data = [NSJSONSerialization dataWithJSONObject:out
@@ -260,6 +293,7 @@ static void dh_write_status(void) {
 // 放到构造函数里才能保证无论前台/后台都拿到注入与端口的第一手事实。
 __attribute__((constructor))
 static void dh_status_boot_probe(void) {
+    dh_ensure_plugin();
     dh_write_status();
 }
 
@@ -575,6 +609,7 @@ static NSString *chk_device_info(void) {
     UIColor *purple = [UIColor colorWithRed:0.82 green:0.66 blue:1.00 alpha:1.0];
     UIColor *mint   = [UIColor colorWithRed:0.36 green:0.92 blue:0.70 alpha:1.0];
     UIColor *red    = [UIColor colorWithRed:0.95 green:0.45 blue:0.45 alpha:1.0];
+    UIColor *pink   = [UIColor colorWithRed:1.00 green:0.62 blue:0.74 alpha:1.0];
 
     // --- tab 0: 加解密 ---
     UIStackView *t0 = [self addTabStack];
@@ -591,6 +626,8 @@ static NSString *chk_device_info(void) {
 
     // --- tab 1: 系统(文件 + 模块加载) ---
     UIStackView *t1 = [self addTabStack];
+    [self addGroup:t1 title:@"Keychain" color:pink buttons:@[@"增查改删"]
+              sels:@[@"onKeychain"] keys:@[@"keychain"]];
     [self addGroup:t1 title:@"文件操作" color:orange buttons:@[@"写文件",@"读文件",@"删除",@"重命名"]
               sels:@[@"onFWrite",@"onFRead",@"onFDel",@"onFRename"] keys:@[@"fwrite",@"fread",@"fdel",@"frename"]];
     [self addGroup:t1 title:@"动态库" color:purple buttons:@[@"dlopen 模块", @"dlsym 符号"]
@@ -646,7 +683,7 @@ static NSString *chk_device_info(void) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
             for (NSString *k in @[@"md5",@"sha1",@"sha256",@"sha512",@"hmac",@"aes",@"3des",@"des",@"rc4",
                                   @"rsasign",@"rsaenc",@"pbkdf",@"big",
-                                  @"fwrite",@"fread",@"fdel",@"frename",@"dlopen",@"dlsym",
+                                  @"keychain",@"fwrite",@"fread",@"fdel",@"frename",@"dlopen",@"dlsym",
                                   @"webkit",
                                   @"chkjb",@"chkurl",@"chkdyld",@"chkanti",@"chkdevice"])
                 [ws triggerByKey:k];
@@ -742,6 +779,8 @@ static NSString *chk_device_info(void) {
         do_hmac();
     } else if ([scenarioId isEqualToString:@"baseline.crypto.rsa"]) {
         dispatch_async(dispatch_get_global_queue(0, 0), ^{ do_rsa_sign(); });
+    } else if ([scenarioId isEqualToString:@"baseline.keychain.lifecycle"]) {
+        do_keychain();
     } else if ([scenarioId isEqualToString:@"baseline.file.lifecycle"]) {
         do_file_write();
         do_file_read();
@@ -916,11 +955,12 @@ static NSString *chk_device_info(void) {
     dispatch_async(dispatch_get_global_queue(0, 0), ^{ do_rsa_enc(); dispatch_async(dispatch_get_main_queue(), ^{ [self flash:@"RSA 加密"]; }); });
 }
 - (void)onPBKDF  { do_pbkdf();    [self flash:@"PBKDF2-HMAC-SHA256"]; }
+- (void)onKeychain { do_keychain(); [self flash:@"Keychain"]; }
 - (void)onBig    { do_bigdata();  [self flash:@"128KB 大数据 AES"]; }
 - (void)onAll {
     do_digest(0); do_digest(1); do_digest(2); do_digest(3);
     do_hmac(); do_sym(kCCAlgorithmAES, 16, 16); do_sym(kCCAlgorithm3DES, 24, 8);
-    do_sym(kCCAlgorithmDES, 8, 8); do_rc4(); do_pbkdf();
+    do_sym(kCCAlgorithmDES, 8, 8); do_rc4(); do_pbkdf(); do_keychain();
     dispatch_async(dispatch_get_global_queue(0, 0), ^{ do_rsa_sign(); do_rsa_enc(); });
     [self flash:@"全部算法"];
 }
@@ -1002,6 +1042,38 @@ static NSString *chk_device_info(void) {
 }
 @end
 
+static void dh_ensure_plugin(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (name && strstr(name, "decrypt_helper")) {
+            gPluginLoad = @"already";
+            return;
+        }
+    }
+    NSMutableArray<NSString *> *paths = [NSMutableArray arrayWithObjects:
+        @"/var/jb/usr/lib/IOSDecryptHub/decrypt_helper.dylib",
+        @"/usr/lib/IOSDecryptHub/decrypt_helper.dylib", nil];
+    NSString *dir = [[NSBundle mainBundle] executablePath].stringByDeletingLastPathComponent;
+    for (int i = 0; i < 8 && dir.length > 1; i++) {
+        [paths addObject:[dir stringByAppendingPathComponent:@"usr/lib/IOSDecryptHub/decrypt_helper.dylib"]];
+        dir = dir.stringByDeletingLastPathComponent;
+    }
+    NSMutableString *last = [NSMutableString string];
+    for (NSString *path in paths) {
+        if (dlopen(path.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL)) {
+            gPluginLoad = @"ok";
+            return;
+        }
+        const char *err = dlerror();
+        [last appendFormat:@"%s | %@", err ?: "?", path];
+    }
+    gPluginLoad = last.length ? last : @"not-found";
+}
+
 int main(int argc, char *argv[]) {
-    @autoreleasepool { return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class])); }
+    @autoreleasepool {
+        dh_ensure_plugin();
+        return UIApplicationMain(argc, argv, nil, NSStringFromClass([AppDelegate class]));
+    }
 }
