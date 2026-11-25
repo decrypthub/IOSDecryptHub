@@ -223,11 +223,17 @@ static void idh_finish_child(pid_t pid) {
     }
 }
 
+static void idh_close_inherited_fds(void) {
+    int maxfd = getdtablesize();
+    for (int fd = 3; fd < maxfd; fd++) close(fd);
+}
+
 static BOOL idh_spawn_mobile(NSString *execPath, NSString *execName) {
     pid_t pid = fork();
     if (pid < 0) return NO;
     if (pid == 0) {
         setsid();
+        idh_close_inherited_fds();
         if (setgid(501) != 0 || initgroups("mobile", 501) != 0 || setuid(501) != 0) _exit(1);
         setenv("HOME", "/var/mobile", 1);
         setenv("TMPDIR", "/var/mobile/tmp", 1);
@@ -264,6 +270,7 @@ static BOOL idh_uiopen(NSString *bundleID, NSString *execName) {
     if (pid < 0) return NO;
     if (pid == 0) {
         setsid();
+        idh_close_inherited_fds();
         execl(tool, tool, "--bundleid", bundleID.UTF8String, (char *)NULL);
         _exit(127);
     }
