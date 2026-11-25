@@ -229,19 +229,25 @@ static void idh_close_inherited_fds(void) {
 }
 
 static BOOL idh_spawn_mobile(NSString *execPath, NSString *execName) {
+    char path[PATH_MAX];
+    if (![execPath getFileSystemRepresentation:path maxLength:sizeof(path)]) return NO;
+    gid_t groups[32] = {501};
+    int groupCount = 32;
+    if (getgrouplist("mobile", 501, groups, &groupCount) < 0) groupCount = 1;
     pid_t pid = fork();
     if (pid < 0) return NO;
     if (pid == 0) {
         setsid();
         idh_close_inherited_fds();
-        if (setgid(501) != 0 || initgroups("mobile", 501) != 0 || setuid(501) != 0) _exit(1);
-        setenv("HOME", "/var/mobile", 1);
-        setenv("TMPDIR", "/var/mobile/tmp", 1);
-        setenv("USER", "mobile", 1);
-        setenv("LOGNAME", "mobile", 1);
+        if (setgroups(groupCount, groups) != 0 || setgid(501) != 0 || setuid(501) != 0) _exit(1);
         pid_t app = fork();
         if (app == 0) {
-            execl(execPath.fileSystemRepresentation, execPath.fileSystemRepresentation, (char *)NULL);
+            char *argv[] = {path, NULL};
+            char *env[] = {
+                "HOME=/var/mobile", "TMPDIR=/var/mobile/tmp", "USER=mobile",
+                "LOGNAME=mobile", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL,
+            };
+            execve(path, argv, env);
             _exit(127);
         }
         _exit(app < 0 ? 1 : 0);
@@ -266,12 +272,14 @@ static BOOL idh_uiopen(NSString *bundleID, NSString *execName) {
         if (access(path.fileSystemRepresentation, X_OK) == 0) { tool = path.fileSystemRepresentation; break; }
     }
     if (!tool) return NO;
+    char bid[256];
+    if (![bundleID getCString:bid maxLength:sizeof(bid) encoding:NSUTF8StringEncoding]) return NO;
     pid_t pid = fork();
     if (pid < 0) return NO;
     if (pid == 0) {
         setsid();
         idh_close_inherited_fds();
-        execl(tool, tool, "--bundleid", bundleID.UTF8String, (char *)NULL);
+        execl(tool, tool, "--bundleid", bid, (char *)NULL);
         _exit(127);
     }
     usleep(300 * 1000);
