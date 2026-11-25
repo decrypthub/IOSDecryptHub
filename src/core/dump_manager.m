@@ -208,8 +208,13 @@ static BOOL dh_is_signing_residue(NSString *sub) {
     NSString *appDirName = [bundlePath lastPathComponent];   // X.app
     if (bundlePath.length == 0) { [self failWith:@"无法取得 bundle 路径"]; return; }
 
-    NSString *tmpDir = [self makeTmpDir];
-    if (!tmpDir) { [self failWith:@"无法创建临时目录"]; return; }
+    NSError *tmpError = nil;
+    NSString *tmpDir = [self makeTmpDir:&tmpError];
+    if (!tmpDir) {
+        [self failWith:[NSString stringWithFormat:@"无法创建临时目录: %@",
+                        tmpError.localizedDescription ?: @"未知错误"]];
+        return;
+    }
 
     NSString *outPath = [docs_dir() stringByAppendingPathComponent:
                          [NSString stringWithFormat:@"%@-decrypted.ipa", [self appBaseName]]];
