@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>IOSDecryptHub</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; color: #f7f8fb; font: 13px/1.45 Inter, sans-serif; }
+  header { padding: 12px 16px; border-bottom: 1px solid #414a59; font-weight: 700; }
+  main { display: grid; grid-template-columns: 280px 1fr; height: calc(100% - 45px); }
+  ul { list-style: none; margin: 0; padding: 8px; overflow: auto; border-right: 1px solid #414a59; }
+  button { width: 100%; text-align: left; background: transparent; color: inherit; border: 0; padding: 8px; cursor: pointer; }
+  button[aria-current="true"] { background: #171b22; }
+  pre { margin: 0; padding: 12px 16px; overflow: auto; white-space: pre-wrap; font-family: ui-monospace, Consolas, monospace; }
+  .muted { color: #b0b8c4; }
+</style>
+</head>
+<body>
+<header>IOSDecryptHub</header>
+<main>
+  <ul id="sessions"></ul>
+  <pre id="events"></pre>
+</main>
+<script>
+async function loadSessions() {
+  const view = document.getElementById("sessions");
+  const response = await fetch("/api/sessions");
+  if (!response.ok) return;
+  const data = await response.json();
+  view.replaceChildren();
+  const sessions = data.sessions || [];
+  if (!sessions.length) {
+    const item = document.createElement("li");
+    item.className = "muted";
+    item.textContent = "没有会话";
+    view.append(item);
+    return;
+  }
+  for (const session of sessions) {
+    const item = document.createElement("li");
+    const button = document.createElement("button");
+    button.textContent = (session.bundleId || session.sessionId) + " · " + (session.status || "");
+    button.addEventListener("click", () => openSession(session.sessionId, button));
+    item.append(button);
+    view.append(item);
+  }
+}
+async function openSession(id, button) {
+  for (const item of document.querySelectorAll("#sessions button")) item.removeAttribute("aria-current");
+  button.setAttribute("aria-current", "true");
+  const response = await fetch("/api/sessions/" + encodeURIComponent(id) + "/events?limit=100");
+  if (!response.ok) return;
+  const data = await response.json();
+  const lines = (data.events || []).map((event) => JSON.stringify(event));
+  document.getElementById("events").textContent = lines.join("\n");
+}
+loadSessions();
+</script>
+</body>
+</html>

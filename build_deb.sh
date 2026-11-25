@@ -133,6 +133,10 @@ compile_session_daemon() {
     [ "$VARIANT" != "roothide" ] || ROOT_HIDE=1
     for ARCH in $ARCHS; do ARCH_FLAGS+=( -arch "$ARCH" ); done
     mkdir -p "$(dirname "$OUT")"
+    python3 "$SCRIPT_DIR/tools/gen_web.py" \
+        "$SCRIPT_DIR/web/daemon-panel.html" \
+        "$SCRIPT_DIR/daemon/panel_html.h" \
+        kDHDaemonPanelHTML
     "$CC" "${ARCH_FLAGS[@]}" -isysroot "$SDK" -miphoneos-version-min=14.0 \
         -fobjc-arc -Wall -O2 -DIDH_ROOT_HIDE="$ROOT_HIDE" -framework Foundation -framework Security -lsqlite3 \
         "$SCRIPT_DIR/daemon/idhjd.m" "$SCRIPT_DIR/daemon/idh_session_store.m" \
