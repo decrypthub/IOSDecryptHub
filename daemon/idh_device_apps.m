@@ -294,9 +294,9 @@ NSDictionary *idh_app_relaunch(NSString *bundleID) {
     NSString *execName = meta[@"execName"];
     if (!execName.length) return @{@"ok": @NO, @"error": @"unknown_bundle_id"};
     NSArray *killed = idh_kill_named([NSSet setWithObject:execName]);
-    BOOL relaunched = [meta[@"kind"] isEqualToString:@"jb"]
-        ? idh_spawn_mobile([meta[@"appPath"] stringByAppendingPathComponent:execName], execName)
-        : idh_uiopen(bundleID, execName);
+    BOOL relaunched = idh_uiopen(bundleID, execName);
+    if (!relaunched && [meta[@"kind"] isEqualToString:@"jb"])
+        relaunched = idh_spawn_mobile([meta[@"appPath"] stringByAppendingPathComponent:execName], execName);
     return @{@"ok": @YES, @"relaunched": @(relaunched), @"killed": killed};
 }
 
