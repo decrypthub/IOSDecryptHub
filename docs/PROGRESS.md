@@ -1,5 +1,14 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-25：设备 / App 架构合入主线（研发主线，未真机验收）
+
+- 设备会话基座和按 App 产品功能已合入 main：`idhjd` 提供设备健康、已安装应用、真实图标、注入范围、App 重启、事件归档与分页；电脑 `idh` 面板改为按设备/App 组织，支持 USB、事件增量轮询、历史翻页和按 App 清理。
+- 事件存储从单场会话淘汰改为 SQLite `app_events` / `app_stats` 连续归档。MCP / REST 以 `list_installed_apps`、`read_app_events`、`get/set_injection_scope`、`relaunch_app` 和 `clear_app_events` 为当前接口。
+- 用户已确认当前采用 Frida 式传输信任：设备 HTTP 不再使用自定义 Bearer / pairing token，默认绑回环，局域网监听是显式标记行为。旧 `IDH_DEVICE_SESSION_TOKEN`、`IDH_DEVICE_SETTINGS_TOKEN` 和 `pair_process` 文档不再适用。
+- 合并前完整包与 control-flow CI 已通过，最终 merge tree 与已验证 feature tree 完全相同；idh-cli 为 65 项本机测试通过。以上不等于 rootless / RootHide 真机验收。
+- 本主线同时恢复进程内原工具服务：设备服务固定 `8088`，rootless / RootHide 的进程内文件、符号、Dump 和诊断服务从 `8089..8108` 选端口，避免会话模式开启后丢失原版能力。该行为尚未真机验收。
+- 2026-11-21/22 的双机记录属于已被取代的 session/token 中间实现：当时验证过设备接管 `8088`、进程诊断转发、历史摘要读取和限额写入。这些事实只能作为设计证据保留，不能当作当前按 App 架构的验收结论。
+
 ## 2026-11-20：1.28.52 正式发布
 
 - [GitHub Release](https://github.com/decrypthub/IOSDecryptHub/releases/tag/v1.28.52) 指向源码 8c6de3c。Rootless、RootHide 原双机验收包与 SHA256SUMS 已公开并回下载核对。

@@ -1,30 +1,51 @@
-# 设备会话第一版
+# 设备会话与按 App 记录
 
-越狱版 Manager 的应用行菜单提供「会话」。打开目标的注入开关，在会话页启用设备会话模式，再点「开始会话」。启动或手动重启目标 App 后，等页面显示 Agent 登记和「观察中」。注入配置、Agent 状态和会话状态分别显示。
+本文描述当前越狱主线。2026-11-25 起，设备数据以 `idhjd` 为真源，记录按「设备 → App」连续归档；早期按单场会话淘汰、Bearer 配对凭证和 `read_session_events` 的实现已经被取代，不要再按旧文档恢复。
 
-一次会话绑定一个 App 主进程的一代 Agent。默认上限为 5 分钟、2,000 条或 2 MiB，先达到哪项就以哪项收尾。手机保留最近 20 场会话。点「结束会话」后，服务给在线 Agent 最多 3 秒提交尾部。已结束记录可从会话页重新查看。
+## 组件分工
 
-## MCP 读取
+- `idhjd`：手机常驻设备服务，固定使用 `8088`，负责设备健康、已安装应用、注入范围、App 事件存储、事件分页、按 App 清理和进程工具转发。
+- Agent：注入目标进程后按进程代向 `idhjd` 登记；会话模式开启且 bundle 在注入范围内时才提交事件。
+- Manager：查看设备状态和应用列表，管理注入范围，必要时重启目标 App 使新范围生效。
+- 电脑 `idh`：通过 USB 或明确配置的地址连接同一台 `idhjd`；电脑面板只是客户端，不另采数据。
+- 进程内原工具服务：rootless / RootHide 的 Agent 同时保留原来的文件、符号、Dump 和诊断 HTTP/MCP 服务。`8088` 让给设备服务，进程内服务从 `8089` 开始向 `8108` 扫端口；dev / 巨魔变体仍从 `8088` 开始。
 
-在 Manager 的会话页点「复制 MCP 只读凭证」。通过已授权的调试通道把设备的本机 `127.0.0.1:8088` 转发到 PC 本机。把凭证传入客户端的 `IDH_DEVICE_SESSION_TOKEN` 环境变量，再启动 `idh mcp --device-session --endpoint http://127.0.0.1:8088`。若 PC 端使用另一个本机端口，填写对应的转发地址。重新配对和服务重启都会使旧凭证失效。
+## 连接信任边界
 
-| 工具 | 用途 |
+当前采用用户确认的 Frida 式传输信任：设备 HTTP 服务不再使用自定义 Bearer / pairing token。默认只绑 `127.0.0.1`；创建状态目录里的 `listen-remote` 标记后才监听局域网，等同显式接受同网段直连。打开局域网前应按 Frida server 的同一口径理解风险，电脑端优先使用 USB / usbmuxd 或受控转发。
+
+`GET /health` 和面板外壳保持免鉴权。`Origin` 检查只是浏览器 CSRF 防护，不是认证。不要把「页面能打开」当作设备已授权，也不要把旧文档里的 `IDH_DEVICE_SESSION_TOKEN`、`IDH_DEVICE_SETTINGS_TOKEN` 或 `pair_process` 当成当前协议。
+
+## HTTP / MCP 能力
+
+设备服务的主要 HTTP 路由：
+
+| 路由 | 用途 |
 |---|---|
-| `list_sessions` | 查看设备最近保留的会话 |
-| `get_session` | 按 `session_id` 查询状态、进程代、计数及结束原因 |
-| `read_session_events` | 按 `session_id` 读取摘要，传入 `after_seq` 和最多 100 条的 `limit` |
+| `GET /health` | 设备服务与已登记进程概览 |
+| `GET /api/apps` | 已安装应用、运行状态和注入范围摘要 |
+| `GET /api/apps/<bundle>/events` | 按 App 读取事件，可用 `after` / `before` / `limit` 分页 |
+| `GET /api/apps/<bundle>/icon` | 应用真实图标 PNG |
+| `GET /api/injection-scope` | 读取 loader 注入范围 |
+| `POST /api/injection-scope` | 增加或移除 bundle；下次启动目标 App 生效 |
+| `POST /api/apps/relaunch` | 结束并重新打开目标 App |
+| `POST /api/apps/clear` | 真正删除该 App 在设备上的事件记录 |
+| `POST /api/mcp` | 同一能力的 MCP 入口 |
 
-分页按会话序号升序返回。使用 `nextAfterSeq` 接续读取，`hasMore` 表示本次读取时还有已提交记录。摘要字段限于时间、类别、阶段、来源序号和已存在的关联标识。会话报告源队列丢失 `sourceDropped`、摘要队列丢失 `dropped` 和待确认队列峰值 `queuePeak`。
+MCP 工具包括 `list_installed_apps`、`read_app_events`、`clear_app_events`、`get_injection_scope`、`set_injection_scope` 和 `relaunch_app`。`read_app_events` 不传游标时读最新一页；`after` 用于增量轮询，`before` 用于向历史翻页，`limit` 最大 500。电脑端对会改变设备状态的工具必须保留显式确认门。
 
-「尾部已确认」表示服务已提交终批次，并核对最终序号 `finalSeq` 等于保留条数加已知摘要丢失。Agent 直接退出、失联或确认超时，显示「尾部未确认」，此时丢失计数反映服务最后收到的计数。
+## 事件存储
 
-## 设备上的服务
+事件不再按一次性 session 淘汰。`idhjd` 在 SQLite 中按 `bundle_id` 写入 `app_events`，并维护 `app_stats` 汇总；同一 App 跨重启和跨进程代保持连续时间线。事件摘要可携带算法、操作、详情、输入输出长度和前缀字节；没有原始字节时不能补造。
 
-- `idhjd` 通过本机 Unix socket 接收 Manager 和 Agent 的请求，从内核提供的进程身份识别对端。Agent 的观察窗确认后，服务按会话和进程代接受批次，提交摘要和游标后再确认。
-- Agent 的摘要编号独立于旧日志编号。网络记录原位更新时，摘要流会生成新的序号并标记 `update`。待确认队列最多 512 条，每帧最多发送 64 条，满批唤醒发送，收到持久化确认后继续发送积压批次。
-- 设备会话模式初始关闭。开启时本机 `8088` 归设备会话服务，已启动的旧进程可能占用端口，Manager 会显示占用。关闭模式后，新启动的 Agent 使用原进程服务。
-- 已确认批次保存在设备服务的 SQLite 中。服务重启时将未封存的会话记为「设备服务已重启」，历史记录可在重新配对后继续读。
+按 App 清理是真实删除，不是「清空显示」。需要删除前应让用户确认范围。设备端存储配额按 App 裁剪最旧记录，裁剪丢失和读取分页是两件事。
 
-## 真机验收路径
+## 注入范围与重启
 
-用仓库的 `sim_uitest` 测试宿主在 Rootless 和 RootHide 各走一次。Manager 启用测试宿主并开会话，观察状态确认后触发 `dhtest://sessionburst`，执行 192 次固定 SHA-256 调用。分别验证直接终止宿主，以及在 Manager 主动结束会话后再退出宿主。比较退出前后记录、两个丢失计数和尾部状态。重新启动宿主和手机服务，确认旧会话的进程代和记录仍与退出时一致。
+Loader 的权威注入范围是 prefs plist；jb config 只是尽力写入的镜像。RootHide 用户域写不进 root 属主镜像时，只要权威 prefs 写入成功，就不能报 `config_write_failed`。bundle ID 必须合法，`com.apple.*` 拒绝写入。
+
+修改注入范围不会自动结束运行中的目标 App。运行中的进程保持原状态；用户明确选择重启后，下一代进程才按新范围注入。
+
+## 当前验收缺口
+
+按 App 连续归档、注入范围、USB 接入和电脑 Vue 面板已经合入主线并通过构建/单元 CI，但还没有完成新的 rootless / RootHide 双端真机验收。旧的 2026-11-21/22 双机证据属于已取代的 session/token 中间实现，只能说明当时设备接管、进程诊断转发、历史摘要读取和限额写入曾经走通过，不能当作当前架构的验收结论。
