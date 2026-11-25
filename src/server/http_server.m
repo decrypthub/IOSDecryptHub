@@ -1036,13 +1036,22 @@ static void accept_loop(void) {
 void dh_http_start(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        for (uint16_t p = DH_HTTP_PORT_FIRST; p <= DH_HTTP_PORT_LAST; p++) {
+#if DH_DEVICE_SESSIONS
+        const uint16_t firstPort = DH_HTTP_PORT_FIRST + 1;
+        const char *portRange = "8089..8108";
+        const char *portFailure = "端口 8089..8108 全被占用, 本地服务不可用";
+#else
+        const uint16_t firstPort = DH_HTTP_PORT_FIRST;
+        const char *portRange = "8088..8108";
+        const char *portFailure = "端口 8088..8108 全被占用, 本地服务不可用";
+#endif
+        for (uint16_t p = firstPort; p <= DH_HTTP_PORT_LAST; p++) {
             int fd = try_bind(p);
             if (fd >= 0) { gListenFD = fd; gPort = p; break; }
         }
         if (gListenFD < 0) {
-            NSLog(@"[IOSDecryptHub] HTTP 服务启动失败: %s..%s 端口都被占用", "8088", "8108");
-            dh_health_http_fail("端口 8088..8108 全被占用, 本地服务不可用");
+            NSLog(@"[IOSDecryptHub] HTTP 服务启动失败: %s 端口都被占用", portRange);
+            dh_health_http_fail(portFailure);
             return;
         }
         NSString *ip = get_local_ip();
