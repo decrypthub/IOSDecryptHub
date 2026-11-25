@@ -7,9 +7,11 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <grp.h>
 #include <sys/param.h>
 #include <signal.h>
 #include <sys/sysctl.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static NSString *idh_bootstrap_root(void) {
@@ -204,7 +206,62 @@ static NSArray *idh_kill_named(NSSet *names) {
     return killed;
 }
 
-static BOOL idh_uiopen(NSString *bundleID) {
+static BOOL idh_reap_child(pid_t pid, int attempts) {
+    for (int i = 0; i < attempts; i++) {
+        int status = 0;
+        pid_t done = waitpid(pid, &status, WNOHANG);
+        if (done == pid || (done < 0 && errno != EINTR)) return YES;
+        usleep(50 * 1000);
+    }
+    return NO;
+}
+
+static void idh_finish_child(pid_t pid) {
+    if (!idh_reap_child(pid, 20)) {
+        kill(pid, SIGKILL);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+    }
+}
+
+static void idh_close_inherited_fds(void) {
+    int maxfd = getdtablesize();
+    for (int fd = 3; fd < maxfd; fd++) close(fd);
+}
+
+static BOOL idh_spawn_mobile(NSString *execPath, NSString *execName) {
+    char path[PATH_MAX];
+    if (![execPath getFileSystemRepresentation:path maxLength:sizeof(path)]) return NO;
+    gid_t groups[32] = {501};
+    int groupCount = 32;
+    if (getgrouplist("mobile", 501, groups, &groupCount) < 0) groupCount = 1;
+    pid_t pid = fork();
+    if (pid < 0) return NO;
+    if (pid == 0) {
+        setsid();
+        idh_close_inherited_fds();
+        if (setgroups(groupCount, groups) != 0 || setgid(501) != 0 || setuid(501) != 0) _exit(1);
+        pid_t app = fork();
+        if (app == 0) {
+            char *argv[] = {path, NULL};
+            char *env[] = {
+                "HOME=/var/mobile", "TMPDIR=/var/mobile/tmp", "USER=mobile",
+                "LOGNAME=mobile", "PATH=/usr/bin:/bin:/usr/sbin:/sbin", NULL,
+            };
+            execve(path, argv, env);
+            _exit(127);
+        }
+        _exit(app < 0 ? 1 : 0);
+    }
+    idh_finish_child(pid);
+    usleep(300 * 1000);
+    for (int i = 0; i < 50; i++) {
+        if (idh_name_running(execName, idh_running_names())) return YES;
+        usleep(100 * 1000);
+    }
+    return NO;
+}
+
+static BOOL idh_uiopen(NSString *bundleID, NSString *execName) {
     const char *candidates[] = {"/var/jb/usr/bin/uiopen", "/usr/local/bin/uiopen", "/usr/bin/uiopen", NULL};
     NSMutableArray *paths = [NSMutableArray array];
     NSString *root = idh_bootstrap_root();
@@ -215,23 +272,39 @@ static BOOL idh_uiopen(NSString *bundleID) {
         if (access(path.fileSystemRepresentation, X_OK) == 0) { tool = path.fileSystemRepresentation; break; }
     }
     if (!tool) return NO;
+    char bid[256];
+    if (![bundleID getCString:bid maxLength:sizeof(bid) encoding:NSUTF8StringEncoding]) return NO;
     pid_t pid = fork();
     if (pid < 0) return NO;
     if (pid == 0) {
         setsid();
-        execl(tool, tool, "--bundleid", bundleID.UTF8String, (char *)NULL);
+        idh_close_inherited_fds();
+        execl(tool, tool, "--bundleid", bid, (char *)NULL);
         _exit(127);
     }
-    return YES;
+    usleep(300 * 1000);
+    for (int i = 0; i < 50; i++) {
+        idh_reap_child(pid, 1);
+        if (idh_name_running(execName, idh_running_names())) {
+            idh_finish_child(pid);
+            return YES;
+        }
+        usleep(100 * 1000);
+    }
+    idh_finish_child(pid);
+    return NO;
 }
 
 NSDictionary *idh_app_relaunch(NSString *bundleID) {
     if (![bundleID isKindOfClass:NSString.class] || !bundleID.length || bundleID.length > 255)
         return @{@"ok": @NO, @"error": @"invalid_arguments"};
-    NSString *execName = idh_app_map()[bundleID][@"execName"];
+    NSDictionary *meta = idh_app_map()[bundleID];
+    NSString *execName = meta[@"execName"];
     if (!execName.length) return @{@"ok": @NO, @"error": @"unknown_bundle_id"};
     NSArray *killed = idh_kill_named([NSSet setWithObject:execName]);
-    BOOL relaunched = idh_uiopen(bundleID);
+    BOOL relaunched = idh_uiopen(bundleID, execName);
+    if (!relaunched && [meta[@"kind"] isEqualToString:@"jb"])
+        relaunched = idh_spawn_mobile([meta[@"appPath"] stringByAppendingPathComponent:execName], execName);
     return @{@"ok": @YES, @"relaunched": @(relaunched), @"killed": killed};
 }
 
