@@ -288,7 +288,7 @@ linux:
 	$(CROSS_CC) $(ARCH_FLAGS) -isysroot $(IOS_SDK) -miphoneos-version-min=$(MIN_IOS) \
 		-dynamiclib -install_name @executable_path/$(TARGET) \
 		-fobjc-arc -Wall -Wno-deprecated-declarations -Wno-nullability-completeness \
-		-O2 $(INCLUDES) $(CAPSTONE_DEF) $(VERSION_DEF) $(VENDOR_DEF) -DDH_VARIANT=$(DH_VARIANT_NUM) $(FRAMEWORKS) \
+		-O2 $(INCLUDES) $(CAPSTONE_DEF) $(VERSION_DEF) $(VENDOR_DEF) -DDH_VARIANT=$(DH_VARIANT_NUM) $(SESSION_DEF) $(FRAMEWORKS) \
 		$(SRC) $(VENDOR_LIBS) -o $(TARGET)
 	@echo "✅ $(TARGET) (linux cross)"
 

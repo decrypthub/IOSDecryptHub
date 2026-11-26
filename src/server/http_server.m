@@ -143,7 +143,9 @@ static void send_response_ex(int fd, int status, NSString *statusMsg, NSString *
     if (contentType) [headers appendFormat:@"Content-Type: %@\r\n", contentType];
     [headers appendFormat:@"Content-Length: %lu\r\n", (unsigned long)body.length];
     [headers appendString:@"Cache-Control: no-store\r\n"];
-    [headers appendString:@"Access-Control-Allow-Origin: *\r\n"];
+    // 不下发 CORS 头: 面板与接口同源(都由本服务吐出), 不需要跨源授权; 而通配
+    // ACAO 会让设备上任何网页/WebView 跨源读取抓到的 key、iv 和明文,
+    // 与本服务"无鉴权"叠加就是一条静默外带通道。
     if (extraHeaders) [headers appendString:extraHeaders];
     [headers appendString:@"Connection: close\r\n\r\n"];
     NSData *hd = [headers dataUsingEncoding:NSUTF8StringEncoding];
@@ -964,11 +966,10 @@ static void handle_connection(int fd) {
                 send_text(fd, 404, @"not found");
             }
         } else if ([method isEqualToString:@"OPTIONS"]) {
+            // 预检只声明方法, 不回 Access-Control-Allow-*: 跨源请求会被浏览器拦掉.
             NSMutableString *h = [NSMutableString string];
             [h appendString:@"HTTP/1.1 204 No Content\r\n"];
-            [h appendString:@"Access-Control-Allow-Origin: *\r\n"];
-            [h appendString:@"Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"];
-            [h appendString:@"Access-Control-Allow-Headers: *\r\n"];
+            [h appendString:@"Allow: GET, POST, OPTIONS\r\n"];
             [h appendString:@"Connection: close\r\n\r\n"];
             NSData *hd = [h dataUsingEncoding:NSUTF8StringEncoding];
             write_all(fd, hd.bytes, hd.length);
@@ -987,18 +988,20 @@ static void handle_connection(int fd) {
 
 // 监听地址。注入进程的 HTTP 面带文件/符号/Dump/事件接口且没有鉴权, 绑到 0.0.0.0
 // 等于把目标 App 的沙箱开给同网段任何一台机器。越狱整包已经由 idhjd 承担设备入口,
-// idhjd 自己默认只绑回环, 所以进程内端口跟随同一口径: 默认回环, 只有状态目录里
-// 存在 listen-remote 标记(显式接受同网段直连)才放开局域网。标记在启动时读一次,
+// idhjd 自己默认只绑回环, 所以进程内端口跟随同一口径: 默认回环, 只有 idhjd 的
+// listen-remote 标记(显式接受同网段直连)存在才放开局域网。标记在启动时读一次,
 // 加/删标记后需重启目标 App 生效。
 //
 // 巨魔版没有守护进程, 这个端口就是产品入口, 保持原来的局域网监听。
-#define DH_LISTEN_REMOTE_PATH "/private/var/db/idhjd-v1/listen-remote"
+#if DH_DEVICE_SESSIONS
+#import "../session/idh_session_ipc.h"   // IDHSessionRemotePath: 与 idhjd 共用同一个标记路径
+#endif
 
 static BOOL dh_listen_remote_enabled(void) {
 #if DH_DEVICE_SESSIONS
     static BOOL enabled = NO;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ enabled = (access(DH_LISTEN_REMOTE_PATH, F_OK) == 0); });
+    dispatch_once(&once, ^{ enabled = (access(IDHSessionRemotePath.fileSystemRepresentation, F_OK) == 0); });
     return enabled;
 #else
     return YES;
@@ -1085,7 +1088,15 @@ void dh_http_start(void) {
             return;
         }
         // 只绑回环时对外地址就是 127.0.0.1: 不再把 Wi-Fi/蜂窝 IP 当成可达入口打印出去.
-        NSString *ip = dh_listen_remote_enabled() ? get_local_ip() : @"127.0.0.1";
+        NSString *ip;
+        if (dh_listen_remote_enabled()) {
+            ip = get_local_ip();
+        } else {
+            ip = @"127.0.0.1";
+            // health.localOnly 与 listen 必须同一口径: 回环绑定就是「仅本地」,
+            // 否则 stats 里会出现 listen=loopback 而 localOnly=false 的自相矛盾.
+            dh_health_note_localonly();
+        }
         gURL = [NSString stringWithFormat:@"http://%@:%u/", ip, (unsigned)gPort];
         gAcceptQ = dispatch_queue_create("com.decrypthelper.http.accept", DISPATCH_QUEUE_SERIAL);
         gWorkerQ = dispatch_queue_create("com.decrypthelper.http.worker", DISPATCH_QUEUE_CONCURRENT);
