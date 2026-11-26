@@ -14,9 +14,22 @@
 
 当前采用用户确认的 Frida 式传输信任：设备 HTTP 服务不再使用自定义 Bearer / pairing token。默认只绑 `127.0.0.1`；创建状态目录里的 `listen-remote` 标记后才监听局域网，等同显式接受同网段直连。打开局域网前应按 Frida server 的同一口径理解风险，电脑端优先使用 USB / usbmuxd 或受控转发。
 
-进程内原工具服务（`8089..8108`）跟随同一份标记与同一默认值：越狱包默认也只绑回环，端口不再对同网段开放。它与 `idhjd` 是各自独立绑定，标记在启动时读一次，加删标记后重启目标 App（`idhjd` 则重启服务）才生效。RootHide 上这个目录在 App 与根 shell 里都解析到 `<jbroot>/rootfs/private/var/db/idhjd-v1`，就是 `idhjd` 自己的 state 目录；巨魔版没有守护进程，端口就是产品入口，仍监听局域网。
+进程内原工具服务（`8089..8108`）跟随同一份标记与同一默认值：越狱包默认也只绑回环，端口不再对同网段开放。它与 `idhjd` 是各自独立绑定，标记在启动时读一次，加删标记后重启目标 App（`idhjd` 则重启服务）才生效。巨魔版没有守护进程，端口就是产品入口，仍监听局域网，也没有下面的 `listen` 字段。
 
-`/api/stats` 与 MCP `get_stats` 都带 `port` 与 `listen`（`loopback` / `any`），"工具连不上"时先看这一项再怀疑服务没起来。
+模板标记的命令（越狱版）：
+
+```sh
+# 放开：touch 标记后重启目标 App（idhjd 需重启服务）
+touch /private/var/db/idhjd-v1/listen-remote
+# 收回
+rm -f /private/var/db/idhjd-v1/listen-remote
+```
+
+RootHide 上 `/private/var/db/idhjd-v1` 在根 shell 里是另一个视图：实测在真实 `/private/var/db` 下建标记不生效，要建在 `idhjd` 自己的 state 目录里（本机为 `/var/containers/Bundle/Application/.jbroot-*/rootfs/private/var/db/idhjd-v1/listen-remote`）。验收用的是无沙箱测试宿主，沙箱内的真实 App 是否读得到该路径尚未验证。
+
+默认收紧后，PC 侧继续看进程内面板的三条路：设备本机浏览器开 `127.0.0.1:<端口>`；`ssh -L 8089:127.0.0.1:8089 root@<设备>` 转到本机；或建上面那个标记。`idhjd` 的 `/api/apps/<bundle>/tools/...` 只代理文件、符号、Dump，不代理面板 HTML 与 `/api/logs`。
+
+`/api/stats` 与 MCP `get_stats` 带 `port` 与 `listen`（`loopback` / `any`）：`port=0` 才代表服务没起来，`listen` 只表示绑定策略。
 
 `GET /health` 和面板外壳保持免鉴权。`Origin` 检查只是浏览器 CSRF 防护，不是认证。不要把「页面能打开」当作设备已授权，也不要把旧文档里的 `IDH_DEVICE_SESSION_TOKEN`、`IDH_DEVICE_SETTINGS_TOKEN` 或 `pair_process` 当成当前协议。
 

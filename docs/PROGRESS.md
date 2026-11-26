@@ -2,12 +2,14 @@
 
 ## 2026-11-26：进程内工具端口默认只绑回环（1.28.52 之后，未发布）
 
-- 注入进程自带的 HTTP 服务（越狱包 `8089..8108`）原本 bind `0.0.0.0`，还带 `Access-Control-Allow-Origin: *`，没有任何鉴权，等于把文件、符号、Dump 和事件接口开给同网段任何人。改动前实测：Windows 直连 `http://192.168.200.148:8089/` 返回 200 和完整面板 HTML。
-- 现在越狱变体（`DH_DEVICE_SESSIONS`）跟随 `idhjd` 的口径：默认只绑 `127.0.0.1`，状态目录存在 `listen-remote` 标记才放开局域网。巨魔版没有守护进程、端口就是产品入口，保持监听局域网不变。
-- `/api/stats` 和 MCP `get_stats` 增加 `port` / `listen`（`loopback` | `any`），让「工具连不上」先能区分是暴露面收紧还是服务没起来。
+- 注入进程自带的 HTTP 服务（越狱包 `8089..8108`）原本 bind `0.0.0.0`，还带通配 ACAO，没有任何鉴权，等于把文件、符号、Dump 和事件接口开给同网段任何人。改动前实测：Windows 直连 `http://192.168.200.148:8089/` 返回 200 和完整面板 HTML。
+- 现在越狱变体（`DH_DEVICE_SESSIONS`）跟随 `idhjd` 的口径：默认只绑 `127.0.0.1`，`idhjd` 的 `listen-remote` 标记（`src/session/idh_session_ipc.m` 的 `IDHSessionRemotePath`，不再另写字面量）存在才放开局域网。巨魔版没有守护进程、端口就是产品入口，保持监听局域网不变。
+- 同时删掉通配 ACAO 与 `Allow-Headers: *` 预检：面板由本服务同源吐出，不需要跨源授权；留着它等于给设备上任何网页/WebView 一条跨源读 key/iv/明文的通道。响应里不再有任何 `Access-Control-Allow-*`，同机网页跨源 GET/预检会被浏览器拦掉（本项按代码与同源关系判定，没有做浏览器侧真机复验）。
+- `/api/stats` 和 MCP `get_stats` 增加 `port` / `listen`（`loopback` | `any`）；`port` 才是「服务有没有起来」的判据，`listen` 只表示绑定策略。
+- 运营口径变化：升级后 PC 浏览器直连手机 IP 看不到进程内日志面板了。要继续看，三条路：设备本机浏览器开 `127.0.0.1:8089`、`ssh -L 8089:127.0.0.1:8089` 转发、或建 `listen-remote` 标记（等同显式接受同网段直连）。`idhjd` 的 tools 代理只覆盖文件/符号/Dump，不代理面板与日志接口。
 - 双机真机验收（本次研发包，arm64 / arm64e）：两台默认都报 `listen=loopback`，Windows 与 Mac 连 8089 均不可达；`idhjd` 的 `/api/apps/<bundle>/tools/files` 代理照常拿到真实目录。分别建标记后两台恢复 `listen=any`、局域网返回 200，删除标记并重启后回到 loopback。
-- RootHide 路径口径：`/private/var/db/idhjd-v1` 在 App 与根 shell 里都解析到 `<jbroot>/rootfs/private/var/db/idhjd-v1`，标记建在这个视图里（即 `idhjd` 自己的 state 目录），根 shell 在真实 `/private/var/db` 下建同名目录不会生效。
-- 门禁：`tests/verify_architecture.sh` 增加「跟随 idhjd 标记」「默认只绑回环」「统计接口报告监听范围」三条，并把它接入 CI（`build.yml` 新增 Verify architecture invariants 步骤）；同一轮修掉两条因为源码是 CRLF 而恒红的 `$` 锚定断言（`DH_HTTP_PORT_FIRST` / `IDH_SESSION_PORT`），现在本机 32/32 全绿。
+- RootHide 实测口径：根 shell 在真实 `/private/var/db/idhjd-v1` 建标记**不生效**；建在 `idhjd` 自己的 state 目录 `<jbroot>/rootfs/private/var/db/idhjd-v1/listen-remote` 才生效。两台验收用的是无沙箱测试宿主，真实 App Store 目标（沙箱内）能否 stat 该路径**未验证**，留作后续在快手等真实目标上复验。
+- 门禁：`tests/verify_architecture.sh` 增加「复用 idhjd 标记常量」「进程内不再写死状态目录」「默认只绑回环」「巨魔变体保持局域网」「不下发通配 CORS」「统计接口报告监听范围」六条，并把它接入 CI（`build.yml` 新增 Verify architecture invariants 步骤）；同一轮修掉两条因为源码是 CRLF 而恒红的 `$` 锚定断言（`DH_HTTP_PORT_FIRST` / `IDH_SESSION_PORT`）。
 - 只改进程内端口；`idhjd` 的 8088 原本就只绑回环，未改动。
 
 ## 2026-11-25：设备 / App 架构合入主线，进程工具双端真机验收通过
