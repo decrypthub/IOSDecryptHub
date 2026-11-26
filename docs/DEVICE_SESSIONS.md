@@ -14,6 +14,10 @@
 
 当前采用用户确认的 Frida 式传输信任：设备 HTTP 服务不再使用自定义 Bearer / pairing token。默认只绑 `127.0.0.1`；创建状态目录里的 `listen-remote` 标记后才监听局域网，等同显式接受同网段直连。打开局域网前应按 Frida server 的同一口径理解风险，电脑端优先使用 USB / usbmuxd 或受控转发。
 
+进程内原工具服务（`8089..8108`）跟随同一份标记与同一默认值：越狱包默认也只绑回环，端口不再对同网段开放。它与 `idhjd` 是各自独立绑定，标记在启动时读一次，加删标记后重启目标 App（`idhjd` 则重启服务）才生效。RootHide 上这个目录在 App 与根 shell 里都解析到 `<jbroot>/rootfs/private/var/db/idhjd-v1`，就是 `idhjd` 自己的 state 目录；巨魔版没有守护进程，端口就是产品入口，仍监听局域网。
+
+`/api/stats` 与 MCP `get_stats` 都带 `port` 与 `listen`（`loopback` / `any`），"工具连不上"时先看这一项再怀疑服务没起来。
+
 `GET /health` 和面板外壳保持免鉴权。`Origin` 检查只是浏览器 CSRF 防护，不是认证。不要把「页面能打开」当作设备已授权，也不要把旧文档里的 `IDH_DEVICE_SESSION_TOKEN`、`IDH_DEVICE_SETTINGS_TOKEN` 或 `pair_process` 当成当前协议。
 
 ## HTTP / MCP 能力

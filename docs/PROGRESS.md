@@ -1,5 +1,15 @@
 # IOSDecryptHub 越狱版当前进度
 
+## 2026-11-26：进程内工具端口默认只绑回环（1.28.52 之后，未发布）
+
+- 注入进程自带的 HTTP 服务（越狱包 `8089..8108`）原本 bind `0.0.0.0`，还带 `Access-Control-Allow-Origin: *`，没有任何鉴权，等于把文件、符号、Dump 和事件接口开给同网段任何人。改动前实测：Windows 直连 `http://192.168.200.148:8089/` 返回 200 和完整面板 HTML。
+- 现在越狱变体（`DH_DEVICE_SESSIONS`）跟随 `idhjd` 的口径：默认只绑 `127.0.0.1`，状态目录存在 `listen-remote` 标记才放开局域网。巨魔版没有守护进程、端口就是产品入口，保持监听局域网不变。
+- `/api/stats` 和 MCP `get_stats` 增加 `port` / `listen`（`loopback` | `any`），让「工具连不上」先能区分是暴露面收紧还是服务没起来。
+- 双机真机验收（本次研发包，arm64 / arm64e）：两台默认都报 `listen=loopback`，Windows 与 Mac 连 8089 均不可达；`idhjd` 的 `/api/apps/<bundle>/tools/files` 代理照常拿到真实目录。分别建标记后两台恢复 `listen=any`、局域网返回 200，删除标记并重启后回到 loopback。
+- RootHide 路径口径：`/private/var/db/idhjd-v1` 在 App 与根 shell 里都解析到 `<jbroot>/rootfs/private/var/db/idhjd-v1`，标记建在这个视图里（即 `idhjd` 自己的 state 目录），根 shell 在真实 `/private/var/db` 下建同名目录不会生效。
+- 门禁：`tests/verify_architecture.sh` 增加「跟随 idhjd 标记」「默认只绑回环」「统计接口报告监听范围」三条。
+- 只改进程内端口；`idhjd` 的 8088 原本就只绑回环，未改动。
+
 ## 2026-11-25：设备 / App 架构合入主线，进程工具双端真机验收通过
 
 - 设备会话基座和按 App 产品功能已合入 main：`idhjd` 提供设备健康、已安装应用、真实图标、注入范围、App 重启、事件归档与分页；电脑 `idh` 面板改为按设备/App 组织，支持 USB、事件增量轮询、历史翻页和按 App 清理。
