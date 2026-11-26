@@ -9,6 +9,7 @@
 #import <setjmp.h>
 #import <signal.h>
 #import "dh_symtab.h"
+#import "http_server.h"
 #include <dlfcn.h>
 #include "mcp_server.h"
 #include "analysis.h"
@@ -1761,6 +1762,8 @@ static NSDictionary *tool_get_stats(NSDictionary *args) {
         @"byCategory": byCat,
         @"capture":    capture,
         @"logBytes":   @([s totalLogBytes]),
+        @"port":       @(dh_http_port()),
+        @"listen":     [NSString stringWithUTF8String:dh_http_listen_mode()],   // loopback | any
         @"pipeline":   [s pipelineStats],
         @"process":    [s processInfo] ?: @{},
         @"noise":      @{@"crypto": @([s noiseCountForBoard:DHNoiseBoardCrypto]),

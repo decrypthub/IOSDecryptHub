@@ -58,6 +58,10 @@ static dispatch_semaphore_t gConcurrency = NULL;  // 限制同时处理的连接
 
 #define DH_HTTP_MAX_CONCURRENCY 8
 
+// 监听地址判定在文件后部 (listen + accept 段) 定义, 这里先声明: /api/stats 要报告 listen 模式.
+static BOOL dh_listen_remote_enabled(void);
+static const char *dh_listen_mode_name(void);
+
 
 // ============================================================
 // 工具
@@ -201,6 +205,7 @@ static void handle_stats(int fd) {
         @"categoryNames": catNames,   // 前端据此派生 CAT_CLS, 不再硬编码分类名数组
         @"capture":     capture,
         @"port":        @(gPort),
+        @"listen":      [NSString stringWithUTF8String:dh_listen_mode_name()],   // loopback | any
         @"version":     @DH_HTTP_VERSION,
         @"logBytes":    @(logBytes),
         @"pipeline":    [s pipelineStats],   // 背压/丢弃/RSS: 用于长时间运行稳定性观测
@@ -979,6 +984,31 @@ static void handle_connection(int fd) {
 // ============================================================
 // listen + accept loop
 // ============================================================
+
+// 监听地址。注入进程的 HTTP 面带文件/符号/Dump/事件接口且没有鉴权, 绑到 0.0.0.0
+// 等于把目标 App 的沙箱开给同网段任何一台机器。越狱整包已经由 idhjd 承担设备入口,
+// idhjd 自己默认只绑回环, 所以进程内端口跟随同一口径: 默认回环, 只有状态目录里
+// 存在 listen-remote 标记(显式接受同网段直连)才放开局域网。标记在启动时读一次,
+// 加/删标记后需重启目标 App 生效。
+//
+// 巨魔版没有守护进程, 这个端口就是产品入口, 保持原来的局域网监听。
+#define DH_LISTEN_REMOTE_PATH "/private/var/db/idhjd-v1/listen-remote"
+
+static BOOL dh_listen_remote_enabled(void) {
+#if DH_DEVICE_SESSIONS
+    static BOOL enabled = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ enabled = (access(DH_LISTEN_REMOTE_PATH, F_OK) == 0); });
+    return enabled;
+#else
+    return YES;
+#endif
+}
+
+static const char *dh_listen_mode_name(void) {
+    return dh_listen_remote_enabled() ? "any" : "loopback";
+}
+
 static int try_bind(uint16_t port) {
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return -1;
@@ -987,7 +1017,7 @@ static int try_bind(uint16_t port) {
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
     struct sockaddr_in addr = {0};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_addr.s_addr = dh_listen_remote_enabled() ? htonl(INADDR_ANY) : htonl(INADDR_LOOPBACK);
     addr.sin_port = htons(port);
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0) { close(fd); return -1; }
     if (listen(fd, DH_HTTP_BACKLOG) != 0) { close(fd); return -1; }
@@ -1054,16 +1084,18 @@ void dh_http_start(void) {
             dh_health_http_fail(portFailure);
             return;
         }
-        NSString *ip = get_local_ip();
+        // 只绑回环时对外地址就是 127.0.0.1: 不再把 Wi-Fi/蜂窝 IP 当成可达入口打印出去.
+        NSString *ip = dh_listen_remote_enabled() ? get_local_ip() : @"127.0.0.1";
         gURL = [NSString stringWithFormat:@"http://%@:%u/", ip, (unsigned)gPort];
         gAcceptQ = dispatch_queue_create("com.decrypthelper.http.accept", DISPATCH_QUEUE_SERIAL);
         gWorkerQ = dispatch_queue_create("com.decrypthelper.http.worker", DISPATCH_QUEUE_CONCURRENT);
         gConcurrency = dispatch_semaphore_create(DH_HTTP_MAX_CONCURRENCY);
         dispatch_async(gAcceptQ, ^{ accept_loop(); });
         dh_health_http_ok();
-        NSLog(@"[IOSDecryptHub] HTTP 服务已启动: %@", gURL);
+        NSLog(@"[IOSDecryptHub] HTTP 服务已启动: %@ (listen=%s)", gURL, dh_listen_mode_name());
     });
 }
 
 uint16_t  dh_http_port(void)  { return gPort; }
 NSString *dh_http_url(void)   { return gURL ?: @"(not running)"; }
+const char *dh_http_listen_mode(void) { return dh_listen_mode_name(); }

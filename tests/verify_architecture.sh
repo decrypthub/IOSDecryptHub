@@ -84,6 +84,11 @@ expect_present "事件按 App 连续归档" 'CREATE TABLE IF NOT EXISTS app_even
 expect_present "事件分页保持有界" 'limit > 500' daemon/idh_session_store.m
 expect_present "注入范围拒绝系统 bundle" 'com.apple.' daemon/idh_device_apps.m
 expect_present "局域网监听需要显式标记" 'IDHSessionRemotePath' daemon/idhjd.m
+expect_present "进程工具跟随 idhjd 的局域网标记" \
+    'DH_LISTEN_REMOTE_PATH "/private/var/db/idhjd-v1/listen-remote"' src/server/http_server.m
+expect_present "进程工具端口默认只绑回环" \
+    'dh_listen_remote_enabled\(\) \? htonl\(INADDR_ANY\) : htonl\(INADDR_LOOPBACK\)' src/server/http_server.m
+expect_present "统计接口报告监听范围" 'dh_http_listen_mode' src/server/mcp_server.m
 
 echo "== constructor 顺序 =="
 main_file="src/core/main.m"

@@ -3,7 +3,7 @@
 //
 // 端点:
 //   GET  /                   嵌入式单页前端
-//   GET  /api/stats          {total, paused, byCategory:[...], port, ip, version}
+//   GET  /api/stats          {total, paused, byCategory:[...], port, listen, version}
 //   GET  /api/logs?cat=N&q=KW&since=SEQ&limit=N
 //                            日志摘要数组 (不含 key/iv/in/out 原文, 只给元信息)
 //   GET  /api/logs/:seq      单条详情 (含 hex / hexdump / 调用栈)
@@ -19,7 +19,10 @@
 void      dh_http_start(void);
 // 返回成功绑定的端口, 0 表示未启动
 uint16_t  dh_http_port(void);
-// 形如 "http://192.168.x.x:8088/" (局域网直连, 无鉴权)
+// 形如 "http://127.0.0.1:8089/" (越狱版默认只绑回环; 状态目录有 listen-remote 标记才用 Wi-Fi IP)
 NSString *dh_http_url(void);
+// "loopback" | "any": 端口当前是否只对本机开放。MCP get_stats 报告这个值, 便于上层判断
+// 「工具连不上」是网络暴露面被收紧还是服务没起来。
+const char *dh_http_listen_mode(void);
 
 #endif
