@@ -7,7 +7,7 @@
 - `/api/stats` 和 MCP `get_stats` 增加 `port` / `listen`（`loopback` | `any`），让「工具连不上」先能区分是暴露面收紧还是服务没起来。
 - 双机真机验收（本次研发包，arm64 / arm64e）：两台默认都报 `listen=loopback`，Windows 与 Mac 连 8089 均不可达；`idhjd` 的 `/api/apps/<bundle>/tools/files` 代理照常拿到真实目录。分别建标记后两台恢复 `listen=any`、局域网返回 200，删除标记并重启后回到 loopback。
 - RootHide 路径口径：`/private/var/db/idhjd-v1` 在 App 与根 shell 里都解析到 `<jbroot>/rootfs/private/var/db/idhjd-v1`，标记建在这个视图里（即 `idhjd` 自己的 state 目录），根 shell 在真实 `/private/var/db` 下建同名目录不会生效。
-- 门禁：`tests/verify_architecture.sh` 增加「跟随 idhjd 标记」「默认只绑回环」「统计接口报告监听范围」三条。
+- 门禁：`tests/verify_architecture.sh` 增加「跟随 idhjd 标记」「默认只绑回环」「统计接口报告监听范围」三条，并把它接入 CI（`build.yml` 新增 Verify architecture invariants 步骤）；同一轮修掉两条因为源码是 CRLF 而恒红的 `$` 锚定断言（`DH_HTTP_PORT_FIRST` / `IDH_SESSION_PORT`），现在本机 32/32 全绿。
 - 只改进程内端口；`idhjd` 的 8088 原本就只绑回环，未改动。
 
 ## 2026-11-25：设备 / App 架构合入主线，进程工具双端真机验收通过

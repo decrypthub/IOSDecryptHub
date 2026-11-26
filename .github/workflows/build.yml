@@ -24,6 +24,10 @@ jobs:
         run: |
           command -v cmake >/dev/null || brew install cmake
           command -v ninja >/dev/null || brew install ninja
+      - name: Verify architecture invariants
+        run: |
+          command -v rg >/dev/null || brew install ripgrep
+          bash tests/verify_architecture.sh
       - name: Build iOS Inline and Trace dependencies
         run: |
           bash tools/build_dobby_ios.sh

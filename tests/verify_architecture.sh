@@ -60,12 +60,12 @@ expect_present "存在 fishhook 实现" 'rebind_symbols' src/core/fishhook.c
 expect_present "存在 ObjC swizzle 实现" 'method_setImplementation|method_exchangeImplementations' src
 
 echo "== 服务与协议边界 =="
-expect_present "HTTP 首选端口保持 8088" '^#define DH_HTTP_PORT_FIRST[[:space:]]+8088$' src/server/http_server.m
+expect_present "HTTP 首选端口保持 8088" '^#define DH_HTTP_PORT_FIRST[[:space:]]+8088\r?$' src/server/http_server.m
 expect_present "MCP 路径保持 /api/mcp" '"/api/mcp"' src/server/http_server.m
 
 echo "== 设备会话与应用工具边界 =="
 expect_present "设备会话端口固定 8088" \
-    '^#define IDH_SESSION_PORT[[:space:]]+8088$' src/session/idh_session_ipc.h
+    '^#define IDH_SESSION_PORT[[:space:]]+8088\r?$' src/session/idh_session_ipc.h
 expect_present "会话变体为设备服务保留 8088" \
     'firstPort = DH_HTTP_PORT_FIRST \+ 1' src/server/http_server.m
 expect_present "会话上报不阻断进程工具服务" \
